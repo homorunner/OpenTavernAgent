@@ -151,6 +151,7 @@ pip install ".[bench]"
 | [Architecture](docs/ARCHITECTURE.md) | Engine structure, interfaces and how the components fit together. |
 | [Content coverage](docs/CONTENT.md) | Implemented minions, heroes, spells, trinkets and other game objects. |
 | [Timewarp](docs/TIMEWARP.md) | The Timewarped Tavern (off by default in 37.0.2; two heroes still visit it). |
+| [TavernPlugin journal](docs/TAVERNPLUGIN_JOURNAL.md) | Hooking the live game into TavernGym: design, runtime limits, and how the board and shop were aligned. |
 
 For development, run `pip install -e ".[test]"` and `pytest`. The Rust crate also works on its
 own with `cargo test --release`.

@@ -1,0 +1,15 @@
+# build outputs of the replay tool
+bin/
+obj/
+tools/replay/out/
+
+# local snapshots and logs
+*.log
+snapshots/
+
+# python bytecode
+__pycache__/
+*.pyc
+
+# ilspec dumps
+tools/ilspec/out/

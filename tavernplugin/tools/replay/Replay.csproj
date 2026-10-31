@@ -1,0 +1,35 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Offline harness: replays a real Power.log through the same parser the game
+       plugin uses, so the parsing and the server can be tested without playing.
+       The parser lives in ../client/Core so there is a single source of truth. -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>tavernreplay</AssemblyName>
+    <RootNamespace>TavernPlugin.Replay</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\client\Core\TavernJson.cs" Link="Core\TavernJson.cs" />
+    <Compile Include="..\..\client\Core\Snapshot.cs" Link="Core\Snapshot.cs" />
+    <Compile Include="..\..\client\Core\PowerLog.cs" Link="Core\PowerLog.cs" />
+    <Compile Include="..\..\client\Core\PowerLogParser.cs" Link="Core\PowerLogParser.cs" />
+    <Compile Include="..\..\client\Core\BridgeClient.cs" Link="Core\BridgeClient.cs" />
+    <Compile Include="..\..\client\Core\ServerLauncher.cs" Link="Core\ServerLauncher.cs" />
+    <Compile Include="..\..\client\Core\GameLog.cs" Link="Core\GameLog.cs" />
+        <Compile Include="..\..\client\Core\Text.cs" Link="Core\Text.cs" />
+    <Compile Include="..\..\client\Core\NativeProcess.cs" Link="Core\NativeProcess.cs" />
+    <Compile Include="..\..\client\Core\SelfCheck.cs" Link="Core\SelfCheck.cs" />
+  </ItemGroup>
+
+</Project>
+
+
+
