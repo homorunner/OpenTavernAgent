@@ -5433,8 +5433,6 @@ fn sanders_is_targeted_and_buddy_bans_apply() {
     }
 }
 
-// ------------------------------------------------- A-class fixes
-
 #[test]
 fn rallies_that_need_an_attack_cant_be_triggered() {
     // Sky-hatch Runaway can't pick Jailbird Juggernaut (BG36_333); Flittering Bat can.
@@ -5730,12 +5728,12 @@ fn observation_hides_this_turns_opponent_boards() {
 
 #[test]
 fn observation_shows_only_the_warbands_the_player_fought() {
-    use taverngym::obs::{MINION_F, OPP_BOARD_F, observe};
+    use taverngym::obs::{ACTION_BUDGET_F, MINION_F, OPP_BOARD_F, observe};
     let mut g = game(9203);
     // Per opponent slot of p0's observation: how many minions it holds.
     let seen = |g: &Game| -> Vec<usize> {
         let o = observe(g, 0);
-        let start = o.floats.len() - OPP_BOARD_F;
+        let start = o.floats.len() - OPP_BOARD_F - ACTION_BUDGET_F;
         (0..7)
             .map(|i| {
                 (0..7)
@@ -14020,4 +14018,79 @@ fn a_host_played_from_hand_fires_its_last_volumizer_once() {
         (0, 6),
         "no Volumizer, no bonus"
     );
+}
+
+#[test]
+fn experiment_action_budgets_are_per_seat_and_reset_each_turn() {
+    use taverngym::actions::{A_FREEZE, A_MOVE};
+    let mut g = game(4203);
+    g.cfg.turn_action_caps = vec![100];
+    g.cfg.move_actions_per_turn = 10;
+    g.cfg.freeze_presses_per_turn = 5;
+    set_board(&mut g, 0, &["BG25_008", "BGS_039"]);
+    for n in 0..10 {
+        assert!(g.legal_mask(0)[A_MOVE + 1]);
+        g.apply(0, Action::Move { from: 0, to: 1 }).unwrap();
+        assert_eq!(g.players[0].moves_this_turn, n + 1);
+    }
+    assert!(!g.legal_mask(0)[A_MOVE..].iter().any(|x| *x));
+    let before = g.players[0].actions_this_turn;
+    assert!(g.apply(0, Action::Move { from: 0, to: 1 }).is_err());
+    assert_eq!(g.players[0].actions_this_turn, before);
+    assert_eq!(g.players[0].moves_this_turn, 10);
+    for _ in 0..5 {
+        g.apply(0, Action::Freeze).unwrap();
+    }
+    assert!(!g.legal_mask(0)[A_FREEZE]);
+    assert!(g.apply(0, Action::Freeze).is_err());
+    assert_eq!(g.players[0].freezes_this_turn, 5);
+    assert!(g.legal_mask(1)[A_FREEZE]);
+    assert_eq!(g.players[1].moves_this_turn, 0);
+    // Limits and used budgets survive exact save/restore.
+    let json = serde_json::to_string(&g).unwrap();
+    let restored: Game = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.cfg.move_actions_per_turn, 10);
+    assert_eq!(restored.players[0].moves_this_turn, 10);
+    assert_eq!(restored.legal_mask(0), g.legal_mask(0));
+    end_all(&mut g);
+    assert_eq!(g.players[0].moves_this_turn, 0);
+    assert_eq!(g.players[0].freezes_this_turn, 0);
+    assert_eq!(g.players[0].actions_this_turn, 0);
+    assert!(g.can_move(0) && g.can_freeze(0));
+}
+
+#[test]
+fn experiment_total_budget_allows_one_hundred_successful_actions() {
+    let mut g = game(4204);
+    g.cfg.turn_action_caps = vec![100];
+    g.cfg.freeze_presses_per_turn = 0;
+    g.players[0].actions_this_turn = 0;
+    for _ in 0..100 {
+        assert!(g.legal_mask(0)[Action::Freeze.encode()]);
+        g.apply(0, Action::Freeze).unwrap();
+    }
+    assert_eq!(g.players[0].actions_this_turn, 100);
+    assert_eq!(g.legal_actions(0), vec![Action::EndTurn.encode()]);
+    assert!(g.apply(0, Action::Freeze).is_err());
+    assert_eq!(g.players[0].actions_this_turn, 100);
+    g.apply(0, Action::EndTurn).unwrap();
+}
+
+#[test]
+fn failed_moves_do_not_consume_the_move_budget_and_zero_is_unlimited() {
+    let mut g = game(4205);
+    set_board(&mut g, 0, &["BG25_008", "BGS_039"]);
+    g.cfg.move_actions_per_turn = 10;
+    let before = g.players[0].actions_this_turn;
+    assert!(g.apply(0, Action::Move { from: 0, to: 0 }).is_err());
+    assert!(g.apply(0, Action::Move { from: 0, to: 7 }).is_err());
+    assert_eq!(g.players[0].moves_this_turn, 0);
+    assert_eq!(g.players[0].actions_this_turn, before);
+    g.cfg.move_actions_per_turn = 0;
+    for _ in 0..20 {
+        g.apply(0, Action::Move { from: 0, to: 1 }).unwrap();
+    }
+    assert_eq!(g.players[0].moves_this_turn, 20);
+    assert!(g.can_move(0));
+    assert!(RulesConfig::from_json(r#"{"move_actions_per_turn":10}"#).is_ok());
 }

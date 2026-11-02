@@ -279,7 +279,7 @@ impl Game {
         let n = pl.board.len().min(N_BOARD);
         for f in 0..n {
             for t in 0..n {
-                if f != t {
+                if f != t && self.can_move(p) {
                     m[A_MOVE + f * N_BOARD + t] = true;
                 }
             }

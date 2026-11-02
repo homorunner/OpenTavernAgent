@@ -2045,13 +2045,23 @@ impl Game {
 
     pub fn move_minion(&mut self, p: PlayerId, from: usize, to: usize) -> ActResult {
         self.check_turn(p)?;
+        if !self.can_move(p) {
+            return Err("no Move left this turn");
+        }
         let b = &mut self.players[p].board;
         if from >= b.len() || to >= b.len() || from == to {
             return Err("bad move");
         }
         let m = b.remove(from);
         b.insert(to, m);
+        self.players[p].moves_this_turn += 1;
         Ok(())
+    }
+
+    /// The host's optional warband rearrangement budget has not been exhausted.
+    pub fn can_move(&self, p: PlayerId) -> bool {
+        self.cfg.move_actions_per_turn == 0
+            || self.players[p].moves_this_turn < self.cfg.move_actions_per_turn
     }
 
     pub fn refresh(&mut self, p: PlayerId) -> ActResult {

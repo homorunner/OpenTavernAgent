@@ -210,6 +210,10 @@ pub struct RulesConfig {
     /// and freezing never advance the game, so a policy without a cap can act forever:
     /// whoever drives one sets this (bots stop at 60 actions by themselves).
     pub turn_action_caps: Vec<u32>,
+    /// Optional host budget for successful warband Move actions per turn (0 = unlimited).
+    /// This is an experiment/time budget, not a Battlegrounds rule.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub move_actions_per_turn: u32,
     /// The Freeze button answers this many times a turn - freezing and unfreezing the Tavern
     /// each count - and is not available after that (0 = no limit). 10 in the game
     /// (client 36.6.3). Not written while it has its default.
@@ -285,6 +289,7 @@ impl Default for RulesConfig {
             deity_threshold: 4,
             max_actions_per_turn: max_actions(),
             turn_action_caps: Vec::new(),
+            move_actions_per_turn: 0,
             freeze_presses_per_turn: freeze_presses(),
             max_turns: max_turns(),
             record_log: false,
@@ -327,8 +332,12 @@ impl RulesConfig {
 
     /// The fields that are not written while they have their default (the default config
     /// stays the same): `from_json` knows them by name.
-    const UNWRITTEN_AT_DEFAULT: [&'static str; 3] =
-        ["hero_bans", "freeze_presses_per_turn", "experimental_mode"];
+    const UNWRITTEN_AT_DEFAULT: [&'static str; 4] = [
+        "hero_bans",
+        "freeze_presses_per_turn",
+        "experimental_mode",
+        "move_actions_per_turn",
+    ];
 
     pub fn validate(&self) -> Result<(), String> {
         let (b, h, s) = (self.board_size, self.hand_size, 7 + self.shop_spell_slots);
@@ -540,6 +549,10 @@ fn shop_max_cards() -> usize {
 
 fn max_turns() -> u32 {
     100
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 fn freeze_presses() -> u32 {

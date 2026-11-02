@@ -23,11 +23,14 @@ pub const QUEST_F: usize = 2;
 /// Secrets in play shown: a player holds at most 5 (the Hearthstone limit; Akazamzarak's
 /// four plus one from a trinket).
 pub const N_SECRETS: usize = crate::state::MAX_SECRETS;
-pub const OPP_F: usize = 9;
+/// Public summary plus last observed combat turn / 20 (0 = never observed).
+pub const OPP_F: usize = 10;
 pub const N_OPP: usize = 7;
 /// Opponent warband memory (last seen boards, 7 minions each).
 pub const OPP_BOARD_F: usize = N_OPP * N_BOARD * MINION_F;
 pub const PENDING_KINDS: usize = 9;
+/// Remaining total-action / Move / Freeze host budgets.
+pub const ACTION_BUDGET_F: usize = 3;
 
 pub const OBS_FLOATS: usize = GLOBAL_F
     + N_QUESTS * QUEST_F
@@ -37,7 +40,8 @@ pub const OBS_FLOATS: usize = GLOBAL_F
     + N_SHOP * ITEM_F
     + N_CHOICE * ITEM_F
     + N_OPP * OPP_F
-    + OPP_BOARD_F;
+    + OPP_BOARD_F
+    + ACTION_BUDGET_F;
 /// hero, hero powers, Deity, source of the pending choice, board, hand, shop, choices, owned
 /// trinkets (8), Quests with their Rewards, owned Rewards, Secrets, opponent heroes, opponent
 /// last boards.
@@ -58,16 +62,23 @@ fn card_index(c: CardId) -> i32 {
     c.idx() as i32 + 1
 }
 
+// log1p keeps late-game stats usable without a hard cap. 10 stats maps to 1.
+fn stat_feature(value: i32) -> f32 {
+    (value.max(0) as f32).ln_1p() / 10.0_f32.ln_1p()
+}
+
+// TODO(observation): encode visible dynamic card counters, attached card identities,
+// hero progress and persistent effect contents; counts alone do not identify effects.
 fn push_minion(f: &mut Vec<f32>, m: Option<&Minion>) {
     let Some(m) = m else {
         f.extend(std::iter::repeat_n(0.0, MINION_F));
         return;
     };
     f.push(1.0);
-    f.push(m.atk as f32 / 10.0);
-    f.push(m.hp as f32 / 10.0);
-    f.push(m.max_hp as f32 / 10.0);
-    f.push(m.tier as f32 / 6.0);
+    f.push(stat_feature(m.atk));
+    f.push(stat_feature(m.hp));
+    f.push(stat_feature(m.max_hp));
+    f.push(m.tier as f32 / 7.0);
     f.push(m.golden as u8 as f32);
     f.push(m.attached.len() as f32 / 3.0);
     f.push(m.shield_hits as f32 / 3.0);
@@ -106,7 +117,7 @@ fn push_item(f: &mut Vec<f32>, it: Option<&Item>, cost: i32, locked: u8, flags: 
             f.push(*data as f32 / 6.0);
             f.push(0.0);
             f.push(0.0);
-            f.push(db().get(*card).tier as f32 / 6.0);
+            f.push(db().get(*card).tier as f32 / 7.0);
             f.extend(std::iter::repeat_n(0.0, MINION_F - 5));
         }
     }
@@ -159,12 +170,12 @@ pub fn observe_view(g: &Game, p: PlayerId, all: bool) -> Observation {
         (g.phase == Phase::GameOver) as u8 as f32,
         alive as f32 / 8.0,
         pl.alive as u8 as f32,
-        pl.health as f32 / 40.0,
+        (pl.health.max(0) as f32).ln_1p() / 40.0_f32.ln_1p(),
         pl.armor as f32 / 20.0,
         pl.gold as f32 / 10.0,
         pl.max_gold_bonus as f32 / 5.0,
         pl.gold_next_turn as f32 / 5.0,
-        pl.tier as f32 / 6.0,
+        pl.tier as f32 / 7.0,
         g.upgrade_price(p) as f32 / 10.0,
         g.refresh_price(p) as f32 / 2.0,
         g.minion_price(p) as f32 / 3.0,
@@ -179,8 +190,11 @@ pub fn observe_view(g: &Game, p: PlayerId, all: bool) -> Observation {
         g.can_dark_gift(p) as u8 as f32,
         pl.dark_gift_uses as f32 / 3.0,
         pl.trinkets.len() as f32 / 2.0,
-        pl.deity.as_ref().map(|d| d.atk).unwrap_or(0) as f32 / 10.0,
-        pl.deity.as_ref().map(|d| d.hp).unwrap_or(0) as f32 / 10.0,
+        pl.deity
+            .as_ref()
+            .map(|d| stat_feature(d.atk))
+            .unwrap_or(0.0),
+        pl.deity.as_ref().map(|d| stat_feature(d.hp)).unwrap_or(0.0),
         pl.stats.won_last as u8 as f32,
         pl.stats.lost_last as u8 as f32,
         pl.stats.spell_atk as f32 / 5.0,
@@ -379,7 +393,8 @@ pub fn observe_view(g: &Game, p: PlayerId, all: bool) -> Observation {
                     o.alive as u8 as f32,
                     1.0,
                     0.0,
-                    1.0 / 6.0,
+                    1.0 / 7.0,
+                    0.0,
                     0.0,
                     0.0,
                     0.0,
@@ -391,13 +406,14 @@ pub fn observe_view(g: &Game, p: PlayerId, all: bool) -> Observation {
                 f.extend([
                     1.0,
                     o.alive as u8 as f32,
-                    o.health as f32 / 40.0,
+                    (o.health.max(0) as f32).ln_1p() / 40.0_f32.ln_1p(),
                     o.armor as f32 / 20.0,
-                    o.tier as f32 / 6.0,
+                    o.tier as f32 / 7.0,
                     g.board_shown(p, o.id, all).0.len() as f32 / 7.0,
                     o.placement as f32 / 8.0,
                     (pl.last_opponent == Some(o.id)) as u8 as f32,
                     (pl.next_opponent == Some(o.id)) as u8 as f32,
+                    g.board_shown(p, o.id, all).1 as f32 / 20.0,
                 ]);
                 c.push(o.hero.map(card_index).unwrap_or(0));
             }
@@ -416,6 +432,25 @@ pub fn observe_view(g: &Game, p: PlayerId, all: bool) -> Observation {
             c.push(m.map(|m| card_index(m.card)).unwrap_or(0));
         }
     }
+    // Fixed typical scales preserve absolute remaining budgets across experiments.
+    // -1 explicitly denotes no limit; 0 denotes an exhausted budget.
+    let remaining = |cap: u32, used: u32, scale: f32| {
+        if cap == 0 {
+            -1.0
+        } else {
+            cap.saturating_sub(used) as f32 / scale
+        }
+    };
+    let total = g.action_cap_of(p);
+    f.extend([
+        if pl.uncapped || total == u32::MAX {
+            -1.0
+        } else {
+            total.saturating_sub(pl.actions_this_turn) as f32 / 100.0
+        },
+        remaining(g.cfg.move_actions_per_turn, pl.moves_this_turn, 10.0),
+        remaining(g.cfg.freeze_presses_per_turn, pl.freezes_this_turn, 5.0),
+    ]);
     debug_assert_eq!(f.len(), OBS_FLOATS);
     debug_assert_eq!(c.len(), OBS_CARDS);
     Observation {

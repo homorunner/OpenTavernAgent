@@ -68,11 +68,23 @@ while True:
 - `env.save(i)` / `env.load(i, s)` save and restore game `i` exactly; `env.game(i)` returns an
   independent copy to inspect or search from.
 
-**Observation.** A player view with only what the real client shows: `features` (3,227 floats:
-global state, warband, hand, Tavern, pending choice, quests, opponents' last seen warbands)
+**Observation.** A player view plus visible host action budgets: `features` (3,237 floats:
+global state, warband, hand, Tavern, pending choice, quests, opponents' last seen warbands,
+then remaining total-action / Move / Freeze budgets)
 and `cards` (124 card-embedding indices into the `N_CARDS` card vocabulary, 0 = empty;
 `taverngym.card_info(i)` describes index `i`). `taverngym.layout()` lists the sizes of every
 block, so a model can slice the vector without hard-coding offsets.
+
+Stat encoding: minion Attack/current Health/maximum Health use
+`log1p(max(stat, 0)) / log(11)`; hero Health uses `log1p(max(health, 0)) / log(41)`.
+Tavern/card tiers are divided by 7; other features use their existing linear scales.
+Each opponent's 10-value summary ends with `last_seen_turn / 20` (0 = never seen),
+paired with that opponent's historical board, including an observed empty board.
+The final three floats are remaining actions/100, Moves/10 and Freeze presses/5; -1 means
+unlimited and 0 means exhausted. `Game.action_budgets(seat)` returns the exact counts
+(`None` for unlimited). TavernAgent uses finite positive host limits, v2 model/trainer
+snapshots and the `sampled-prep-v2` search protocol. Rebuild the extension after changing
+this encoding.
 
 **Actions.** 245 discrete actions with an exact legal mask (`taverngym.action_name(a)` names
 one):

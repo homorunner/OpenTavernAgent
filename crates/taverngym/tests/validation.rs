@@ -219,7 +219,7 @@ fn t21_temporary_bans_are_in_no_pool() {
     }
 }
 
-/// Drustfallen Butcher's Avenge is 4 (the 3 seen live before 36.6.2 was a bug).
+/// Drustfallen Butcher's Avenge threshold is 4.
 #[test]
 fn t22_drustfallen_butcher_avenge_four() {
     let mut g = game(722);

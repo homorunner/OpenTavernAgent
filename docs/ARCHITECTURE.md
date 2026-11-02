@@ -198,7 +198,7 @@ state from another card table (`Game::card_table` vs `CardDb::fingerprint`) or a
   is accepted by `Game::apply` (test `every_masked_legal_action_applies`).
 - **`obs`**: `obs::observe(game, seat)` gives the player-view `Observation`: `floats` (f32
   features: global state, Quests, pending choice, warband, hand, Tavern, choice options,
-  opponents' public state and the warbands seen of them) and `cards` (i32 card-embedding
+  opponents' public state including the last observed combat turn /20, and the warbands seen of them) and `cards` (i32 card-embedding
   indices, 0 = empty, else `CardId + 1`). `taverngym.layout()` gives the block sizes. Only what
   the client shows is encoded: of an opponent's warband, what the player saw in its last combat
   against it (`Game::known_board`), never hands or unfought boards.

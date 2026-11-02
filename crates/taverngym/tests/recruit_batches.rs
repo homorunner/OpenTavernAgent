@@ -32,6 +32,40 @@ fn count_hand(g: &Game, id: &str) -> usize {
 }
 
 #[test]
+fn quest_completion_during_summon_can_triple_away_the_inserted_slot() {
+    use taverngym::state::QuestState;
+
+    let mut g = fixture(1390079);
+    g.cfg.triple_copies = 3;
+    let filler = db().get(db().golden_of(cid("BG20_100"))).id.as_str();
+    set_board(
+        &mut g,
+        0,
+        &[filler, filler, filler, filler, filler, "BG25_009"],
+    );
+    give(&mut g, 0, "BG25_009");
+    let attack: i32 = g.players[0].board.iter().map(|m| m.atk).sum();
+    let added = g.players[0].hand[0].item.as_minion().unwrap().atk;
+    g.players[0].quests.push(QuestState {
+        card: cid("BG27_Quest_801"),
+        reward: cid("BG27_Reward_803"),
+        progress: attack,
+        goal: attack + added,
+        data: 0,
+        reward_data: 0,
+    });
+    // Playing the second Eternal Summoner completes Pressure the Authorities.
+    // Turbulent Tombs gives the third copy, removing both board copies in a triple.
+    play_last(&mut g, 0);
+    assert_eq!(g.players[0].board.len(), 5);
+    assert!(g.players[0].board.iter().all(|m| m.card != cid("BG25_009")));
+    assert!(g.players[0].quests.is_empty());
+    assert!(g.players[0].rewards.contains(&cid("BG27_Reward_803")));
+    let golden = db().golden_of(cid("BG25_009"));
+    assert!(g.players[0].hand.iter().any(|h| h.item.card() == golden));
+}
+
+#[test]
 fn generated_spell_kind_does_not_make_a_goldenizer_a_tavern_spell() {
     for id in [
         "BG26_813t",
