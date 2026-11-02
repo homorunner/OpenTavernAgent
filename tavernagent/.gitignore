@@ -1,0 +1,4 @@
+﻿# build artefacts
+__pycache__/
+*.pyc
+models/

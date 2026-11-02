@@ -379,6 +379,7 @@ impl Game {
         pl.ended_turn = false;
         pl.actions_this_turn = 0;
         pl.freezes_this_turn = 0;
+        pl.moves_this_turn = 0;
         pl.skipping = false;
         pl.turn_data.clear();
         pl.tavern_turn_health = 0;

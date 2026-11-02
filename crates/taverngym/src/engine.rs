@@ -911,6 +911,8 @@ impl<'g> Ctx<'g> {
             let n = db().normal_of(m.card);
             n == mishmash || n == amalgam
         };
+        // Capture the name before summon triggers can change the board.
+        let name = m.name();
         self.boards[side].insert(pos, m);
         crate::content::check_total_attack(self, side);
         if watched {
@@ -922,7 +924,6 @@ impl<'g> Ctx<'g> {
         if aura != (0, 0) {
             self.buff(eid, aura.0, aura.1);
         }
-        let name = self.boards[side][pos].name();
         let who = self.who(side);
         self.g.log(|| format!("{who} summons {name} at {pos}"));
         self.emit(Event::Summoned { side, eid });

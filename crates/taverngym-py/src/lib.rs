@@ -86,6 +86,29 @@ impl PyGame {
         check_seat(&self.g, p)?;
         Ok(self.g.needs_action(p))
     }
+    /// Remaining host budgets: total actions, warband moves, Freeze presses.
+    /// None denotes an unlimited budget. All three are visible to the acting player.
+    fn action_budgets(&self, p: usize) -> PyResult<(Option<u32>, Option<u32>, Option<u32>)> {
+        check_seat(&self.g, p)?;
+        let pl = &self.g.players[p];
+        let total = self.g.action_cap_of(p);
+        let remaining = |cap: u32, used: u32| {
+            if cap == 0 {
+                None
+            } else {
+                Some(cap.saturating_sub(used))
+            }
+        };
+        Ok((
+            if pl.uncapped || total == u32::MAX {
+                None
+            } else {
+                Some(total.saturating_sub(pl.actions_this_turn))
+            },
+            remaining(self.g.cfg.move_actions_per_turn, pl.moves_this_turn),
+            remaining(self.g.cfg.freeze_presses_per_turn, pl.freezes_this_turn),
+        ))
+    }
     /// Legal-action mask as bytes (one u8 per action).
     fn legal_mask<'py>(&self, py: Python<'py>, p: usize) -> PyResult<Bound<'py, PyBytes>> {
         check_seat(&self.g, p)?;
@@ -150,9 +173,17 @@ impl PyGame {
     fn log(&self) -> Vec<String> {
         self.g.log.clone()
     }
-    /// Independent deep copy (for search / rollouts).
-    fn copy(&self, py: Python<'_>) -> Self {
-        py.detach(|| self.clone())
+    /// Independent deep copy. An explicit seed replaces only the copy's future RNG;
+    /// copy() without a seed remains an exact snapshot for replay and save/restore.
+    #[pyo3(signature = (seed=None))]
+    fn copy(&self, py: Python<'_>, seed: Option<u64>) -> Self {
+        py.detach(|| {
+            let mut copy = self.clone();
+            if let Some(seed) = seed {
+                copy.g.rng = taverngym::rng::Rng::new(seed);
+            }
+            copy
+        })
     }
     /// Human-readable JSON view of seat `p` (`taverngym::debug::view`).
     fn view(&self, py: Python<'_>, p: usize) -> PyResult<String> {
@@ -433,6 +464,7 @@ fn layout() -> Vec<(&'static str, usize)> {
         ("MINION_F", o::MINION_F),
         ("ITEM_F", o::ITEM_F),
         ("GLOBAL_F", o::GLOBAL_F),
+        ("ACTION_BUDGET_F", o::ACTION_BUDGET_F),
         ("N_QUESTS", o::N_QUESTS),
         ("QUEST_F", o::QUEST_F),
         ("N_SECRETS", o::N_SECRETS),
