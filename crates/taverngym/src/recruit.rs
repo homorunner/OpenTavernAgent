@@ -2301,10 +2301,28 @@ impl Game {
     }
 
     /// Back out of a cancellable pending choice (spell/hero power/Activate targeting).
+    /// Whether the top pending choice may be declined: when nothing has been paid or moved
+    /// yet, or when it is a paid trinket offer whose every option has become unaffordable
+    /// (Gold spent on another choice opened at the same time, e.g. Buttons' offer before
+    /// Trip Vouchers'); declining such an offer is the only way out.
+    pub fn can_cancel(&self, p: PlayerId) -> bool {
+        match self.players[p].pending.last() {
+            None => false,
+            Some(top) if top.cancellable() => true,
+            Some(Pending::Trinket {
+                options,
+                free: false,
+                ..
+            }) => (0..options.len()).all(|i| !self.option_legal(p, i)),
+            Some(_) => false,
+        }
+    }
+
     pub fn cancel(&mut self, p: PlayerId) -> ActResult {
+        let cancellable = self.can_cancel(p);
         let pl = &mut self.players[p];
         match pl.pending.last() {
-            Some(top) if top.cancellable() => {
+            Some(top) if cancellable => {
                 let combined = matches!(
                     top,
                     Pending::Target {

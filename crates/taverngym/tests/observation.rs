@@ -100,3 +100,39 @@ fn end_turn_effects_previews_the_position_handed_to_combat_without_fighting() {
     assert!(g.players.iter().all(|p| p.ended_turn));
     assert_eq!(observe(&g, 0).floats[ENDED_TURN_F], 1.0);
 }
+
+#[test]
+fn an_unaffordable_paid_trinket_offer_can_be_declined() {
+    use taverngym::actions::{A_CANCEL, A_CHOOSE};
+    let mut g = game(4208);
+    g.players[0].gold = 3;
+    let greater: Vec<CardId> = db()
+        .iter()
+        .filter(|d| d.kind == taverngym::cards::CardKind::TrinketGreater && d.cost >= 5)
+        .map(|d| d.cid)
+        .take(3)
+        .collect();
+    g.players[0].trinkets.push(cid("BG30_MagicItem_891"));
+    g.players[0].pending.push(Pending::Trinket {
+        options: greater.clone(),
+        free: false,
+        replace: Some(cid("BG30_MagicItem_891")),
+    });
+    assert!(g.needs_action(0));
+    let mask = g.legal_mask(0);
+    assert!((0..greater.len()).all(|i| !mask[A_CHOOSE + i]));
+    assert!(mask[A_CANCEL], "declining is the only legal action");
+    assert!(g.legal_actions(0).len() == 1);
+    g.apply(0, Action::Cancel).unwrap();
+    assert!(g.players[0].pending.is_empty());
+    assert!(g.players[0].trinkets.contains(&cid("BG30_MagicItem_891")));
+    // With enough Gold the offer cannot be declined.
+    g.players[0].gold = 20;
+    g.players[0].pending.push(Pending::Trinket {
+        options: greater,
+        free: false,
+        replace: Some(cid("BG30_MagicItem_891")),
+    });
+    assert!(!g.legal_mask(0)[A_CANCEL]);
+    assert!(g.apply(0, Action::Cancel).is_err());
+}

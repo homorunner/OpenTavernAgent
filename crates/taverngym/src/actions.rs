@@ -221,7 +221,7 @@ impl Game {
             for i in 0..top.len().min(N_CHOICE) {
                 m[A_CHOOSE + i] = self.option_legal(p, i);
             }
-            m[A_CANCEL] = top.cancellable();
+            m[A_CANCEL] = self.can_cancel(p);
             return m;
         }
         let cfg = &self.cfg;
