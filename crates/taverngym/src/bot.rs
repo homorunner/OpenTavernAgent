@@ -38,6 +38,10 @@ fn item_value(i: &Item) -> i32 {
 /// Choose one action for `p` (always legal when `game.needs_action(p)`).
 pub fn choose_action(g: &mut Game, p: PlayerId) -> Action {
     if let Some(top) = g.players[p].pending.last().cloned() {
+        // A paid trinket offer with nothing affordable left is declined.
+        if matches!(top, Pending::Trinket { .. }) && !g.option_legal(p, 0) && g.can_cancel(p) {
+            return Action::Cancel;
+        }
         return Action::Choose(pick_option(g, p, &top));
     }
     let pl = &g.players[p];

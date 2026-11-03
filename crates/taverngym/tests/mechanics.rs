@@ -11917,9 +11917,10 @@ fn a_saved_game_is_checked_against_the_card_table() {
 }
 
 #[test]
-fn a_seat_without_a_legal_action_stops_the_bots_at_once() {
-    // A paid trinket offer nobody can afford and nobody can decline (built by hand: the
-    // engine skips such an offer).
+fn a_paid_trinket_offer_nobody_can_afford_is_declined() {
+    // Gold spent on one offer can make another, opened at the same time, unaffordable
+    // (Buttons' turn-8 offer before Trip Vouchers'); declining is then the only legal action
+    // and the bot takes it instead of stalling.
     let mut g = game(9502);
     let dear = *g
         .trinket_universe
@@ -11932,9 +11933,15 @@ fn a_seat_without_a_legal_action_stops_the_bots_at_once() {
         free: false,
         replace: None,
     });
-    assert!(g.needs_action(0) && !g.legal_mask(0).iter().any(|x| *x));
-    assert!(!taverngym::bot::play_turn(&mut g, 0), "nothing was done");
-    assert!(g.players[0].pending.len() == 1);
+    assert!(g.needs_action(0));
+    assert_eq!(
+        g.legal_actions(0),
+        vec![taverngym::actions::A_CANCEL],
+        "declining is the only legal action"
+    );
+    assert_eq!(taverngym::bot::choose_action(&mut g, 0), Action::Cancel);
+    assert!(taverngym::bot::play_turn(&mut g, 0));
+    assert!(g.players[0].pending.is_empty());
 }
 
 #[test]

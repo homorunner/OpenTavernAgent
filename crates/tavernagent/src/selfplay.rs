@@ -185,6 +185,21 @@ pub fn play_one<E: Evaluator + ?Sized>(
             }
             acted = true;
             let obs = observe_seat(&game, seat);
+            if !obs.mask.iter().any(|m| *m) {
+                // An engine state the policy cannot act in; keep it for diagnosis.
+                if let Ok(dir) = std::env::var("TAVERNAGENT_DUMP_DIR") {
+                    let path = format!(
+                        "{dir}/no_legal_action_seed{seed}_seat{seat}_turn{}.json",
+                        game.turn
+                    );
+                    let _ = std::fs::write(&path, serde_json::to_string(&game).unwrap_or_default());
+                }
+                return Err(format!(
+                    "seat {seat} needs an action but has no legal one: seed={seed}, turn={}, pending={:?}",
+                    game.turn,
+                    game.players[seat].pending.last()
+                ));
+            }
             let result = mcts::search(&game, seat, net, &opts.search, &mut rng)?;
             let mut action = if opts.temperature <= 0.0 {
                 result.best_action()
