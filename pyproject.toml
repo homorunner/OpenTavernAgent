@@ -13,7 +13,6 @@ dependencies = ["numpy"]
 
 [project.optional-dependencies]
 test = ["pytest"]
-experiments = ["matplotlib>=3.5"]
 # TavernBench model runners (scoring needs none of these)
 bench = ["openai>=1.0", "httpx", "requests"]
 
@@ -29,7 +28,7 @@ features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["python", "tavernagent"]
+pythonpath = ["python"]
 
 [tool.ruff]
 line-length = 100

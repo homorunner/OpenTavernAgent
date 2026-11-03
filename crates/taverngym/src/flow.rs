@@ -764,8 +764,19 @@ impl Game {
 
     /// End a player's recruit phase; when all living players are done, fight and advance.
     pub fn end_turn(&mut self, p: PlayerId) -> crate::recruit::ActResult {
+        self.end_turn_effects(p)?;
+        self.fight_when_all_ended();
+        Ok(())
+    }
+
+    /// Everything `end_turn` does except starting the fight: end-of-turn effects, their
+    /// pending choices (resolved randomly), `ended_turn`. The seat then needs no action and
+    /// the round does not start even when it was the last to end, so a search or a trainer
+    /// can look at the position a seat hands to combat. On an exact copy this consumes the
+    /// random stream exactly as `end_turn` does, so the preview matches the real End Turn.
+    pub fn end_turn_effects(&mut self, p: PlayerId) -> crate::recruit::ActResult {
         let pl = &self.players[p];
-        if !pl.alive || pl.ended_turn {
+        if self.phase != Phase::Recruit || !pl.alive || pl.ended_turn {
             return Err("can't end turn");
         }
         if !pl.pending.is_empty() {
@@ -814,7 +825,6 @@ impl Game {
             pl.normalize_timewarp_hand_limit(self.cfg.hand_size);
         }
         pl.last_board = pl.board.clone();
-        self.fight_when_all_ended();
         Ok(())
     }
 

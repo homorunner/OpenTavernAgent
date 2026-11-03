@@ -4,6 +4,8 @@ TavernGym is a headless simulator of Hearthstone Battlegrounds solo mode (client
 server rules 37.0.2) built as a reinforcement-learning environment. All game logic lives in the
 pure-Rust crate `crates/taverngym`. `crates/taverngym-py` is a thin PyO3 layer exposed as
 `taverngym._core`, and `python/taverngym` wraps it in numpy-based environments.
+`crates/tavernagent` is a separate Rust crate (network, PUCT search, self-play training and
+evaluation) that depends on `taverngym` directly; see [TavernAgent](TAVERNAGENT.md).
 
 The 37.0.2 update keeps these layers and the Python action/observation layouts. Card IDs
 retain their table order. Trinket instance tags distinguish multiple owned copies, and
@@ -19,6 +21,7 @@ cards.rs   CardDb: card definitions, pool flags, golden links           ▼
 engine.rs  Game + Ctx   ◀── recruit.rs / combat.rs / flow.rs
 script.rs  hook table   ◀── content/*.rs (one Script per card)
 actions.rs / obs.rs / env.rs / batch.rs / bot.rs ──▶ taverngym-py ──▶ python/taverngym
+                                                 └──▶ crates/tavernagent (net, mcts, selfplay)
 ```
 
 | Module | Responsibility |
@@ -136,6 +139,9 @@ universes, the shared pool and `hero_choices` offers per seat. Phases run
 - **End turn** (`Game::end_turn`, refused while a choice is pending): end-of-turn hooks run
   `Ctx::end_of_turn_mult` times, choices they open resolve at random, temporary cards leave the
   hand, and the warband is kept in `Player::last_board`. The last seat to end starts the round.
+  `Game::end_turn_effects` is the same without the round starting (for previewing the position
+  a seat hands to combat on a copy; TavernAgent's search and training rely on it);
+  `Game::end_turn` is that followed by the fight check.
 - **Combat round** (`Game::combat_round`): nobody meets an opponent (ghost included) from their
   last two combats unless no other pairing exists; with an odd count one player fights the
   ghost, the last eliminated player's final warband. Each side remembers the warband it fought
@@ -265,6 +271,8 @@ With `RulesConfig::record_log`, `Game::log` holds a text event log and each `Com
 - `crates/taverngym/tests/` holds `mechanics.rs` (a focused test per mechanic), `persistence.rs`
   (combat never leaks into the persistent warband) and content tests; modules carry unit tests
   (e.g. `batch`: thread independence, exact save/load); pytest (`tests/`) covers the Python side.
+- `crates/tavernagent/tests/` covers the agent: numerical gradient checks, search information
+  boundaries, self-play samples and combat labels, replay persistence and exact resume.
 - CI runs `cargo fmt --check`, `cargo clippy --release --all-targets -- -D warnings`,
   `cargo test --release`, `pip install -e ".[test]"` and `pytest`.
 
