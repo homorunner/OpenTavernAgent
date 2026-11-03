@@ -16,7 +16,11 @@ pub const MINION_F: usize = 8 + Kw::NAMES.len() + Races::COUNT;
 /// (Tavern: frozen; hand: dies if played this turn, Tomb Turning), kept from last turn
 /// (Tavern), marked (Tavern: Darkmoon Ticket; hand: linked group).
 pub const ITEM_F: usize = 9 + MINION_F;
-pub const GLOBAL_F: usize = 42 + Races::COUNT;
+/// Global state; the last scalar before the lobby races is `ended_turn`.
+pub const GLOBAL_F: usize = 43 + Races::COUNT;
+/// Offset of the `ended_turn` flag: the seat has finished recruiting and waits for combat
+/// (see `Game::end_turn_effects`), so it has no legal action.
+pub const ENDED_TURN_F: usize = GLOBAL_F - Races::COUNT - 1;
 /// Active Quests shown (present, progress / goal each).
 pub const N_QUESTS: usize = 3;
 pub const QUEST_F: usize = 2;
@@ -215,6 +219,7 @@ pub fn observe_view(g: &Game, p: PlayerId, all: bool) -> Observation {
             _ => pl.chronum_saved,
         } as f32
             / 4.0,
+        pl.ended_turn as u8 as f32,
     ]);
     for i in 0..Races::COUNT {
         f.push((g.lobby_races.0 >> i & 1) as f32);

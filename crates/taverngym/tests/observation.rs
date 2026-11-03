@@ -16,7 +16,7 @@ fn stats_are_log_scaled_and_other_features_stay_linear() {
     g.players[0].health = 20;
     let obs = observe(&g, 0);
     let offset = GLOBAL_F + N_QUESTS * QUEST_F + PENDING_KINDS;
-    assert_eq!(obs.floats.len(), 3237);
+    assert_eq!(obs.floats.len(), 3238);
     assert_eq!(obs.floats[7], 0.7);
     assert!((obs.floats[5] - 20.0_f32.ln_1p() / 40.0_f32.ln_1p()).abs() < 1e-6);
     assert!((obs.floats[offset + 1] - 1.0).abs() < 1e-6);
@@ -65,4 +65,38 @@ fn remaining_action_budgets_are_visible_and_unlimited_is_distinct() {
         &observe(&g, 0).floats[OBS_FLOATS - ACTION_BUDGET_F..],
         &[-1.0, -1.0, -1.0]
     );
+}
+
+#[test]
+fn end_turn_effects_previews_the_position_handed_to_combat_without_fighting() {
+    use taverngym::engine::Phase;
+    let mut g = game(4207);
+    g.cfg.triple_copies = 99;
+    set_board(&mut g, 0, &["BG36_115"]); // Nightmare Corroder: a spell to hand at end of turn
+    assert_eq!(observe(&g, 0).floats[ENDED_TURN_F], 0.0);
+    // A non-last seat: the preview is exactly what End Turn does.
+    let mut real = g.clone();
+    real.apply(0, Action::EndTurn).unwrap();
+    let mut preview = g.clone();
+    preview.end_turn_effects(0).unwrap();
+    preview.players[0].actions_this_turn += 1; // `apply` counts the action itself
+    assert_eq!(
+        serde_json::to_string(&preview).unwrap(),
+        serde_json::to_string(&real).unwrap()
+    );
+    assert_eq!(preview.players[0].hand.len(), 1, "end-of-turn effects ran");
+    assert!(preview.players[0].ended_turn && !preview.needs_action(0));
+    assert!(preview.legal_actions(0).is_empty());
+    assert_eq!(observe(&preview, 0).floats[ENDED_TURN_F], 1.0);
+    assert!(preview.end_turn_effects(0).is_err(), "already ended");
+    // The last seat to end: the round does not start.
+    for p in 1..8 {
+        g.apply(p, Action::EndTurn).unwrap();
+    }
+    let turn = g.turn;
+    g.end_turn_effects(0).unwrap();
+    assert_eq!(g.turn, turn);
+    assert_eq!(g.phase, Phase::Recruit);
+    assert!(g.players.iter().all(|p| p.ended_turn));
+    assert_eq!(observe(&g, 0).floats[ENDED_TURN_F], 1.0);
 }

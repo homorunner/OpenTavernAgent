@@ -4,12 +4,12 @@
   <img src="docs/assets/autotavern-banner.png" alt="AutoTavern: fantasy tavern, tactical battlefield and AI decision trees" width="100%">
 </p>
 
-<h3 align="center">TavernGym &amp; TavernBench</h3>
+<h3 align="center">TavernGym, TavernBench &amp; TavernAgent</h3>
 
 <p align="center"><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
 
 <p align="center">
-  A fast simulator and a decision benchmark for Hearthstone Battlegrounds.
+  A fast simulator, a decision benchmark and a self-play agent for Hearthstone Battlegrounds.
 </p>
 
 <p align="center">
@@ -24,6 +24,7 @@
   <a href="#quick-start">Quick Start</a> ·
   <a href="#taverngym">TavernGym</a> ·
   <a href="#tavernbench">TavernBench</a> ·
+  <a href="#tavernagent">TavernAgent</a> ·
   <a href="#documentation">Documentation</a> ·
   <a href="#citation">Citation</a>
 </p>
@@ -44,8 +45,10 @@ This is the code and data release for [*Build, Don't Play: Self-Improving LLM Re
 Develop a Hearthstone Battlegrounds AI That Rivals Top Players*](https://arxiv.org/abs/2610.33845v1),
 by Changlian Ma and Limin Wang, Nanjing University and Shanghai AI Laboratory.
 
-The release includes TavernGym and TavernBench. The trained TavernAgent, its weights and
-training code, and the benchmark item generators are not included.
+The upstream release includes TavernGym and TavernBench; the paper's TavernAgent and the
+benchmark item generators were not released. This repository adds its own TavernAgent
+(`crates/tavernagent`): a policy/value network, PUCT search and self-play training written in
+Rust on top of TavernGym. See [TavernAgent](#tavernagent).
 
 TavernGym now targets **37.0.2**; see the [patch notes](docs/PATCH_37.0.2.md).
 TavernBench keeps the paper's **36.6.3** tasks, labels, saved states and results unchanged.
@@ -107,7 +110,7 @@ It exposes the player-visible state, an exact legal action mask, and seeded save
 | `BattlegroundsEnv` | Connect one learning seat against seven scripted bots. |
 | `BatchEnv` | Step many games together, with any set of controlled seats, including self-play. |
 
-The learning interface provides 245 discrete actions, 3,237 numeric features and 124 card
+The learning interface provides 245 discrete actions, 3,238 numeric features and 124 card
 indices per observation. Rules and lobby settings can be configured explicitly.
 
 [Environment guide](docs/TAVERNGYM.md) · [Architecture](docs/ARCHITECTURE.md) ·
@@ -142,19 +145,35 @@ pip install ".[bench]"
 [Benchmark guide](docs/TAVERNBENCH.md) · [Task data](tavernbench/data) ·
 [Released answers](tavernbench/results) · [Scoring code](tavernbench/tavernbench/score.py)
 
+## TavernAgent
+
+```bash
+cargo build --release -p tavernagent
+target/release/tavernagent selfplay --steps 200 --workers 32 --save-every 100 --out runs/agent/model.npz
+target/release/tavernagent eval --model runs/agent/model.step200.npz --games 1024 --workers 32
+```
+
+A 0.8M-parameter network (policy, value and an auxiliary combat-outcome head over a shared
+card embedding) drives a PUCT search that stays inside the seat's own recruit phase and
+evaluates the position handed to combat. All eight seats self-play; training uses AdamW on
+a replay window with an EMA copy of the weights. After 1,000 rounds of 128 games the agent
+places 2.7 on average against seven scripted bots (the bot itself places 4.6).
+[Details, options and results](docs/TAVERNAGENT.md).
+
 ## Documentation
 
 | Guide | Contents |
 | :--- | :--- |
 | [TavernGym](docs/TAVERNGYM.md) | Game APIs, batched environments, observations, actions, configuration and speed. |
 | [TavernBench](docs/TAVERNBENCH.md) | Dataset layout, labels, scoring, model runners, tool use and reproduction notes. |
+| [TavernAgent](docs/TAVERNAGENT.md) | Network, search, self-play training, evaluation commands and experiment results. |
 | [Architecture](docs/ARCHITECTURE.md) | Engine structure, interfaces and how the components fit together. |
 | [Content coverage](docs/CONTENT.md) | Implemented minions, heroes, spells, trinkets and other game objects. |
 | [Timewarp](docs/TIMEWARP.md) | The Timewarped Tavern (off by default in 37.0.2; two heroes still visit it). |
 | [TavernPlugin journal](docs/TAVERNPLUGIN_JOURNAL.md) | Hooking the live game into TavernGym: design, runtime limits, and how the board and shop were aligned. |
 
-For development, run `pip install -e ".[test]"` and `pytest`. The Rust crate also works on its
-own with `cargo test --release`.
+For development, run `pip install -e ".[test]"` and `pytest`; the Rust crates are tested with
+`cargo test --release`.
 
 ## Citation
 

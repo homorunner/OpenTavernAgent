@@ -68,7 +68,7 @@ while True:
 - `env.save(i)` / `env.load(i, s)` save and restore game `i` exactly; `env.game(i)` returns an
   independent copy to inspect or search from.
 
-**Observation.** A player view plus visible host action budgets: `features` (3,237 floats:
+**Observation.** A player view plus visible host action budgets: `features` (3,238 floats:
 global state, warband, hand, Tavern, pending choice, quests, opponents' last seen warbands,
 then remaining total-action / Move / Freeze budgets)
 and `cards` (124 card-embedding indices into the `N_CARDS` card vocabulary, 0 = empty;
@@ -82,8 +82,12 @@ Each opponent's 10-value summary ends with `last_seen_turn / 20` (0 = never seen
 paired with that opponent's historical board, including an observed empty board.
 The final three floats are remaining actions/100, Moves/10 and Freeze presses/5; -1 means
 unlimited and 0 means exhausted. `Game.action_budgets(seat)` returns the exact counts
-(`None` for unlimited). TavernAgent uses finite positive host limits, v2 model/trainer
-snapshots and the `sampled-prep-v2` search protocol. Rebuild the extension after changing
+(`None` for unlimited). The global block ends (before the lobby races) with `ended_turn`
+(`layout()["ENDED_TURN_F"]`): 1 once the seat has finished recruiting and has no legal
+action. `Game.end_turn_effects(seat)` ends a seat's turn on a copy without starting the
+fight, even for the last seat: end-of-turn effects run and their choices resolve randomly,
+exactly as the real End Turn would, so a search can evaluate the position handed to
+combat ([TavernAgent](TAVERNAGENT.md) builds on this). Rebuild the extension after changing
 this encoding.
 
 **Actions.** 245 discrete actions with an exact legal mask (`taverngym.action_name(a)` names

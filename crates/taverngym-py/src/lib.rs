@@ -120,6 +120,15 @@ impl PyGame {
         py.detach(|| self.g.apply_index(p, action))
             .map_err(PyValueError::new_err)
     }
+    /// End Turn for seat `p` without starting the fight: end-of-turn effects run and the
+    /// seat stops needing actions, but the round never advances, even for the last seat.
+    /// For previewing the position handed to combat (on a copy); raises ValueError if the
+    /// seat cannot end its turn.
+    fn end_turn_effects(&mut self, py: Python<'_>, p: usize) -> PyResult<()> {
+        check_seat(&self.g, p)?;
+        py.detach(|| self.g.end_turn_effects(p))
+            .map_err(PyValueError::new_err)
+    }
     /// (float32 features bytes, int32 card-index bytes) of seat `p`: what that player sees.
     fn observe<'py>(&self, py: Python<'py>, p: usize) -> PyResult<ObsBytes<'py>> {
         check_seat(&self.g, p)?;
@@ -464,6 +473,7 @@ fn layout() -> Vec<(&'static str, usize)> {
         ("MINION_F", o::MINION_F),
         ("ITEM_F", o::ITEM_F),
         ("GLOBAL_F", o::GLOBAL_F),
+        ("ENDED_TURN_F", o::ENDED_TURN_F),
         ("ACTION_BUDGET_F", o::ACTION_BUDGET_F),
         ("N_QUESTS", o::N_QUESTS),
         ("QUEST_F", o::QUEST_F),

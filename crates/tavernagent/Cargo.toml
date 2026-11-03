@@ -1,0 +1,24 @@
+[package]
+name = "tavernagent"
+description = "TavernAgent: policy/value network, PUCT search and self-play training over TavernGym"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+taverngym = { path = "../taverngym" }
+matrixmultiply = { version = "0.3", features = ["threading"] }
+rayon = "1.10"
+rand = "0.9"
+rand_distr = "0.5"
+rand_pcg = { version = "0.9", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zip = { version = "2", default-features = false }
+clap = { version = "4.5", features = ["derive"] }
+
+[[bin]]
+name = "tavernagent"
+path = "src/bin/tavernagent.rs"

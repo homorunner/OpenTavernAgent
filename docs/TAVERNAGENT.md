@@ -1,0 +1,197 @@
+# TavernAgent
+
+TavernAgent is a policy/value network with PUCT search over TavernGym, trained by all-seat
+self-play. It is the Rust crate `crates/tavernagent` and the `tavernagent` binary; it depends
+on the `taverngym` crate directly and needs no Python. Checkpoints are numpy-readable `.npz`
+files, so weights stay inspectable from Python.
+
+The current model has **803,191 parameters**: a policy head, a value head and an auxiliary
+combat head. Weights are model format v4; the search protocol is `ended-state-v3`.
+
+## Commands
+
+```bash
+cargo build --release -p tavernagent
+A=target/release/tavernagent
+
+# Train 100 rounds (128 games and 64 simulations per decision by default).
+$A selfplay --steps 100 --workers 32 --save-trainer-state --save-every 50 --out runs/agent/model.npz
+
+# Continue exactly from the saved trainer state to round 200; saved options apply unless
+# given again on the command line.
+$A selfplay --resume-state runs/agent/model.trainer.npz --steps 200
+
+# Paired evaluation against seven scripted bots on the same seeds.
+$A eval --model runs/agent/model.ema.npz --games 1024 --sims 64 --workers 32 --out runs/agent/eval.json
+
+# Two checkpoints against each other (seat swaps, seed-clustered intervals); up to eight at
+# one table; or a league of many checkpoints for rating fits.
+$A arena --a runs/agent/model.npz --b runs/agent/model.step50.npz --games 512 --workers 32 --out runs/agent/arena.json
+$A tournament --model a=runs/a.npz --model b=runs/b.npz --games 2048 --workers 32 --out runs/agent/tournament.json
+$A league --model a_s100=... --model a_s200=... --rounds 2000 --workers 64 --out runs/league/league.jsonl
+python tools/league_elo.py runs/league/league.jsonl --out images/elo.png   # Plackett-Luce ratings
+
+# First actions of turns 1 and 2; per-turn action traces (Gold left at End Turn, loop
+# candidates); inference and decision latency; a few games against the bots.
+$A probe --model runs/agent/model.npz --games 32 --sims 64
+$A patterns --model runs/agent/model.npz --games 64 --sims 64 --workers 32 --out runs/agent/patterns.json
+$A bench
+$A play --model runs/agent/model.npz --games 8 --sims 48
+```
+
+`--help` on any subcommand lists every option. `tavernagent eval/arena/tournament/league`
+parallelise over games with rayon (`--workers`); results do not depend on the thread count.
+
+## Network and inputs
+
+```
+1716 numeric features + 69 card slots x 16-dim shared card embedding
+  -> 192 -> 4 residual blocks  h <- h + GELU(LN(W h))
+  -> 245 policy logits (masked softmax) / tanh value / tanh combat outcome
+```
+
+- The environment exposes 3,238 floats and 124 card indices; the network drops the 1,519
+  historical-opponent-warband floats, the 49 historical warband card slots and three
+  redundant global flags (hero selection, game over, the Tavern-wide freeze flag), keeping
+  the opponents' public summaries and heroes.
+- The global block ends (before the lobby races) with `ended_turn`: the seat has finished
+  recruiting and has no legal action. On such a position the value head estimates the
+  warband that goes to combat.
+- Minions, spells, heroes, hero powers, trinkets, quests and rewards share one embedding
+  table indexed by `CardId + 1` (0 = empty; Dark Gifts are not embedded). The 69 slots are
+  the own warband, hand, Tavern, the pending choice's source and options, trinkets,
+  quests/rewards and the opponents' heroes; the Deity and secret slots are not used.
+- Stats use the engine's `log1p` scaling; other features keep their linear scales. The
+  last three inputs are the remaining per-turn action / Move / Freeze budgets.
+- Hero selection is a uniform random choice outside the network (`heroes::select_heroes`,
+  seeded); the chosen hero is still an input. Discovers, trinkets and targets are decided
+  by the model.
+- The backward pass is written by hand (`net.rs`); batched products use `matrixmultiply`,
+  and the single-row forward used by search skips zero inputs (about 30 µs per
+  evaluation). `tests/net.rs` checks every gradient against central differences.
+
+`--hidden`, `--blocks`, `--embedding-dim`, `--activation gelu|silu|relu`,
+`--residual-scale` and the parameter-free `--head-norm` define the architecture and are
+stored in the checkpoint; `--resume` refuses conflicting options.
+
+## Search
+
+The default `--horizon turn` stays inside the seat's own recruit phase and never simulates
+opponents or combat. End Turn is an ordinary edge: the simulation copy calls
+`Game::end_turn_effects`, so end-of-turn triggers and their random choices happen and the
+seat is marked ended without starting the fight; the resulting position is a leaf with no
+legal actions, evaluated by the same value head. The search therefore compares "the
+position after more actions" with "the position actually handed to combat", instead of
+reusing a mid-turn value as the stopping value.
+
+Each simulation uses an exact clone of the game with a fresh random stream; distinct
+observable outcomes of one action (a Refresh, a Discover) become separate child nodes and
+the action edge aggregates their visits. The real game and its random stream are never
+touched.
+
+- PUCT over all legal actions, unvisited actions at Q = 0; the played action is the most
+  visited one (ties: lowest index). Default `--c-puct 1.9`, `--sims 64`.
+- Self-play mixes Dirichlet noise into the root prior (`--noise 0.20`, `--noise-alpha 0.3`);
+  evaluation does not.
+- Per-turn host budgets (100 actions, 10 Moves, 5 Freeze presses) are enforced by the
+  engine, reset every turn and visible to the network; `--action-cap/--move-cap/--freeze-cap`
+  must be positive.
+- `--horizon game` advances the other seats with the scripted bot using hidden state; it is
+  an experimental full-information mode only.
+- One 64-simulation decision takes 4-5 ms on one core; the cost is dominated by cloning the
+  game and encoding observations, not by the network.
+
+## Training
+
+All eight seats play the current network. Every decision records the observation, legal
+mask, root visit distribution, the action played and the final placement reward
+`1 - 2 (placement - 1) / 7`. Each End Turn also records the ended position
+(`end_turn_effects` on a copy): no policy target, the same value label. `--end-explore`
+(0.02) forces End Turn with a small probability so that ended positions with unspent Gold
+also appear; the search distribution stays the policy target.
+
+**Combat labels.** Every decision that could end the turn, and every ended position, carries
+the expected result of this turn's fight if the seat stopped there: the warband it would
+hand to combat is simulated `--combat-sims` (20) times against the opponent's final warband,
+scored +1 / 0 / -1 and averaged. Labels are computed once all seats have ended and before
+the real fight, when every final warband is known; positions with a pending choice cannot
+end the turn and carry no label (about 10%). This is a dense, low-variance signal next to
+the final placement; it costs about 6% of collection time and the search does not use it.
+
+**Loss.** Policy cross-entropy against the (smoothed, `--policy-smoothing 0.05`) visit
+distribution, averaged over rows with legal actions; `--value-weight` (0.5) times the value
+MSE over all rows; `--combat-weight` (0.5) times the combat MSE over labelled rows.
+Optional `--pg-weight` adds a REINFORCE term with the value as baseline. AdamW (decay on
+weight matrices only), global gradient-norm clipping, cosine learning-rate schedule.
+
+**Data.** Each round keeps up to `--max-samples` (65,536) of the roughly 150,000 decisions
+of 128 games (uniform per game) and adds them to a replay window of `--replay-rounds` (3)
+rounds; each epoch (`--epochs 1`) trains on a uniform draw of `--max-samples` from the
+window, so a sample is used about once on average.
+
+**EMA.** An EMA copy of the weights is updated every minibatch with a decay derived from
+`--ema-rounds` (2): `1 - 1 / (ema_rounds x updates per round)`, warmed up as
+`min(decay, (1 + t) / (10 + t))`. It is saved as `<out>.ema.npz`.
+
+| option | default |
+| --- | --- |
+| `--steps` / `--games` | 200 / 128 |
+| `--sims` / `--c-puct` | 64 / 1.9 |
+| `--replay-rounds` / `--epochs` / `--max-samples` / `--batch` | 3 / 1 / 65,536 / 512 |
+| `--lr` / `--lr-min` / `--lr-decay-steps` | 3e-4 / 3e-5 / 200 |
+| `--noise` / `--noise-alpha` / `--end-explore` | 0.20 / 0.3 / 0.02 |
+| `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 1.0 / 0.5 |
+| `--hidden` / `--blocks` / `--embedding-dim` | 192 / 4 / 16 |
+| `--value-weight` / `--combat-weight` / `--combat-sims` | 0.5 / 0.5 / 20 |
+| `--weight-decay` / `--clip` / `--ema-rounds` | 0.01 / 5.0 / 2 |
+
+`--save-trainer-state` writes the network, AdamW moments, EMA, RNG states, history, options
+and the **whole replay window** to `<out>.trainer.npz` after every round (about 2.9 GB at the
+defaults); `--save-every N` keeps immutable `<out>.stepN.npz` / `.ema.npz` / `.trainer.npz`.
+`--resume-state` restores all of it bit-exactly (a smaller `--replay-rounds` keeps the newest
+rounds); `--resume` loads weights only. `<out>.history.json` records per-round losses,
+gradient norms, entropies, target KL, the combat and ended sample counts and timings.
+
+## Experiments so far
+
+Settings: 128 games and 64 simulations per round, batch 512, one seed per run. Placement is
+the mean final placement of seat 0 against seven scripted bots over 1,024 paired seeds (the
+bot itself scores 4.60); Elo is a Plackett-Luce fit on eight-player leagues of checkpoints.
+
+- **`c_puct` at 200 rounds is noise.** Two seeds ranked 1.3/1.5/1.7/1.9 in opposite orders.
+  At 1,000 rounds (3e-4 with a 200-round cosine, then 3e-5) 1.9 led: placement 2.71 vs
+  2.78 (1.5), 2.91 (1.3), 3.05 (1.7); in a 16,000-game league of the 100-round checkpoints
+  1.9 was ahead from round 300 on (+146 Elo at 1,000 vs +124 for 1.5), hence the default.
+- **Every run was still improving at 1,000 rounds**; all 1,000-round checkpoints beat all
+  500-round ones.
+- **The learning rate matters far more.** With a 1,000-round cosine, 6e-4 and 1.2e-3 fell
+  below the bot for the first 400 rounds (placement 5.6 and 7.1 at round 200) and never
+  caught up; 1.5e-4 was stable but slow. The best run so far spent 800 of its 1,000 rounds
+  at 3e-5, which suggests the useful learning rate is small; lower peaks are being tested.
+
+## Open problems
+
+- Ended-position value labels come only from where the policy actually stopped (plus
+  `--end-explore`); asking "stop now" in mid-turn is still extrapolation. `patterns`'
+  `mean_gold_left` at End Turn measures this directly.
+- Policy, value and search gain are not evaluated separately; eight weak copies in
+  self-play may give a thin learning signal early on.
+- Dynamic card counters, attached cards and persistent effects are not fully encoded
+  (`obs.rs` TODOs); opponents' historical warbands are not network inputs.
+- The input projection is per slot (70% of the parameters): the same card in two Tavern
+  slots uses different weights. A shared per-entity encoder would be the structural fix.
+
+## Code map
+
+| `crates/tavernagent/src/` | purpose |
+| --- | --- |
+| `net.rs`, `linalg.rs`, `npz.rs` | network and hand-written backward; matrices; numpy-compatible checkpoints |
+| `mcts.rs` | PUCT, per-simulation random streams, chance branches, End Turn to the ended state |
+| `selfplay.rs`, `train.rs` | self-play with combat labels, AdamW/EMA, replay window, exact resume, the training loop |
+| `eval.rs`, `arena.rs`, `tournament.rs`, `league.rs` | evaluation against the bot and between checkpoints |
+| `probe.rs`, `patterns.rs`, `bench.rs`, `play.rs` | behaviour summaries, action traces, latency, games |
+| `heroes.rs`, `rules.rs` | hero selection outside the network; host action budgets |
+
+`cargo test --release -p tavernagent` covers gradients, input encoding, search boundaries,
+ended samples, combat labels, replay persistence and exact resume. `tools/league_elo.py`
+fits and plots league ratings.
