@@ -155,9 +155,9 @@ gradient norms, entropies, target KL, the combat and ended sample counts and tim
 
 ## Experiments so far
 
-Settings: 128 games and 64 simulations per round, batch 512, one seed per run. Placement is
-the mean final placement of seat 0 against seven scripted bots over 1,024 paired seeds (the
-bot itself scores 4.60); Elo is a Plackett-Luce fit on eight-player leagues of checkpoints.
+Settings: 128 games and 64 simulations per round, batch 512. Placement is the mean final
+placement of seat 0 against seven scripted bots over 1,024 paired seeds (2,048 for the runs
+below; the bot itself scores 4.60); Elo is a Plackett-Luce fit on eight-player leagues.
 
 - **`c_puct` at 200 rounds is noise.** Two seeds ranked 1.3/1.5/1.7/1.9 in opposite orders.
   At 1,000 rounds (3e-4 with a 200-round cosine, then 3e-5) 1.9 led: placement 2.71 vs
@@ -169,6 +169,32 @@ bot itself scores 4.60); Elo is a Plackett-Luce fit on eight-player leagues of c
   below the bot for the first 400 rounds (placement 5.6 and 7.1 at round 200) and never
   caught up; 1.5e-4 was stable but slow. The best run so far spent 800 of its 1,000 rounds
   at 3e-5, which suggests the useful learning rate is small; lower peaks are being tested.
+- **A 1,000-round cosine at 3e-4 is worse than annealing by round 200 and staying at 3e-5.**
+  Both are about 1.8 placements better than the bot (2.71 and 2.81 against 4.60), but in a
+  4,096-game paired arena the 200-round anneal wins by 24 Elo (network) and 18 Elo (EMA),
+  95% CI [20, 29] and [13, 23] -- the placement difference between them is not significant
+  on its own.
+- **5,000 rounds, four seeds, 200-round anneal.** All four seeds still gained between 4,000
+  and 5,000 rounds except the best one, which is flat from 4,000 on. Network placement at
+  round 5,000 against the bots is 1.88 (seed 444444), 2.07 (333333), 2.11 (111111) and 2.13
+  (222222). A 6,000-game league of the 20 EMA checkpoints (every 1,000 rounds, all four
+  seeds, about 2,400 games each) gives, in Elo:
+
+  | seed | 1,000 | 2,000 | 3,000 | 4,000 | 5,000 | EMA placement at 5,000 |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 444444 | -35 | +28 | +54 | +90 | **+93** | 1.95 (EMA) |
+  | 333333 | -141 | -34 | +8 | +44 | +70 | 2.08 |
+  | 222222 | -95 | -15 | +15 | +40 | +48 | 2.19 |
+  | 111111 | -96 | -81 | -40 | +5 | +44 | 2.10 |
+
+  Two things follow. The seed spread at round 5,000 is about 49 Elo, wider than the gap
+  between neighbouring checkpoints of one seed, so **one seed per configuration cannot rank
+  configurations** -- which is what the earlier sections do. And a seed that is last at
+  1,000 rounds ends third, so early rankings do not predict the final one.
+- **Placement against the bots saturates near 2.0.** The four final checkpoints are 1.88 to
+  2.13, inside two standard errors of each other (0.05 per checkpoint over 2,048 games);
+  only the league separates them. A 2,048-game evaluation resolves about 0.1 placements
+  (2 sigma); 1,024 games leave 0.06 per checkpoint and 0.11 on the difference of two.
 
 ## Open problems
 
