@@ -25,7 +25,9 @@ use taverngym::state::Player;
 
 use crate::heroes::select_heroes;
 use crate::linalg::Mat;
-use crate::mcts::{self, A_END_TURN, Evaluator, SearchOptions, observe_seat, placement_reward};
+use crate::mcts::{
+    self, A_END_TURN, Evaluator, Observation, SearchOptions, observe_seat, placement_reward,
+};
 use crate::net::{
     self, N_ACTIONS, N_CARD_SLOTS, N_FEATURES, Params, PolicyValueNet, masked_softmax_rows,
 };
@@ -148,6 +150,53 @@ pub struct PlayOptions {
     pub combat_sims: usize,
 }
 
+/// Search of one ply: the searches of all seats that need an action run concurrently
+/// (rayon) on the same read-only starting position, each with its own generator seeded
+/// from `rng`; the actions are then applied in seat order by `play_one`. Returns, per
+/// seat, its observation and search result (None = did not act). A ply with a single
+/// acting seat is left to the caller's sequential search.
+fn presearch_ply<E: Evaluator + ?Sized>(
+    game: &Game,
+    net: &E,
+    opts: &PlayOptions,
+    rng: &mut Pcg64Mcg,
+    pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<Option<(Observation, mcts::SearchResult)>>, String> {
+    use rayon::prelude::*;
+    let active: Vec<usize> = (0..game.players.len())
+        .filter(|&s| game.needs_action(s))
+        .collect();
+    if active.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let seeds: Vec<u64> = active.iter().map(|_| rng.random::<u64>()).collect();
+    let search_all = || {
+        active
+            .par_iter()
+            .zip(seeds.par_iter())
+            .map(|(&seat, &seed)| {
+                let obs = observe_seat(game, seat);
+                if !obs.mask.iter().any(|m| *m) {
+                    return Err(format!("seat {seat} has no legal action"));
+                }
+                let mut seat_rng = Pcg64Mcg::seed_from_u64(seed);
+                let result = mcts::search(game, seat, net, &opts.search, &mut seat_rng)?;
+                Ok((seat, obs, result))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    };
+    let found = match pool {
+        Some(pool) => pool.install(search_all)?,
+        None => search_all()?,
+    };
+    let mut out: Vec<Option<(Observation, mcts::SearchResult)>> =
+        (0..game.players.len()).map(|_| None).collect();
+    for (seat, obs, result) in found {
+        out[seat] = Some((obs, result));
+    }
+    Ok(out)
+}
+
 /// A position of the current turn waiting for its combat label once every seat has ended.
 struct PendingCombat {
     samples: Vec<usize>,
@@ -163,10 +212,13 @@ pub fn game_rng(seed: u64) -> Pcg64Mcg {
 
 /// Play one all-seat self-play game; returns every recorded sample with its final label
 /// and seat 0's reward.
+/// Each ply's searches run concurrently in `pool` (see `presearch_ply`); the game itself
+/// must run outside it. `None` uses rayon's global pool.
 pub fn play_one<E: Evaluator + ?Sized>(
     net: &E,
     seed: u64,
     opts: &PlayOptions,
+    pool: Option<&rayon::ThreadPool>,
 ) -> Result<(Vec<Sample>, f32), String> {
     if !(0.0..=1.0).contains(&opts.end_explore) {
         return Err("end_explore must be a probability".into());
@@ -179,12 +231,22 @@ pub fn play_one<E: Evaluator + ?Sized>(
     let mut pending: Vec<PendingCombat> = Vec::new();
     while !game.is_over() {
         let mut acted = false;
+        let mut presearched = presearch_ply(&game, net, opts, &mut rng, pool)?;
         for seat in 0..game.players.len() {
             if !game.needs_action(seat) {
                 continue;
             }
             acted = true;
-            let obs = observe_seat(&game, seat);
+            // A pre-searched seat is used only while its legal actions are still those
+            // of the ply's start; otherwise it is searched again on the live position.
+            let pre = presearched
+                .get_mut(seat)
+                .and_then(|p| p.take())
+                .filter(|(o, _)| o.mask == game.legal_mask(seat));
+            let (obs, pre_result) = match pre {
+                Some((o, r)) => (o, Some(r)),
+                None => (observe_seat(&game, seat), None),
+            };
             if !obs.mask.iter().any(|m| *m) {
                 // An engine state the policy cannot act in; keep it for diagnosis.
                 if let Ok(dir) = std::env::var("TAVERNAGENT_DUMP_DIR") {
@@ -200,7 +262,10 @@ pub fn play_one<E: Evaluator + ?Sized>(
                     game.players[seat].pending.last()
                 ));
             }
-            let result = mcts::search(&game, seat, net, &opts.search, &mut rng)?;
+            let result = match pre_result {
+                Some(r) => r,
+                None => mcts::search(&game, seat, net, &opts.search, &mut rng)?,
+            };
             let mut action = if opts.temperature <= 0.0 {
                 result.best_action()
             } else {

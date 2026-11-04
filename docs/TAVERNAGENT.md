@@ -40,7 +40,9 @@ $A play --model runs/agent/model.npz --games 8 --sims 48
 ```
 
 `--help` on any subcommand lists every option. `tavernagent eval/arena/tournament/league`
-parallelise over games with rayon (`--workers`); results do not depend on the thread count.
+parallelise over games with rayon (`--workers`); `selfplay` additionally searches the
+acting seats of each ply concurrently, so one slow game does not hold a round back.
+Results do not depend on the thread count.
 
 ## Network and inputs
 
@@ -98,8 +100,7 @@ touched.
   must be positive.
 - `--horizon game` advances the other seats with the scripted bot using hidden state; it is
   an experimental full-information mode only.
-- One 64-simulation decision takes 4-5 ms on one core; the cost is dominated by cloning the
-  game and encoding observations, not by the network.
+- One 64-simulation decision takes 45-60 µs per simulation on one core.
 
 ## Training
 

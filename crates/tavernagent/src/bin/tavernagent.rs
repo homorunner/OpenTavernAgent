@@ -7,6 +7,9 @@ use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use tavernagent::{arena, bench, eval, league, patterns, play, tournament, train};
 
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser)]
 #[command(name = "tavernagent", version, about)]
 struct Cli {
