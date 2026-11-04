@@ -190,9 +190,34 @@ fn play_options(sims: usize, end_explore: f32) -> PlayOptions {
     }
 }
 
+/// A self-play game is a function of its seed alone: the pool that runs the ply's
+/// concurrent seat searches, and its thread count, change nothing.
+#[test]
+fn self_play_does_not_depend_on_the_search_pool() {
+    let mut opts = play_options(2, 0.0);
+    opts.combat_sims = 2;
+    let global = play_one(&EndOrFirst, 31, &opts, None).unwrap();
+    let single = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let serial = play_one(&EndOrFirst, 31, &opts, Some(&single)).unwrap();
+    assert_eq!(serial.1, global.1);
+    assert_eq!(serial.0.len(), global.0.len());
+    for (a, b) in serial.0.iter().zip(&global.0) {
+        assert_eq!(a.action, b.action);
+        assert_eq!(a.mask, b.mask);
+        assert_eq!(a.pi, b.pi);
+        assert_eq!(a.z, b.z);
+        assert_eq!((a.combat_known, a.combat), (b.combat_known, b.combat));
+        assert!(a.is_ended() || a.mask[a.action as usize]);
+    }
+    assert!(global.0.iter().any(|s| s.combat_known));
+}
+
 #[test]
 fn self_play_records_one_ended_position_per_end_turn() {
-    let (samples, _) = play_one(&EndOrFirst, 31, &play_options(2, 0.0)).unwrap();
+    let (samples, _) = play_one(&EndOrFirst, 31, &play_options(2, 0.0), None).unwrap();
     let ended = samples.iter().filter(|s| s.is_ended()).count();
     let ends = samples
         .iter()
@@ -210,12 +235,12 @@ fn self_play_records_one_ended_position_per_end_turn() {
     }
     assert!(samples.iter().all(|s| (-1.0..=1.0).contains(&s.z)));
     assert!(
-        play_one(&EndOrFirst, 31, &play_options(1, 1.5))
+        play_one(&EndOrFirst, 31, &play_options(1, 1.5), None)
             .unwrap_err()
             .contains("probability")
     );
     // Exploration changes what is played, not the target.
-    let (explored, _) = play_one(&EndOrFirst, 31, &play_options(2, 1.0)).unwrap();
+    let (explored, _) = play_one(&EndOrFirst, 31, &play_options(2, 1.0), None).unwrap();
     assert!(
         explored
             .iter()
@@ -548,7 +573,7 @@ fn combat_labels_are_simulated_matchup_means_and_train_only_the_combat_head_wher
     // the End Turn decision shares its label with its ended row.
     let mut opts = play_options(2, 0.0);
     opts.combat_sims = 4;
-    let (samples, _) = play_one(&EndOrFirst, 31, &opts).unwrap();
+    let (samples, _) = play_one(&EndOrFirst, 31, &opts, None).unwrap();
     let known = samples.iter().filter(|s| s.combat_known).count();
     assert!(
         known > samples.len() / 2,

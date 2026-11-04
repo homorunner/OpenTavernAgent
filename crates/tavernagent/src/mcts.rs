@@ -227,9 +227,13 @@ pub fn observe_seat(game: &Game, seat: usize) -> Observation {
 
 /// Observable outcome key: the observation and legal mask, never the hidden future RNG.
 pub fn observation_key(obs: &Observation) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for v in &obs.x {
-        v.to_bits().hash(&mut h);
+    let mut h = rustc_hash::FxHasher::default();
+    let (pairs, rest) = obs.x.as_chunks::<2>();
+    for [lo, hi] in pairs {
+        h.write_u64((lo.to_bits() as u64) << 32 | hi.to_bits() as u64);
+    }
+    if let Some(v) = rest.first() {
+        h.write_u32(v.to_bits());
     }
     obs.cards.hash(&mut h);
     obs.mask.hash(&mut h);

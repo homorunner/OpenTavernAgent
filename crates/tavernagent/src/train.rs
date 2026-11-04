@@ -7,7 +7,6 @@ use std::time::Instant;
 use clap::Args;
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -43,7 +42,7 @@ pub struct SelfplayArgs {
     pub weight_decay: f32,
     #[arg(long, default_value_t = 512)]
     pub batch: usize,
-    /// Threads playing games (and evaluating probes).
+    /// Threads running the self-play searches (and evaluating probes).
     #[arg(long, default_value_t = 10)]
     pub workers: usize,
     /// Fresh samples kept per round (split across games) and the size of the uniform
@@ -265,7 +264,6 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
     args.validate()?;
     let out = args.out.clone();
     crate::npz::ensure_parent(&out)?;
-    args.workers = args.workers.min(args.games);
 
     let net = match &args.resume {
         Some(path) => {
@@ -356,6 +354,7 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
         args.updates_per_round()
     );
 
+    // The games run on their own threads and only hand each ply's searches to this pool
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.workers)
         .build()
@@ -387,14 +386,28 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
             .map(|i| args.seed + step as u64 * 10_000 + i)
             .collect();
         let net_ref = &trainer.net;
-        let results: Vec<(Vec<Sample>, f32, usize)> = pool.install(|| {
-            seeds
-                .par_iter()
+        let one_game = |seed: u64| -> Result<(Vec<Sample>, f32, usize), String> {
+            let (samples, place) = play_one(net_ref, seed, &play, Some(&pool))
+                .map_err(|e| format!("self-play seed={seed}: {e}"))?;
+            let decisions = samples.len();
+            Ok((subsample(samples, per_game, seed), place, decisions))
+        };
+        // Every game walks on its own thread and only hands its searches to the pool.
+        // Games as pool tasks would let a worker that waits for its ply's searches steal
+        // a whole other game, and resume its own only after that one ends.
+        let results: Vec<(Vec<Sample>, f32, usize)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = seeds
+                .iter()
                 .map(|&seed| {
-                    let (samples, place) = play_one(net_ref, seed, &play)
-                        .map_err(|e| format!("self-play seed={seed}: {e}"))?;
-                    let decisions = samples.len();
-                    Ok((subsample(samples, per_game, seed), place, decisions))
+                    let one_game = &one_game;
+                    scope.spawn(move || one_game(seed))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .map_err(|_| "a self-play thread panicked".to_string())?
                 })
                 .collect::<Result<Vec<_>, String>>()
         })?;
