@@ -27,7 +27,8 @@ use taverngym::Game;
 use crate::heroes::select_heroes;
 use crate::linalg::Mat;
 use crate::mcts::{
-    self, A_END_TURN, Evaluator, Observation, SearchOptions, observe_seat, placement_reward,
+    self, A_END_TURN, Evaluator, Observation, SearchOptions, agent_mask, observe_seat,
+    placement_reward,
 };
 use crate::net::{
     self, N_ACTIONS, N_CARD_SLOTS, N_FEATURES, Params, PolicyValueNet, masked_softmax_rows,
@@ -232,7 +233,7 @@ pub fn play_one<E: Evaluator + ?Sized>(
             let pre = presearched
                 .get_mut(seat)
                 .and_then(|p| p.take())
-                .filter(|(o, _)| o.mask == game.legal_mask(seat));
+                .filter(|(o, _)| o.mask == agent_mask(&game, seat));
             let (obs, pre_result) = match pre {
                 Some((o, r)) => (o, Some(r)),
                 None => (observe_seat(&game, seat), None),
