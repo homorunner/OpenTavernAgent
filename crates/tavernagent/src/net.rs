@@ -14,6 +14,7 @@
 //! in the crate tests.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -23,7 +24,7 @@ use taverngym::actions as a;
 use taverngym::cards::{CardKind, db};
 use taverngym::obs as o;
 
-use crate::linalg::Mat;
+use crate::linalg::{Bf16Mat, Mat};
 use crate::npz::{NpyArray, Npz};
 
 pub const N_ACTIONS: usize = a::N_ACTIONS;
@@ -149,6 +150,61 @@ fn gelu_grad(x: f32) -> f32 {
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     0.5 * (1.0 + (0.5 * x).tanh())
+}
+
+/// tanh as a clamped rational polynomial (Eigen's float `ptanh`): arithmetic only, so a
+/// loop over it vectorises; absolute error below 1e-6. Used by inference, not training.
+#[inline(always)]
+fn fast_tanh(x: f32) -> f32 {
+    const BOUND: f32 = 7.905_311;
+    let x = x.clamp(-BOUND, BOUND);
+    let x2 = x * x;
+    let p = -2.760_768_5e-16f32;
+    let p = p * x2 + 2.000_188e-13;
+    let p = p * x2 - 8.604_672e-11;
+    let p = p * x2 + 5.122_297_1e-8;
+    let p = p * x2 + 1.485_722_4e-5;
+    let p = p * x2 + 6.372_619_3e-4;
+    let p = p * x2 + 4.893_524_6e-3;
+    let p = p * x;
+    let q = 1.198_258_4e-6f32;
+    let q = q * x2 + 1.185_347_1e-4;
+    let q = q * x2 + 2.268_434_6e-3;
+    let q = q * x2 + 4.893_525e-3;
+    p / q
+}
+
+/// `Activation::apply` over a slice with `fast_tanh`; one loop per activation so that the
+/// compiler vectorises it.
+fn apply_fast(act: Activation, h: &mut [f32]) {
+    match act {
+        Activation::Gelu => {
+            for v in h.iter_mut() {
+                let x = *v;
+                let inner = GELU_C * (x + GELU_K * x * x * x);
+                *v = 0.5 * x * (1.0 + fast_tanh(inner));
+            }
+        }
+        Activation::Silu => {
+            for v in h.iter_mut() {
+                let x = *v;
+                *v = x * 0.5 * (1.0 + fast_tanh(0.5 * x));
+            }
+        }
+        Activation::Relu => {
+            for v in h.iter_mut() {
+                *v = v.max(0.0);
+            }
+        }
+    }
+}
+
+/// `h += scale * act(z)` with `fast_tanh`.
+fn add_residual_fast(act: Activation, h: &mut [f32], z: &mut [f32], scale: f32) {
+    apply_fast(act, z);
+    for (hv, nv) in h.iter_mut().zip(z.iter()) {
+        *hv += scale * nv;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -293,6 +349,26 @@ struct LnCache {
     inv: Vec<f32>,
 }
 
+#[inline]
+fn add_bias(x: &mut [f32], bias: &[f32]) {
+    debug_assert_eq!(x.len(), bias.len());
+    for (v, b) in x.iter_mut().zip(bias) {
+        *v += b;
+    }
+}
+
+/// `layer_norm` of one row in place, without the backward cache; identical arithmetic.
+fn layer_norm_row(x: &mut [f32], gamma: &[f32], beta: &[f32]) {
+    let eps = 1e-5f32;
+    let n = x.len() as f32;
+    let mean = x.iter().sum::<f32>() / n;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
+    let s = 1.0 / (var + eps).sqrt();
+    for j in 0..x.len() {
+        x[j] = (x[j] - mean) * s * gamma[j] + beta[j];
+    }
+}
+
 fn layer_norm(x: &Mat, gamma: &[f32], beta: &[f32]) -> (Mat, LnCache) {
     let eps = 1e-5f32;
     let mut out = x.zeros_like();
@@ -369,6 +445,31 @@ pub struct PolicyValueNet {
     card_slots: Vec<usize>,
     allowed: Vec<bool>,
     pub card_fingerprint: u64,
+    /// bfloat16 copies of the weight matrices for search-time inference, built on first
+    /// use and dropped by `params_changed`.
+    fast: OnceLock<FastWeights>,
+}
+
+/// The weight matrices in bfloat16 (biases and LayerNorm parameters stay f32 in `p`).
+#[derive(Clone, Debug)]
+struct FastWeights {
+    w0: Bf16Mat,
+    blocks: Vec<Bf16Mat>,
+    wp: Bf16Mat,
+    wv: Bf16Mat,
+}
+
+impl FastWeights {
+    fn new(p: &Params) -> FastWeights {
+        FastWeights {
+            w0: Bf16Mat::from_mat(&p.tensors[W0]),
+            blocks: (0..p.blocks)
+                .map(|i| Bf16Mat::from_mat(&p.tensors[w(i)]))
+                .collect(),
+            wp: Bf16Mat::from_mat(&p.tensors[p.wp()]),
+            wv: Bf16Mat::from_mat(&p.tensors[p.wv()]),
+        }
+    }
 }
 
 impl PolicyValueNet {
@@ -431,7 +532,18 @@ impl PolicyValueNet {
             card_slots,
             allowed: allowed_cards(),
             card_fingerprint: db().fingerprint,
+            fast: OnceLock::new(),
         })
+    }
+
+    /// Forget the bfloat16 inference weights; call after writing to `p` so that the next
+    /// search evaluation converts the new values.
+    pub fn params_changed(&mut self) {
+        self.fast.take();
+    }
+
+    fn fast(&self) -> &FastWeights {
+        self.fast.get_or_init(|| FastWeights::new(&self.p))
     }
 
     pub fn n_params(&self) -> usize {
@@ -455,6 +567,7 @@ impl PolicyValueNet {
             card_slots: self.card_slots.clone(),
             allowed: self.allowed.clone(),
             card_fingerprint: self.card_fingerprint,
+            fast: OnceLock::new(),
         }
     }
 
@@ -575,8 +688,69 @@ impl PolicyValueNet {
         cards: &[i32],
         mask: &[bool],
     ) -> Result<(Vec<f32>, f32), String> {
-        let (logits, value, _, _) = self.forward(&[x], &[cards])?;
-        Ok((masked_softmax(logits.row(0), mask), value[0]))
+        let (logits, value) = self.infer(x, cards)?;
+        Ok((masked_softmax(&logits, mask), value))
+    }
+
+    /// Logits and value of one observation for search: bfloat16 weight matrices with f32
+    /// accumulation, a polynomial tanh in the activations, no training cache. The weights
+    /// are converted once per parameter update (`params_changed`); training itself stays
+    /// in f32 with the exact functions (`forward`/`backward`).
+    pub fn infer(&self, x: &[f32], cards: &[i32]) -> Result<(Vec<f32>, f32), String> {
+        let (x_in, _) = self.assemble(&[x], &[cards])?;
+        let p = &self.p.tensors;
+        let fast = self.fast();
+        let act = self.cfg.activation;
+        let mut h = fast.w0.vecmat(x_in.row(0));
+        add_bias(&mut h, &p[B0].data);
+        layer_norm_row(&mut h, &p[G0].data, &p[K0].data);
+        apply_fast(act, &mut h);
+        for i in 0..self.cfg.blocks {
+            let mut z = fast.blocks[i].vecmat(&h);
+            add_bias(&mut z, &p[b(i)].data);
+            layer_norm_row(&mut z, &p[g(i)].data, &p[k(i)].data);
+            add_residual_fast(act, &mut h, &mut z, self.cfg.residual_scale);
+        }
+        if self.cfg.head_norm {
+            let ones = vec![1.0f32; self.cfg.hidden];
+            let zeros = vec![0.0f32; self.cfg.hidden];
+            layer_norm_row(&mut h, &ones, &zeros);
+        }
+        let mut logits = fast.wp.vecmat(&h);
+        add_bias(&mut logits, &p[self.p.bp()].data);
+        let value = (fast.wv.vecmat(&h)[0] + p[self.p.bv()].data[0]).tanh();
+        Ok((logits, value))
+    }
+
+    /// `infer` in f32: the same operations in the same order as `forward`, so the results
+    /// are bit-identical to the training forward pass; for reference and tests.
+    pub fn infer_f32(&self, x: &[f32], cards: &[i32]) -> Result<(Vec<f32>, f32), String> {
+        let (x_in, _) = self.assemble(&[x], &[cards])?;
+        let p = &self.p.tensors;
+        let act = self.cfg.activation;
+        let mut h = p[W0].vecmat(x_in.row(0));
+        add_bias(&mut h, &p[B0].data);
+        layer_norm_row(&mut h, &p[G0].data, &p[K0].data);
+        for v in &mut h {
+            *v = act.apply(*v);
+        }
+        for i in 0..self.cfg.blocks {
+            let mut z = p[w(i)].vecmat(&h);
+            add_bias(&mut z, &p[b(i)].data);
+            layer_norm_row(&mut z, &p[g(i)].data, &p[k(i)].data);
+            for (hv, nv) in h.iter_mut().zip(&z) {
+                *hv += self.cfg.residual_scale * act.apply(*nv);
+            }
+        }
+        if self.cfg.head_norm {
+            let ones = vec![1.0f32; self.cfg.hidden];
+            let zeros = vec![0.0f32; self.cfg.hidden];
+            layer_norm_row(&mut h, &ones, &zeros);
+        }
+        let mut logits = p[self.p.wp()].vecmat(&h);
+        add_bias(&mut logits, &p[self.p.bp()].data);
+        let value = (p[self.p.wv()].vecmat(&h)[0] + p[self.p.bv()].data[0]).tanh();
+        Ok((logits, value))
     }
 
     // ---- backward ----------------------------------------------------------

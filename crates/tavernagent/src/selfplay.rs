@@ -1,7 +1,9 @@
 //! Self-play: the whole table plays the network, then we train on it.
 //!
-//! Per round: `games` games in which **all eight seats** use the current weights with a
-//! small PUCT search, and every seat's decisions are recorded. Each End Turn also
+//! Per round: `games` games in which **all eight seats** use the current weights. A
+//! `search_prob` fraction of the decisions run the PUCT search and are recorded with the
+//! visit distribution as policy target (KataGo's full/cheap split); the others sample
+//! the network prior at the play temperature and leave no sample. Each End Turn also
 //! records the ended position (`Game::end_turn_effects` on a copy): no legal actions, so
 //! no policy target, but the same final-placement value label. That is the state the
 //! search evaluates when it considers ending the turn, so the single value head is
@@ -18,6 +20,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand::seq::index::sample as sample_indices;
 use rand_pcg::Pcg64Mcg;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use taverngym::Game;
 use taverngym::rng::Rng as GameRng;
@@ -148,6 +151,61 @@ pub struct PlayOptions {
     pub budgets: Budgets,
     /// Simulated combats per labelled position (0 disables the combat head's labels).
     pub combat_sims: usize,
+    /// Probability that a decision is searched (and recorded); the rest play the prior.
+    pub search_prob: f32,
+}
+
+/// How one decision was made: a full search (recorded) or a direct prior sample.
+pub enum Decision {
+    Searched(Box<mcts::SearchResult>),
+    Direct(Vec<f32>),
+}
+
+impl Decision {
+    /// The distribution the played action is drawn from.
+    pub fn policy(&self) -> &[f32] {
+        match self {
+            Decision::Searched(r) => &r.policy,
+            Decision::Direct(prior) => prior,
+        }
+    }
+    fn choose(&self, temperature: f32, rng: &mut impl Rng) -> usize {
+        match self {
+            Decision::Searched(r) if temperature <= 0.0 => r.best_action(),
+            _ if temperature <= 0.0 => mcts::argmax(self.policy()),
+            _ => sample_action(self.policy(), temperature, rng),
+        }
+    }
+}
+
+/// Search `seat` (seeded by `seed`) when `full`, otherwise evaluate the prior once.
+fn decide<E: Evaluator + ?Sized>(
+    game: &Game,
+    seat: usize,
+    obs: &Observation,
+    net: &E,
+    opts: &PlayOptions,
+    full: bool,
+    seed: u64,
+) -> Result<Decision, String> {
+    if full {
+        let mut seat_rng = Pcg64Mcg::seed_from_u64(seed);
+        Ok(Decision::Searched(Box::new(mcts::search(
+            game,
+            seat,
+            net,
+            &opts.search,
+            &mut seat_rng,
+        )?)))
+    } else {
+        Ok(Decision::Direct(net.evaluate(obs)?.0))
+    }
+}
+
+/// Per decision: whether it is searched, and the seed of its search generator.
+fn draw_decision(opts: &PlayOptions, rng: &mut Pcg64Mcg) -> (bool, u64) {
+    let full = opts.search_prob >= 1.0 || rng.random::<f32>() < opts.search_prob;
+    (full, rng.random::<u64>())
 }
 
 /// Search of one ply: the searches of all seats that need an action run concurrently
@@ -161,7 +219,7 @@ fn presearch_ply<E: Evaluator + ?Sized>(
     opts: &PlayOptions,
     rng: &mut Pcg64Mcg,
     pool: Option<&rayon::ThreadPool>,
-) -> Result<Vec<Option<(Observation, mcts::SearchResult)>>, String> {
+) -> Result<Vec<Option<(Observation, Decision)>>, String> {
     use rayon::prelude::*;
     let active: Vec<usize> = (0..game.players.len())
         .filter(|&s| game.needs_action(s))
@@ -169,18 +227,17 @@ fn presearch_ply<E: Evaluator + ?Sized>(
     if active.len() < 2 {
         return Ok(Vec::new());
     }
-    let seeds: Vec<u64> = active.iter().map(|_| rng.random::<u64>()).collect();
+    let draws: Vec<(bool, u64)> = active.iter().map(|_| draw_decision(opts, rng)).collect();
     let search_all = || {
         active
             .par_iter()
-            .zip(seeds.par_iter())
-            .map(|(&seat, &seed)| {
+            .zip(draws.par_iter())
+            .map(|(&seat, &(full, seed))| {
                 let obs = observe_seat(game, seat);
                 if !obs.mask.iter().any(|m| *m) {
                     return Err(format!("seat {seat} has no legal action"));
                 }
-                let mut seat_rng = Pcg64Mcg::seed_from_u64(seed);
-                let result = mcts::search(game, seat, net, &opts.search, &mut seat_rng)?;
+                let result = decide(game, seat, &obs, net, opts, full, seed)?;
                 Ok((seat, obs, result))
             })
             .collect::<Result<Vec<_>, String>>()
@@ -189,7 +246,7 @@ fn presearch_ply<E: Evaluator + ?Sized>(
         Some(pool) => pool.install(search_all)?,
         None => search_all()?,
     };
-    let mut out: Vec<Option<(Observation, mcts::SearchResult)>> =
+    let mut out: Vec<Option<(Observation, Decision)>> =
         (0..game.players.len()).map(|_| None).collect();
     for (seat, obs, result) in found {
         out[seat] = Some((obs, result));
@@ -222,6 +279,9 @@ pub fn play_one<E: Evaluator + ?Sized>(
 ) -> Result<(Vec<Sample>, f32), String> {
     if !(0.0..=1.0).contains(&opts.end_explore) {
         return Err("end_explore must be a probability".into());
+    }
+    if !(0.0..=1.0).contains(&opts.search_prob) {
+        return Err("search_prob must be a probability".into());
     }
     let mut game = Game::new(seed, opts.budgets.config()?);
     select_heroes(&mut game, seed)?;
@@ -262,15 +322,14 @@ pub fn play_one<E: Evaluator + ?Sized>(
                     game.players[seat].pending.last()
                 ));
             }
-            let result = match pre_result {
+            let decision = match pre_result {
                 Some(r) => r,
-                None => mcts::search(&game, seat, net, &opts.search, &mut rng)?,
+                None => {
+                    let (full, seed) = draw_decision(opts, &mut rng);
+                    decide(&game, seat, &obs, net, opts, full, seed)?
+                }
             };
-            let mut action = if opts.temperature <= 0.0 {
-                result.best_action()
-            } else {
-                sample_action(&result.policy, opts.temperature, &mut rng)
-            };
+            let mut action = decision.choose(opts.temperature, &mut rng);
             if opts.end_explore > 0.0
                 && obs.mask[A_END_TURN]
                 && rng.random::<f32>() < opts.end_explore
@@ -280,24 +339,31 @@ pub fn play_one<E: Evaluator + ?Sized>(
             }
             // The board this position would hand to combat (only when the turn can end
             // here: a pending choice has to be resolved first).
-            let preview = if obs.mask[A_END_TURN] && (opts.combat_sims > 0 || action == A_END_TURN)
+            let searched = matches!(decision, Decision::Searched(_));
+            let preview = if obs.mask[A_END_TURN]
+                && ((opts.combat_sims > 0 && searched) || action == A_END_TURN)
             {
                 Some(end_turn_preview(&game, seat)?)
             } else {
                 None
             };
-            let mut labelled = vec![samples.len()];
-            samples.push(Sample {
-                x: obs.x,
-                cards: obs.cards,
-                mask: obs.mask,
-                pi: result.policy,
-                z: 0.0,
-                action: action as i64,
-                combat: 0.0,
-                combat_known: false,
-            });
-            seats.push(seat);
+            // Only searched decisions are training rows (their visit distribution is
+            // the policy target); the ended position below is recorded either way.
+            let mut labelled = Vec::new();
+            if let Decision::Searched(result) = decision {
+                labelled.push(samples.len());
+                samples.push(Sample {
+                    x: obs.x,
+                    cards: obs.cards,
+                    mask: obs.mask,
+                    pi: result.policy,
+                    z: 0.0,
+                    action: action as i64,
+                    combat: 0.0,
+                    combat_known: false,
+                });
+                seats.push(seat);
+            }
             if action == A_END_TURN {
                 let preview = preview
                     .as_ref()
@@ -308,6 +374,7 @@ pub fn play_one<E: Evaluator + ?Sized>(
             }
             if let Some(preview) = &preview
                 && opts.combat_sims > 0
+                && !labelled.is_empty()
             {
                 pending.push(PendingCombat {
                     samples: labelled,
@@ -458,6 +525,11 @@ impl Trainer {
     }
 
     /// One AdamW step on a batch; returns (policy loss, value loss).
+    ///
+    /// The batch is processed in fixed chunks of `STEP_CHUNK_ROWS` rows, each running the
+    /// forward and backward pass on its own thread; chunk gradients are summed in chunk
+    /// order and the optimizer update is split over the parameter vector. The chunk size is
+    /// a constant, so the result does not depend on the number of threads.
     pub fn step(
         &mut self,
         batch: &[&Sample],
@@ -468,9 +540,6 @@ impl Trainer {
         if bsz == 0 {
             return Err("empty training batch".into());
         }
-        let xs: Vec<&[f32]> = batch.iter().map(|s| s.x.as_slice()).collect();
-        let cards: Vec<&[i32]> = batch.iter().map(|s| s.cards.as_slice()).collect();
-        let masks: Vec<&[bool]> = batch.iter().map(|s| s.mask.as_slice()).collect();
         for s in batch {
             if s.action < -1 || s.action >= N_ACTIONS as i64 {
                 return Err("expected selected actions, with -1 for unknown".into());
@@ -482,105 +551,61 @@ impl Trainer {
                 return Err("ended positions cannot carry a policy target".into());
             }
         }
-        let (logits, value, combat, cache) = self.net.forward(&xs, &cards)?;
         // A row without legal actions is an ended position: it carries a value label but
         // no policy target, and contributes nothing to the policy loss or its gradient.
-        let policy_rows: Vec<bool> = batch.iter().map(|s| !s.is_ended()).collect();
-        let n_policy = policy_rows.iter().filter(|p| **p).count();
-        let probs = masked_softmax_rows(&logits, &masks);
+        let n_policy = batch.iter().filter(|s| !s.is_ended()).count();
         let norm_policy = 1.0 / n_policy.max(1) as f32;
-        // Targets with optional smoothing over the legal actions.
-        let mut pis = Mat::zeros(bsz, N_ACTIONS);
-        for (r, s) in batch.iter().enumerate() {
-            let row = pis.row_mut(r);
-            let legal = s.mask.iter().filter(|m| **m).count().max(1) as f32;
-            for (a, target) in row.iter_mut().enumerate() {
-                let uniform = if s.mask[a] { 1.0 / legal } else { 0.0 };
-                *target = (1.0 - opts.smoothing) * s.pi[a] + opts.smoothing * uniform;
-            }
-        }
-        let mut dlogits = Mat::zeros(bsz, N_ACTIONS);
-        for r in 0..bsz {
-            let (p, t) = (probs.row(r), pis.row(r));
-            let out = dlogits.row_mut(r);
-            for a in 0..N_ACTIONS {
-                out[a] = (p[a] - t[a]) * norm_policy;
-            }
-            if opts.pg_weight != 0.0 && batch[r].action >= 0 {
-                // REINFORCE uses the value prediction as its baseline.
-                let advantage = batch[r].z - value[r];
-                let chosen = batch[r].action as usize;
-                for a in 0..N_ACTIONS {
-                    let onehot = (a == chosen) as u8 as f32;
-                    out[a] += opts.pg_weight * advantage * (p[a] - onehot) * norm_policy;
-                }
-            }
-        }
-        // Every row, continuing or ended, carries the final placement as its value label.
-        let dvalue: Vec<f32> = (0..bsz)
-            .map(|r| {
-                self.hparams.value_weight
-                    * 2.0
-                    * (value[r] - batch[r].z)
-                    * (1.0 - value[r] * value[r])
-                    / bsz as f32
-            })
-            .collect();
-        let value_loss = (0..bsz)
-            .map(|r| (value[r] - batch[r].z).powi(2))
-            .sum::<f32>()
-            / bsz as f32;
         // The combat head is supervised only where this turn's fight could be simulated.
         let n_combat = batch.iter().filter(|s| s.combat_known).count();
-        let dcombat: Vec<f32> = (0..bsz)
-            .map(|r| {
-                if batch[r].combat_known {
-                    self.hparams.combat_weight
-                        * 2.0
-                        * (combat[r] - batch[r].combat)
-                        * (1.0 - combat[r] * combat[r])
-                        / n_combat.max(1) as f32
-                } else {
-                    0.0
-                }
+        let scales = LossScales {
+            norm_policy,
+            bsz,
+            n_combat,
+            value_weight: self.hparams.value_weight,
+            combat_weight: self.hparams.combat_weight,
+        };
+        let net = &self.net;
+        let parts: Vec<ChunkOutput> = batch
+            .par_chunks(STEP_CHUNK_ROWS)
+            .map(|rows| chunk_step(net, rows, opts, &scales))
+            .collect::<Result<_, String>>()?;
+
+        // Chunk gradients summed in chunk order, split over the parameter vector; one
+        // parallel region for all tensors.
+        let mut grads = self.net.p.zeros_like();
+        let tasks: Vec<(usize, usize, &mut [f32])> = grads
+            .tensors
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(i, t)| {
+                t.data
+                    .chunks_mut(OPTIMIZER_CHUNK)
+                    .enumerate()
+                    .map(move |(c, out)| (i, c * OPTIMIZER_CHUNK, out))
             })
             .collect();
-        let combat_loss = if n_combat > 0 {
-            (0..bsz)
-                .filter(|r| batch[*r].combat_known)
-                .map(|r| (combat[r] - batch[r].combat).powi(2))
-                .sum::<f32>()
-                / n_combat as f32
+        tasks.into_par_iter().for_each(|(i, lo, out)| {
+            for part in &parts {
+                let src = &part.grads.tensors[i].data[lo..lo + out.len()];
+                for (o, v) in out.iter_mut().zip(src) {
+                    *o += v;
+                }
+            }
+        });
+        let value: Vec<f32> = parts.iter().flat_map(|p| p.value.iter().copied()).collect();
+        let policy_loss: f32 = parts.iter().map(|p| p.policy_loss).sum::<f32>() * norm_policy;
+        let value_loss: f32 = parts.iter().map(|p| p.value_loss).sum::<f32>() / bsz as f32;
+        let combat_loss: f32 = if n_combat > 0 {
+            parts.iter().map(|p| p.combat_loss).sum::<f32>() / n_combat as f32
         } else {
             0.0
         };
-        let mut policy_loss = 0.0f32;
-        let mut policy_entropy = 0.0f64;
-        let mut target_entropy = 0.0f64;
-        let mut target_kl = 0.0f64;
-        let mut logit_span = 0.0f64;
-        for r in 0..bsz {
-            if !policy_rows[r] {
-                continue;
-            }
-            let (p, t) = (probs.row(r), pis.row(r));
-            let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-            for a in 0..N_ACTIONS {
-                let lp = p[a].max(1e-12).ln();
-                let lt = t[a].max(1e-12).ln();
-                policy_loss -= t[a] * lp;
-                policy_entropy -= (p[a] * lp) as f64;
-                target_entropy -= (t[a] * lt) as f64;
-                target_kl += (t[a] * (lt - lp)) as f64;
-                if batch[r].mask[a] {
-                    lo = lo.min(logits.row(r)[a]);
-                    hi = hi.max(logits.row(r)[a]);
-                }
-            }
-            logit_span += (hi - lo) as f64;
-        }
-        let policy_loss = policy_loss * norm_policy;
-        let grads = self.net.backward(&cache, &dlogits, &dvalue, &dcombat);
+        let policy_entropy: f64 = parts.iter().map(|p| p.policy_entropy).sum();
+        let target_entropy: f64 = parts.iter().map(|p| p.target_entropy).sum();
+        let target_kl: f64 = parts.iter().map(|p| p.target_kl).sum();
+        let logit_span: f64 = parts.iter().map(|p| p.logit_span).sum();
+        let dlogits_sq: f64 = parts.iter().map(|p| p.dlogits_sq).sum();
+        drop(parts);
 
         let norm = grads.sum_squares().sqrt();
         if !norm.is_finite() || !(policy_loss + value_loss + combat_loss).is_finite() {
@@ -643,7 +668,7 @@ impl Trainer {
         metrics.insert("value_std".into(), value_std);
         metrics.insert("target_value_mean".into(), target_mean);
         metrics.insert("advantage_std".into(), adv_std);
-        metrics.insert("policy_gradient_norm".into(), dlogits.sum_squares().sqrt());
+        metrics.insert("policy_gradient_norm".into(), dlogits_sq.sqrt());
         self.last_metrics = metrics;
 
         self.t += 1;
@@ -654,28 +679,189 @@ impl Trainer {
         let ema_decay = ema_decay_at(self.hparams.ema_decay, self.t);
         self.last_metrics
             .insert("ema_decay".into(), ema_decay as f64);
-        for (i, grad) in grads.tensors.iter().enumerate() {
-            let decay = self.net.p.is_weight(i);
-            let m = &mut self.m.tensors[i].data;
-            let v = &mut self.v.tensors[i].data;
-            let p = &mut self.net.p.tensors[i].data;
-            let e = &mut self.ema.tensors[i].data;
-            for j in 0..grad.data.len() {
-                let g = grad.data[j] as f64 * scale;
-                m[j] = (b1 * m[j] as f64 + (1.0 - b1) * g) as f32;
-                v[j] = (b2 * v[j] as f64 + (1.0 - b2) * g * g) as f32;
-                let mh = m[j] as f64 / bias1;
-                let vh = v[j] as f64 / bias2;
-                let mut update = lr * mh / (vh.sqrt() + eps);
-                if decay {
-                    update += lr * wd * p[j] as f64;
-                }
-                p[j] = (p[j] as f64 - update) as f32;
-                e[j] = ema_decay * e[j] + (1.0 - ema_decay) * p[j];
-            }
+        // One parallel region over every (tensor, slice) task.
+        let decay_of: Vec<bool> = (0..grads.tensors.len())
+            .map(|i| self.net.p.is_weight(i))
+            .collect();
+        fn split(params: &mut Params) -> Vec<&mut [f32]> {
+            params
+                .tensors
+                .iter_mut()
+                .flat_map(|t| t.data.chunks_mut(OPTIMIZER_CHUNK))
+                .collect()
         }
+        let g_parts: Vec<(bool, &[f32])> = grads
+            .tensors
+            .iter()
+            .enumerate()
+            .flat_map(|(i, t)| {
+                let decay = decay_of[i];
+                t.data.chunks(OPTIMIZER_CHUNK).map(move |c| (decay, c))
+            })
+            .collect();
+        let m_parts = split(&mut self.m);
+        let v_parts = split(&mut self.v);
+        let p_parts = split(&mut self.net.p);
+        let e_parts = split(&mut self.ema);
+        g_parts
+            .into_par_iter()
+            .zip(m_parts)
+            .zip(v_parts)
+            .zip(p_parts)
+            .zip(e_parts)
+            .for_each(|(((((decay, grad), m), v), p), e)| {
+                for j in 0..grad.len() {
+                    let g = grad[j] as f64 * scale;
+                    m[j] = (b1 * m[j] as f64 + (1.0 - b1) * g) as f32;
+                    v[j] = (b2 * v[j] as f64 + (1.0 - b2) * g * g) as f32;
+                    let mh = m[j] as f64 / bias1;
+                    let vh = v[j] as f64 / bias2;
+                    let mut update = lr * mh / (vh.sqrt() + eps);
+                    if decay {
+                        update += lr * wd * p[j] as f64;
+                    }
+                    p[j] = (p[j] as f64 - update) as f32;
+                    e[j] = ema_decay * e[j] + (1.0 - ema_decay) * p[j];
+                }
+            });
+        self.net.params_changed();
         Ok((policy_loss, value_loss))
     }
+}
+
+/// Rows per parallel forward/backward chunk of a training step. A constant, not a function
+/// of the thread count, so that training results are reproducible on any machine.
+pub const STEP_CHUNK_ROWS: usize = 32;
+/// Parameters per parallel task of the gradient reduction and the optimizer update.
+const OPTIMIZER_CHUNK: usize = 16_384;
+
+/// Batch-level normalisations shared by every chunk of a step.
+struct LossScales {
+    norm_policy: f32,
+    bsz: usize,
+    n_combat: usize,
+    value_weight: f32,
+    combat_weight: f32,
+}
+
+/// Gradients and loss terms of one chunk of rows; sums are unnormalised.
+struct ChunkOutput {
+    grads: Params,
+    value: Vec<f32>,
+    policy_loss: f32,
+    value_loss: f32,
+    combat_loss: f32,
+    policy_entropy: f64,
+    target_entropy: f64,
+    target_kl: f64,
+    logit_span: f64,
+    dlogits_sq: f64,
+}
+
+fn chunk_step(
+    net: &PolicyValueNet,
+    rows: &[&Sample],
+    opts: StepOptions,
+    scales: &LossScales,
+) -> Result<ChunkOutput, String> {
+    let n = rows.len();
+    let xs: Vec<&[f32]> = rows.iter().map(|s| s.x.as_slice()).collect();
+    let cards: Vec<&[i32]> = rows.iter().map(|s| s.cards.as_slice()).collect();
+    let masks: Vec<&[bool]> = rows.iter().map(|s| s.mask.as_slice()).collect();
+    let (logits, value, combat, cache) = net.forward(&xs, &cards)?;
+    let probs = masked_softmax_rows(&logits, &masks);
+    let norm_policy = scales.norm_policy;
+    // Targets with optional smoothing over the legal actions.
+    let mut pis = Mat::zeros(n, N_ACTIONS);
+    for (r, s) in rows.iter().enumerate() {
+        let row = pis.row_mut(r);
+        let legal = s.mask.iter().filter(|m| **m).count().max(1) as f32;
+        for (a, target) in row.iter_mut().enumerate() {
+            let uniform = if s.mask[a] { 1.0 / legal } else { 0.0 };
+            *target = (1.0 - opts.smoothing) * s.pi[a] + opts.smoothing * uniform;
+        }
+    }
+    let mut dlogits = Mat::zeros(n, N_ACTIONS);
+    for r in 0..n {
+        let (p, t) = (probs.row(r), pis.row(r));
+        let out = dlogits.row_mut(r);
+        for a in 0..N_ACTIONS {
+            out[a] = (p[a] - t[a]) * norm_policy;
+        }
+        if opts.pg_weight != 0.0 && rows[r].action >= 0 {
+            // REINFORCE uses the value prediction as its baseline.
+            let advantage = rows[r].z - value[r];
+            let chosen = rows[r].action as usize;
+            for a in 0..N_ACTIONS {
+                let onehot = (a == chosen) as u8 as f32;
+                out[a] += opts.pg_weight * advantage * (p[a] - onehot) * norm_policy;
+            }
+        }
+    }
+    // Every row, continuing or ended, carries the final placement as its value label.
+    let dvalue: Vec<f32> = (0..n)
+        .map(|r| {
+            scales.value_weight * 2.0 * (value[r] - rows[r].z) * (1.0 - value[r] * value[r])
+                / scales.bsz as f32
+        })
+        .collect();
+    let value_loss = (0..n).map(|r| (value[r] - rows[r].z).powi(2)).sum::<f32>();
+    let dcombat: Vec<f32> = (0..n)
+        .map(|r| {
+            if rows[r].combat_known {
+                scales.combat_weight
+                    * 2.0
+                    * (combat[r] - rows[r].combat)
+                    * (1.0 - combat[r] * combat[r])
+                    / scales.n_combat.max(1) as f32
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let combat_loss = (0..n)
+        .filter(|r| rows[*r].combat_known)
+        .map(|r| (combat[r] - rows[r].combat).powi(2))
+        .sum::<f32>();
+    let mut policy_loss = 0.0f32;
+    let mut policy_entropy = 0.0f64;
+    let mut target_entropy = 0.0f64;
+    let mut target_kl = 0.0f64;
+    let mut logit_span = 0.0f64;
+    for (r, sample) in rows.iter().enumerate() {
+        if sample.is_ended() {
+            continue;
+        }
+        let (p, t) = (probs.row(r), pis.row(r));
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for a in 0..N_ACTIONS {
+            let lp = p[a].max(1e-12).ln();
+            let lt = t[a].max(1e-12).ln();
+            policy_loss -= t[a] * lp;
+            policy_entropy -= (p[a] * lp) as f64;
+            target_entropy -= (t[a] * lt) as f64;
+            target_kl += (t[a] * (lt - lp)) as f64;
+            if sample.mask[a] {
+                lo = lo.min(logits.row(r)[a]);
+                hi = hi.max(logits.row(r)[a]);
+            }
+        }
+        logit_span += (hi - lo) as f64;
+    }
+    let dlogits_sq = dlogits.sum_squares();
+    let grads = net.backward(&cache, &dlogits, &dvalue, &dcombat);
+    Ok(ChunkOutput {
+        grads,
+        value,
+        policy_loss,
+        value_loss,
+        combat_loss,
+        policy_entropy,
+        target_entropy,
+        target_kl,
+        logit_span,
+        dlogits_sq,
+    })
 }
 
 /// One pass over `samples` in random minibatches; returns mean losses and mean metrics.
@@ -905,8 +1091,8 @@ pub struct TrainingState<'a> {
 
 /// Atomic optimizer/RNG/replay snapshot for exact continued training.
 ///
-/// The replay window is stored in full (float32 observations), so a snapshot is roughly
-/// `replay_rounds x max_samples x 15 KB` at the defaults.
+/// The replay window is stored in full (float32 observations): every decision of the last
+/// `replay_rounds` rounds, about 9 KB each, so roughly 6 GB at the defaults.
 pub fn save_training_state(path: &Path, state: &TrainingState) -> Result<(), String> {
     let trainer = state.trainer;
     let meta = TrainerMeta {
@@ -1001,28 +1187,4 @@ pub fn load_training_state(
         window.restore(&npz, meta.replay_rounds_stored)?;
     }
     Ok(meta)
-}
-
-/// Subsample `samples` down to `cap` uniformly (deterministic in `seed`).
-pub fn subsample(samples: Vec<Sample>, cap: usize, seed: u64) -> Vec<Sample> {
-    if samples.len() <= cap {
-        return samples;
-    }
-    let mut rng = Pcg64Mcg::seed_from_u64(seed ^ 0x4341_5000);
-    let mut keep = sample_indices(&mut rng, samples.len(), cap).into_vec();
-    keep.sort_unstable();
-    let mut wanted = keep.into_iter().peekable();
-    samples
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| {
-            if wanted.peek() == Some(i) {
-                wanted.next();
-                true
-            } else {
-                false
-            }
-        })
-        .map(|(_, s)| s)
-        .collect()
 }

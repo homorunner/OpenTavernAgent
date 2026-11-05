@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 taverngym = { path = "../taverngym" }
-matrixmultiply = { version = "0.3", features = ["threading"] }
+matrixmultiply = { version = "0.3", features = ["avx512"] }
 rayon = "1.10"
 rand = "0.9"
 rand_distr = "0.5"
