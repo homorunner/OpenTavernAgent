@@ -23,8 +23,6 @@ use rand_pcg::Pcg64Mcg;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use taverngym::Game;
-use taverngym::rng::Rng as GameRng;
-use taverngym::state::Player;
 
 use crate::heroes::select_heroes;
 use crate::linalg::Mat;
@@ -37,7 +35,7 @@ use crate::net::{
 use crate::npz::{NpyArray, Npz};
 use crate::rules::Budgets;
 
-pub const TRAINER_FORMAT: i64 = 4;
+pub const TRAINER_FORMAT: i64 = 5;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
@@ -48,10 +46,6 @@ pub struct Sample {
     pub z: f32,
     /// The action actually played, or -1 when unknown (ended positions).
     pub action: i64,
-    /// Expected result of this turn's fight if the seat stopped here (mean of simulated
-    /// combats, -1 loss / 0 tie / +1 win), when `combat_known`.
-    pub combat: f32,
-    pub combat_known: bool,
 }
 
 impl Sample {
@@ -82,65 +76,11 @@ pub fn ended_sample_of(preview: &Game, seat: usize) -> Result<Sample, String> {
         pi: vec![0.0; N_ACTIONS],
         z: 0.0,
         action: -1,
-        combat: 0.0,
-        combat_known: false,
     })
 }
 
 pub fn ended_sample(game: &Game, seat: usize) -> Result<Sample, String> {
     ended_sample_of(&end_turn_preview(game, seat)?, seat)
-}
-
-/// Expected result of `seat`'s fight this turn with `player` as its final state, against
-/// the opponent `full` pairs it with: the mean of `sims` simulated combats scored -1 / 0 /
-/// +1, each with a fresh random stream. `full` is the position after every seat has ended
-/// (boards final, pairings set). None when the seat has no fight this turn.
-pub fn combat_label(
-    full: &Game,
-    seat: usize,
-    player: &Player,
-    sims: usize,
-    rng: &mut impl Rng,
-) -> Option<f32> {
-    if sims == 0 || !full.players[seat].alive || full.players[seat].health <= 0 {
-        return None;
-    }
-    let pair = full.pairs.iter().find_map(|(a, b)| {
-        if *a == seat {
-            Some(*b)
-        } else if *b == Some(seat) {
-            Some(Some(*a))
-        } else {
-            None
-        }
-    })?;
-    if let Some(o) = pair
-        && (!full.players[o].alive || full.players[o].health <= 0)
-    {
-        return None;
-    }
-    let ghost_id = full.eliminated.last().copied();
-    let ghost = pair.is_none().then(|| {
-        ghost_id
-            .map(|g| (full.players[g].last_board.clone(), full.players[g].tier))
-            .unwrap_or((vec![], 1))
-    });
-    let mut total = 0i32;
-    for _ in 0..sims {
-        let mut g = full.clone();
-        g.players[seat] = player.clone();
-        g.rng = GameRng::new(rng.random::<u64>());
-        if pair.is_none() {
-            g.ghost_player = ghost_id;
-        }
-        let out = g.simulate_combat(seat, pair, ghost.clone());
-        total += match out.winner {
-            0 => 1,
-            1 => -1,
-            _ => 0,
-        };
-    }
-    Some(total as f32 / sims as f32)
 }
 
 #[derive(Clone, Debug)]
@@ -149,8 +89,6 @@ pub struct PlayOptions {
     pub temperature: f32,
     pub end_explore: f32,
     pub budgets: Budgets,
-    /// Simulated combats per labelled position (0 disables the combat head's labels).
-    pub combat_sims: usize,
     /// Probability that a decision is searched (and recorded); the rest play the prior.
     pub search_prob: f32,
 }
@@ -254,13 +192,6 @@ fn presearch_ply<E: Evaluator + ?Sized>(
     Ok(out)
 }
 
-/// A position of the current turn waiting for its combat label once every seat has ended.
-struct PendingCombat {
-    samples: Vec<usize>,
-    seat: usize,
-    player: Player,
-}
-
 /// Seed-derived generator for one self-play game: root noise, simulation seeds,
 /// temperature sampling and End Turn exploration.
 pub fn game_rng(seed: u64) -> Pcg64Mcg {
@@ -288,7 +219,6 @@ pub fn play_one<E: Evaluator + ?Sized>(
     let mut rng = game_rng(seed);
     let mut samples: Vec<Sample> = Vec::new();
     let mut seats: Vec<usize> = Vec::new();
-    let mut pending: Vec<PendingCombat> = Vec::new();
     while !game.is_over() {
         let mut acted = false;
         let mut presearched = presearch_ply(&game, net, opts, &mut rng, pool)?;
@@ -337,21 +267,9 @@ pub fn play_one<E: Evaluator + ?Sized>(
                 // Exploration only changes what is played; the search policy stays the target.
                 action = A_END_TURN;
             }
-            // The board this position would hand to combat (only when the turn can end
-            // here: a pending choice has to be resolved first).
-            let searched = matches!(decision, Decision::Searched(_));
-            let preview = if obs.mask[A_END_TURN]
-                && ((opts.combat_sims > 0 && searched) || action == A_END_TURN)
-            {
-                Some(end_turn_preview(&game, seat)?)
-            } else {
-                None
-            };
             // Only searched decisions are training rows (their visit distribution is
             // the policy target); the ended position below is recorded either way.
-            let mut labelled = Vec::new();
             if let Decision::Searched(result) = decision {
-                labelled.push(samples.len());
                 samples.push(Sample {
                     x: obs.x,
                     cards: obs.cards,
@@ -359,48 +277,13 @@ pub fn play_one<E: Evaluator + ?Sized>(
                     pi: result.policy,
                     z: 0.0,
                     action: action as i64,
-                    combat: 0.0,
-                    combat_known: false,
                 });
                 seats.push(seat);
             }
             if action == A_END_TURN {
-                let preview = preview
-                    .as_ref()
-                    .expect("End Turn is legal, so the preview exists");
-                labelled.push(samples.len());
-                samples.push(ended_sample_of(preview, seat)?);
+                let preview = end_turn_preview(&game, seat)?;
+                samples.push(ended_sample_of(&preview, seat)?);
                 seats.push(seat);
-            }
-            if let Some(preview) = &preview
-                && opts.combat_sims > 0
-                && !labelled.is_empty()
-            {
-                pending.push(PendingCombat {
-                    samples: labelled,
-                    seat,
-                    player: preview.players[seat].clone(),
-                });
-            }
-            if action == A_END_TURN {
-                let last = (0..game.players.len())
-                    .all(|p| p == seat || !game.players[p].alive || game.players[p].ended_turn);
-                if last {
-                    // Every board is final in the preview: label the whole turn's positions.
-                    let full = preview
-                        .as_ref()
-                        .expect("End Turn is legal, so the preview exists");
-                    for item in pending.drain(..) {
-                        if let Some(label) =
-                            combat_label(full, item.seat, &item.player, opts.combat_sims, &mut rng)
-                        {
-                            for &i in &item.samples {
-                                samples[i].combat = label;
-                                samples[i].combat_known = true;
-                            }
-                        }
-                    }
-                }
             }
             // Plain step: every seat is the network here, so nothing may drive the bots.
             game.apply_index(seat, action).map_err(|e| e.to_string())?;
@@ -455,8 +338,6 @@ pub struct OptimizerHparams {
     pub wd: f32,
     pub clip: f32,
     pub value_weight: f32,
-    /// Weight of the auxiliary combat-outcome MSE.
-    pub combat_weight: f32,
     /// Per-update EMA decay once warmed up; `1 - 1/decay` updates is the averaging window.
     /// See `ema_decay_for_window`.
     pub ema_decay: f32,
@@ -468,7 +349,6 @@ impl Default for OptimizerHparams {
             wd: 0.01,
             clip: 5.0,
             value_weight: 0.5,
-            combat_weight: 0.5,
             ema_decay: ema_decay_for_window(1024.0),
         }
     }
@@ -555,14 +435,10 @@ impl Trainer {
         // no policy target, and contributes nothing to the policy loss or its gradient.
         let n_policy = batch.iter().filter(|s| !s.is_ended()).count();
         let norm_policy = 1.0 / n_policy.max(1) as f32;
-        // The combat head is supervised only where this turn's fight could be simulated.
-        let n_combat = batch.iter().filter(|s| s.combat_known).count();
         let scales = LossScales {
             norm_policy,
             bsz,
-            n_combat,
             value_weight: self.hparams.value_weight,
-            combat_weight: self.hparams.combat_weight,
         };
         let net = &self.net;
         let parts: Vec<ChunkOutput> = batch
@@ -595,11 +471,6 @@ impl Trainer {
         let value: Vec<f32> = parts.iter().flat_map(|p| p.value.iter().copied()).collect();
         let policy_loss: f32 = parts.iter().map(|p| p.policy_loss).sum::<f32>() * norm_policy;
         let value_loss: f32 = parts.iter().map(|p| p.value_loss).sum::<f32>() / bsz as f32;
-        let combat_loss: f32 = if n_combat > 0 {
-            parts.iter().map(|p| p.combat_loss).sum::<f32>() / n_combat as f32
-        } else {
-            0.0
-        };
         let policy_entropy: f64 = parts.iter().map(|p| p.policy_entropy).sum();
         let target_entropy: f64 = parts.iter().map(|p| p.target_entropy).sum();
         let target_kl: f64 = parts.iter().map(|p| p.target_kl).sum();
@@ -608,7 +479,7 @@ impl Trainer {
         drop(parts);
 
         let norm = grads.sum_squares().sqrt();
-        if !norm.is_finite() || !(policy_loss + value_loss + combat_loss).is_finite() {
+        if !norm.is_finite() || !(policy_loss + value_loss).is_finite() {
             return Err("nonfinite training loss or gradient".into());
         }
         let scale = if norm > self.hparams.clip as f64 {
@@ -652,12 +523,6 @@ impl Trainer {
             head_norm(&[self.net.p.wv(), self.net.p.bv()]),
         );
         metrics.insert("policy_training_samples".into(), n_policy as f64);
-        metrics.insert("combat_training_samples".into(), n_combat as f64);
-        metrics.insert("combat_loss".into(), combat_loss as f64);
-        metrics.insert(
-            "combat_head_grad_norm".into(),
-            head_norm(&[self.net.p.wc(), self.net.p.bc()]),
-        );
         metrics.insert("ended_samples".into(), (bsz - n_policy) as f64);
         metrics.insert("clipped_fraction".into(), (scale < 1.0) as u8 as f64);
         metrics.insert("policy_entropy".into(), per_policy(policy_entropy));
@@ -739,9 +604,7 @@ const OPTIMIZER_CHUNK: usize = 16_384;
 struct LossScales {
     norm_policy: f32,
     bsz: usize,
-    n_combat: usize,
     value_weight: f32,
-    combat_weight: f32,
 }
 
 /// Gradients and loss terms of one chunk of rows; sums are unnormalised.
@@ -750,7 +613,6 @@ struct ChunkOutput {
     value: Vec<f32>,
     policy_loss: f32,
     value_loss: f32,
-    combat_loss: f32,
     policy_entropy: f64,
     target_entropy: f64,
     target_kl: f64,
@@ -768,7 +630,7 @@ fn chunk_step(
     let xs: Vec<&[f32]> = rows.iter().map(|s| s.x.as_slice()).collect();
     let cards: Vec<&[i32]> = rows.iter().map(|s| s.cards.as_slice()).collect();
     let masks: Vec<&[bool]> = rows.iter().map(|s| s.mask.as_slice()).collect();
-    let (logits, value, combat, cache) = net.forward(&xs, &cards)?;
+    let (logits, value, cache) = net.forward(&xs, &cards)?;
     let probs = masked_softmax_rows(&logits, &masks);
     let norm_policy = scales.norm_policy;
     // Targets with optional smoothing over the legal actions.
@@ -806,23 +668,6 @@ fn chunk_step(
         })
         .collect();
     let value_loss = (0..n).map(|r| (value[r] - rows[r].z).powi(2)).sum::<f32>();
-    let dcombat: Vec<f32> = (0..n)
-        .map(|r| {
-            if rows[r].combat_known {
-                scales.combat_weight
-                    * 2.0
-                    * (combat[r] - rows[r].combat)
-                    * (1.0 - combat[r] * combat[r])
-                    / scales.n_combat.max(1) as f32
-            } else {
-                0.0
-            }
-        })
-        .collect();
-    let combat_loss = (0..n)
-        .filter(|r| rows[*r].combat_known)
-        .map(|r| (combat[r] - rows[r].combat).powi(2))
-        .sum::<f32>();
     let mut policy_loss = 0.0f32;
     let mut policy_entropy = 0.0f64;
     let mut target_entropy = 0.0f64;
@@ -849,13 +694,12 @@ fn chunk_step(
         logit_span += (hi - lo) as f64;
     }
     let dlogits_sq = dlogits.sum_squares();
-    let grads = net.backward(&cache, &dlogits, &dvalue, &dcombat);
+    let grads = net.backward(&cache, &dlogits, &dvalue);
     Ok(ChunkOutput {
         grads,
         value,
         policy_loss,
         value_loss,
-        combat_loss,
         policy_entropy,
         target_entropy,
         target_kl,
@@ -910,16 +754,7 @@ pub struct ReplayWindow {
 }
 
 impl ReplayWindow {
-    pub const FIELDS: [&'static str; 8] = [
-        "x",
-        "cards",
-        "mask",
-        "pi",
-        "z",
-        "action",
-        "combat",
-        "combat_known",
-    ];
+    pub const FIELDS: [&'static str; 6] = ["x", "cards", "mask", "pi", "z", "action"];
 
     pub fn new(capacity: usize) -> Result<ReplayWindow, String> {
         if capacity < 1 {
@@ -968,8 +803,6 @@ impl ReplayWindow {
             let mut pi = Vec::with_capacity(n * N_ACTIONS);
             let mut z = Vec::with_capacity(n);
             let mut action = Vec::with_capacity(n);
-            let mut combat = Vec::with_capacity(n);
-            let mut known = Vec::with_capacity(n);
             for s in batch {
                 x.extend_from_slice(&s.x);
                 cards.extend_from_slice(&s.cards);
@@ -977,8 +810,6 @@ impl ReplayWindow {
                 pi.extend_from_slice(&s.pi);
                 z.push(s.z);
                 action.push(s.action);
-                combat.push(s.combat);
-                known.push(s.combat_known);
             }
             npz.insert(
                 format!("replay/{i}/x"),
@@ -998,11 +829,6 @@ impl ReplayWindow {
             );
             npz.insert(format!("replay/{i}/z"), NpyArray::f32(vec![n], z));
             npz.insert(format!("replay/{i}/action"), NpyArray::i64(vec![n], action));
-            npz.insert(format!("replay/{i}/combat"), NpyArray::f32(vec![n], combat));
-            npz.insert(
-                format!("replay/{i}/combat_known"),
-                NpyArray::bool(vec![n], known),
-            );
         }
     }
 
@@ -1020,16 +846,12 @@ impl ReplayWindow {
             let pi = get("pi")?.as_f32()?;
             let z = get("z")?.as_f32()?;
             let action = get("action")?.as_i64()?;
-            let combat = get("combat")?.as_f32()?;
-            let known = get("combat_known")?.as_bool()?;
             let n = z.len();
             if x.len() != n * N_FEATURES
                 || cards.len() != n * N_CARD_SLOTS
                 || mask.len() != n * N_ACTIONS
                 || pi.len() != n * N_ACTIONS
                 || action.len() != n
-                || combat.len() != n
-                || known.len() != n
             {
                 return Err("inconsistent replay window in trainer snapshot".into());
             }
@@ -1041,8 +863,6 @@ impl ReplayWindow {
                     pi: pi[j * N_ACTIONS..(j + 1) * N_ACTIONS].to_vec(),
                     z: z[j],
                     action: action[j],
-                    combat: combat[j],
-                    combat_known: known[j],
                 })
                 .collect();
             self.add(batch);

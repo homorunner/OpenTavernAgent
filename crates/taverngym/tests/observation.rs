@@ -16,7 +16,7 @@ fn stats_are_log_scaled_and_other_features_stay_linear() {
     g.players[0].health = 20;
     let obs = observe(&g, 0);
     let offset = GLOBAL_F + N_QUESTS * QUEST_F + PENDING_KINDS;
-    assert_eq!(obs.floats.len(), 3238);
+    assert_eq!(obs.floats.len(), 3235);
     assert_eq!(obs.floats[7], 0.7);
     assert!((obs.floats[5] - 20.0_f32.ln_1p() / 40.0_f32.ln_1p()).abs() < 1e-6);
     assert!((obs.floats[offset + 1] - 1.0).abs() < 1e-6);
@@ -43,28 +43,6 @@ fn scout_turn_is_visible_without_revealing_current_opponent_board() {
     assert_eq!(observe(&g, 0).floats, obs.floats);
     let restored: Game = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
     assert_eq!(observe(&restored, 0).floats, obs.floats);
-}
-
-#[test]
-fn remaining_action_budgets_are_visible_and_unlimited_is_distinct() {
-    let mut g = game(4206);
-    g.cfg.turn_action_caps = vec![100];
-    g.cfg.move_actions_per_turn = 10;
-    g.cfg.freeze_presses_per_turn = 5;
-    g.players[0].actions_this_turn = 90;
-    g.players[0].moves_this_turn = 8;
-    g.players[0].freezes_this_turn = 5;
-    assert_eq!(
-        &observe(&g, 0).floats[OBS_FLOATS - ACTION_BUDGET_F..],
-        &[0.1, 0.2, 0.0]
-    );
-    g.players[0].uncapped = true;
-    g.cfg.move_actions_per_turn = 0;
-    g.cfg.freeze_presses_per_turn = 0;
-    assert_eq!(
-        &observe(&g, 0).floats[OBS_FLOATS - ACTION_BUDGET_F..],
-        &[-1.0, -1.0, -1.0]
-    );
 }
 
 #[test]

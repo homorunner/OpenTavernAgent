@@ -31,11 +31,11 @@ fn cfg(activation: Activation, head_norm: bool) -> NetConfig {
 #[test]
 fn parameter_count_and_input_layout() {
     let net = PolicyValueNet::new(0, NetConfig::default()).unwrap();
-    assert_eq!(net.n_input_features(), 1716);
+    assert_eq!(net.n_input_features(), 1713);
     assert_eq!(net.n_card_slots(), 69);
-    assert_eq!(net.n_params(), 803_191);
-    assert_eq!(net.p.tensors.len(), 11 + 4 * 4);
-    assert_eq!(net.p.names().last().unwrap(), "bc");
+    assert_eq!(net.n_params(), 877_302);
+    assert_eq!(net.p.tensors.len(), 9 + 4 * net.cfg.blocks);
+    assert_eq!(net.p.names().last().unwrap(), "bv");
     let wide = PolicyValueNet::new(
         0,
         NetConfig {
@@ -45,10 +45,10 @@ fn parameter_count_and_input_layout() {
         },
     )
     .unwrap();
-    assert_eq!(wide.p.tensors.len(), 11 + 4 * 2);
+    assert_eq!(wide.p.tensors.len(), 9 + 4 * 2);
     assert_eq!(wide.p.tensors[wide.p.wp()].rows, 256);
-    assert!(wide.p.is_weight(wide.p.wv()) && wide.p.is_weight(wide.p.wc()));
-    assert!(!wide.p.is_weight(wide.p.bp()) && !wide.p.is_weight(wide.p.bc()));
+    assert!(wide.p.is_weight(wide.p.wv()));
+    assert!(!wide.p.is_weight(wide.p.bp()) && !wide.p.is_weight(wide.p.bv()));
     assert!(net::input_feature_indices().contains(&net::ENDED_TURN_FEATURE));
     assert!(!net::input_feature_indices().contains(&1));
     assert!(!net::input_feature_indices().contains(&15));
@@ -161,27 +161,20 @@ fn gradient_check(activation: Activation, head_norm: bool) {
             .collect(),
     );
     let dvalue_raw = [0.03f32, -0.02, 0.05];
-    let dcombat_raw = [-0.04f32, 0.01, 0.02];
-    let (_, value, combat, cache) = net.forward(&xs, &cards).unwrap();
+    let (_, value, cache) = net.forward(&xs, &cards).unwrap();
     let dvalue: Vec<f32> = (0..3)
         .map(|i| dvalue_raw[i] * (1.0 - value[i] * value[i]))
         .collect();
-    let dcombat: Vec<f32> = (0..3)
-        .map(|i| dcombat_raw[i] * (1.0 - combat[i] * combat[i]))
-        .collect();
-    let grads = net.backward(&cache, &dlogits, &dvalue, &dcombat);
+    let grads = net.backward(&cache, &dlogits, &dvalue);
     assert!(grads.tensors[net::E].row(0).iter().all(|v| *v == 0.0));
     let loss = |net: &PolicyValueNet| -> f64 {
-        let (logits, value, combat, _) = net.forward(&xs, &cards).unwrap();
+        let (logits, value, _) = net.forward(&xs, &cards).unwrap();
         let mut total = 0.0f64;
         for (l, d) in logits.data.iter().zip(&dlogits.data) {
             total += *l as f64 * *d as f64;
         }
         for (v, d) in value.iter().zip(&dvalue_raw) {
             total += *v as f64 * *d as f64;
-        }
-        for (c, d) in combat.iter().zip(&dcombat_raw) {
-            total += *c as f64 * *d as f64;
         }
         total
     };
@@ -237,7 +230,7 @@ fn search_inference_matches_the_training_forward() {
             let game = position(seed);
             for seat in 0..2 {
                 let obs = observe_seat(&game, seat);
-                let (logits, value, _, _) = net.forward(&[&obs.x], &[&obs.cards]).unwrap();
+                let (logits, value, _) = net.forward(&[&obs.x], &[&obs.cards]).unwrap();
                 // The f32 path repeats the training arithmetic exactly.
                 let (exact_logits, exact_value) = net.infer_f32(&obs.x, &obs.cards).unwrap();
                 assert_eq!(logits.row(0), &exact_logits[..]);
@@ -310,15 +303,13 @@ fn checkpoints_round_trip_and_reject_other_schemas() {
     );
     // Numpy-compatible layout: the arrays carry the Python-era names and 1-D vectors.
     let npz = Npz::load(&path).unwrap();
-    assert_eq!(npz.get("W0").unwrap().shape, vec![1716 + 69 * 4, 192]);
+    assert_eq!(npz.get("W0").unwrap().shape, vec![1713 + 69 * 4, 192]);
     assert_eq!(npz.get("bp").unwrap().shape, vec![N_ACTIONS]);
     let mut wrong = npz.clone();
-    let meta = wrong
-        .get("meta")
-        .unwrap()
-        .as_text()
-        .unwrap()
-        .replace("\"version\":4", "\"version\":2");
+    let meta = wrong.get("meta").unwrap().as_text().unwrap().replace(
+        &format!("\"version\":{}", net::MODEL_VERSION),
+        "\"version\":2",
+    );
     wrong.insert("meta", tavernagent::npz::NpyArray::text(&meta));
     assert!(PolicyValueNet::from_npz(&wrong).unwrap_err().contains("v2"));
     let mut other_cards = npz.clone();

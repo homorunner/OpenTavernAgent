@@ -5,8 +5,8 @@ self-play. It is the Rust crate `crates/tavernagent` and the `tavernagent` binar
 on the `taverngym` crate directly and needs no Python. Checkpoints are numpy-readable `.npz`
 files, so weights stay inspectable from Python.
 
-The current model has **803,191 parameters**: a policy head, a value head and an auxiliary
-combat head. Weights are model format v4; the search protocol is `ended-state-v3`.
+The current model has **877,878 parameters**: a policy head and a value head. Weights are
+model format v5; the search protocol is `ended-state-v3`.
 
 ## Commands
 
@@ -47,12 +47,12 @@ Results do not depend on the thread count.
 ## Network and inputs
 
 ```
-1716 numeric features + 69 card slots x 16-dim shared card embedding
-  -> 192 -> 4 residual blocks  h <- h + GELU(LN(W h))
-  -> 245 policy logits (masked softmax) / tanh value / tanh combat outcome
+1713 numeric features + 69 card slots x 16-dim shared card embedding
+  -> 192 -> 6 residual blocks  h <- h + GELU(LN(W h))
+  -> 245 policy logits (masked softmax) / tanh value
 ```
 
-- The environment exposes 3,238 floats and 124 card indices; the network drops the 1,519
+- The environment exposes 3,235 floats and 124 card indices; the network drops the 1,519
   historical-opponent-warband floats, the 49 historical warband card slots and three
   redundant global flags (hero selection, game over, the Tavern-wide freeze flag), keeping
   the opponents' public summaries and heroes.
@@ -63,8 +63,10 @@ Results do not depend on the thread count.
   table indexed by `CardId + 1` (0 = empty; Dark Gifts are not embedded). The 69 slots are
   the own warband, hand, Tavern, the pending choice's source and options, trinkets,
   quests/rewards and the opponents' heroes; the Deity and secret slots are not used.
-- Stats use the engine's `log1p` scaling; other features keep their linear scales. The
-  last three inputs are the remaining per-turn action / Move / Freeze budgets.
+- Stats use the engine's `log1p` scaling; other features keep their linear scales.
+  Host-side per-turn budgets (actions, Moves, Freeze presses) are not inputs: the search
+  mask already excludes what is unaffordable, and the cap is a host safety limit, not a
+  game rule.
 - Hero selection is a uniform random choice outside the network (`heroes::select_heroes`,
   seeded); the chosen hero is still an input. Discovers, trinkets and targets are decided
   by the model.
@@ -113,8 +115,8 @@ touched.
 - Self-play raises the root prior to `1 / --root-temperature` (1.1) and mixes Dirichlet
   noise into it (`--noise 0.20`, `--noise-alpha 0.3`); evaluation does neither.
 - Per-turn host budgets (100 actions, 10 Moves, 5 Freeze presses) are enforced by the
-  engine, reset every turn and visible to the network; `--action-cap/--move-cap/--freeze-cap`
-  must be positive.
+  engine and reset every turn; `--action-cap/--move-cap/--freeze-cap` must be positive.
+  The network does not see them.
 - `--horizon game` advances the other seats with the scripted bot using hidden state; it is
   an experimental full-information mode only.
 - One 64-simulation decision takes about 23 µs per simulation on one core, of which roughly
@@ -129,18 +131,9 @@ mask, root visit distribution, the action played and the final placement reward
 (0.02) forces End Turn with a small probability so that ended positions with unspent Gold
 also appear; the search distribution stays the policy target.
 
-**Combat labels.** Every decision that could end the turn, and every ended position, carries
-the expected result of this turn's fight if the seat stopped there: the warband it would
-hand to combat is simulated `--combat-sims` (20) times against the opponent's final warband,
-scored +1 / 0 / -1 and averaged. Labels are computed once all seats have ended and before
-the real fight, when every final warband is known; positions with a pending choice cannot
-end the turn and carry no label (about 10%). This is a dense, low-variance signal next to
-the final placement; it costs about 6% of collection time and the search does not use it.
-
 **Loss.** Policy cross-entropy against the (smoothed, `--policy-smoothing 0.05`) visit
 distribution, averaged over rows with legal actions; `--value-weight` (0.5) times the value
-MSE over all rows; `--combat-weight` (0.5) times the combat MSE over labelled rows.
-Optional `--pg-weight` adds a REINFORCE term with the value as baseline. AdamW (decay on
+MSE over all rows. Optional `--pg-weight` adds a REINFORCE term with the value as baseline. AdamW (decay on
 weight matrices only), global gradient-norm clipping, cosine learning-rate schedule.
 
 **Parallel step.** A minibatch is processed in fixed chunks of `STEP_CHUNK_ROWS` (32) rows,
@@ -172,8 +165,8 @@ decisions per round (about 28% of them) was removed.
 | `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 1.0 / 1.0 |
 | `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 2 / 0.15 |
 | `--search-prob` | 0.33 |
-| `--hidden` / `--blocks` / `--embedding-dim` | 192 / 4 / 16 |
-| `--value-weight` / `--combat-weight` / `--combat-sims` | 0.5 / 0.5 / 20 |
+| `--hidden` / `--blocks` / `--embedding-dim` | 192 / 6 / 16 |
+| `--value-weight` | 0.5 |
 | `--weight-decay` / `--clip` / `--ema-rounds` | 0.01 / 5.0 / 2 |
 
 `--save-trainer-state` writes the network, AdamW moments, EMA, RNG states, history, options
@@ -181,7 +174,7 @@ and the **whole replay window** to `<out>.trainer.npz` after every round (about 
 defaults, 9 KB per stored decision); `--save-every N` keeps immutable `<out>.stepN.npz` / `.ema.npz` / `.trainer.npz`.
 `--resume-state` restores all of it bit-exactly (a smaller `--replay-rounds` keeps the newest
 rounds); `--resume` loads weights only. `<out>.history.json` records per-round losses,
-gradient norms, entropies, target KL, the combat and ended sample counts and timings.
+gradient norms, entropies, target KL, the ended sample counts and timings.
 
 ## Experiments so far
 
@@ -244,11 +237,11 @@ below; the bot itself scores 4.60); Elo is a Plackett-Luce fit on eight-player l
 | --- | --- |
 | `net.rs`, `linalg.rs`, `npz.rs` | network and hand-written backward; matrices; numpy-compatible checkpoints |
 | `mcts.rs` | PUCT, per-simulation random streams, chance branches, End Turn to the ended state |
-| `selfplay.rs`, `train.rs` | self-play with combat labels, AdamW/EMA, replay window, exact resume, the training loop |
+| `selfplay.rs`, `train.rs` | self-play, AdamW/EMA, replay window, exact resume, the training loop |
 | `eval.rs`, `arena.rs`, `tournament.rs`, `league.rs` | evaluation against the bot and between checkpoints |
 | `probe.rs`, `patterns.rs`, `bench.rs`, `play.rs` | behaviour summaries, action traces, latency, games |
 | `heroes.rs`, `rules.rs` | hero selection outside the network; host action budgets |
 
 `cargo test --release -p tavernagent` covers gradients, input encoding, search boundaries,
-ended samples, combat labels, replay persistence and exact resume. `tools/league_elo.py`
+ended samples, replay persistence and exact resume. `tools/league_elo.py`
 fits and plots league ratings.

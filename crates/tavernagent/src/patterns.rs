@@ -18,7 +18,7 @@ use taverngym::actions::{A_BUY, N_SHOP};
 
 use crate::heroes::select_heroes;
 use crate::mcts::{self, A_END_TURN, Horizon, SearchOptions, bot_action, observe_seat};
-use crate::net::{BUDGET_FEATURE_START, PolicyValueNet};
+use crate::net::PolicyValueNet;
 use crate::probe::family;
 use crate::rules::Budgets;
 use crate::selfplay::{game_rng, sample_action};
@@ -86,11 +86,11 @@ struct Turn {
     actions: Vec<Step>,
 }
 
-/// Visible preparation state of seat 0 without the action budgets.
+/// Visible preparation state of seat 0.
 fn material_key(game: &Game) -> u64 {
     let obs = observe_seat(game, 0);
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for v in &obs.x[..BUDGET_FEATURE_START] {
+    for v in &obs.x {
         v.to_bits().hash(&mut h);
     }
     obs.cards.hash(&mut h);

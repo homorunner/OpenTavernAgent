@@ -7,9 +7,7 @@ use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
 use tavernagent::heroes::select_heroes;
 use tavernagent::mcts::{self, A_END_TURN, Evaluator, Observation, SearchOptions, observe_seat};
-use tavernagent::net::{
-    BUDGET_FEATURE_START, ENDED_TURN_FEATURE, N_ACTIONS, NetConfig, PolicyValueNet,
-};
+use tavernagent::net::{ENDED_TURN_FEATURE, N_ACTIONS, NetConfig, PolicyValueNet};
 use tavernagent::npz::Npz;
 use tavernagent::rules::Budgets;
 use tavernagent::selfplay::{
@@ -42,8 +40,6 @@ fn batch() -> (Game, Sample) {
         pi,
         z: 1.0,
         action: -1,
-        combat: 0.0,
-        combat_known: false,
     };
     (game, sample)
 }
@@ -68,14 +64,11 @@ fn ended_sample_is_the_preview_of_end_turn_with_no_policy_target() {
     assert!(end.is_ended() && end.pi.iter().all(|p| *p == 0.0) && end.action == -1);
     assert_eq!(decision.x[ENDED_TURN_FEATURE], 0.0);
     assert_eq!(end.x[ENDED_TURN_FEATURE], 1.0);
-    // Identical to the real End Turn up to the action budget, which only `apply` counts.
+    // Identical to the real End Turn.
     let mut real = game.clone();
     real.apply_index(0, A_END_TURN).unwrap();
     let real_obs = observe_seat(&real, 0);
-    assert_eq!(
-        end.x[..BUDGET_FEATURE_START],
-        real_obs.x[..BUDGET_FEATURE_START]
-    );
+    assert_eq!(end.x, real_obs.x);
     assert_eq!(end.cards, real_obs.cards);
 }
 
@@ -185,7 +178,6 @@ fn play_options(sims: usize, end_explore: f32) -> PlayOptions {
         temperature: 0.0,
         end_explore,
         budgets: Budgets::default(),
-        combat_sims: 0,
         search_prob: 1.0,
     }
 }
@@ -194,8 +186,7 @@ fn play_options(sims: usize, end_explore: f32) -> PlayOptions {
 /// concurrent seat searches, and its thread count, change nothing.
 #[test]
 fn self_play_does_not_depend_on_the_search_pool() {
-    let mut opts = play_options(2, 0.0);
-    opts.combat_sims = 2;
+    let opts = play_options(2, 0.0);
     let global = play_one(&EndOrFirst, 31, &opts, None).unwrap();
     let single = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
@@ -209,10 +200,8 @@ fn self_play_does_not_depend_on_the_search_pool() {
         assert_eq!(a.mask, b.mask);
         assert_eq!(a.pi, b.pi);
         assert_eq!(a.z, b.z);
-        assert_eq!((a.combat_known, a.combat), (b.combat_known, b.combat));
         assert!(a.is_ended() || a.mask[a.action as usize]);
     }
-    assert!(global.0.iter().any(|s| s.combat_known));
 }
 
 #[test]
@@ -324,7 +313,6 @@ fn full_trainer_snapshot_restores_optimizer_rng_and_replay_exactly() {
         wd: 0.02,
         clip: 2.0,
         value_weight: 0.25,
-        combat_weight: 0.3,
         ema_decay: 0.995,
     };
     let mut trainer = Trainer::new(PolicyValueNet::new(12, small()).unwrap(), hparams.clone());
@@ -335,13 +323,8 @@ fn full_trainer_snapshot_restores_optimizer_rng_and_replay_exactly() {
     let replay_rng = Pcg64Mcg::seed_from_u64(11);
     let _ = rand::RngCore::next_u64(&mut rng);
     let mut replay = ReplayWindow::new(3).unwrap();
-    let labelled = Sample {
-        combat: 0.35,
-        combat_known: true,
-        ..decision.clone()
-    };
     replay.add(vec![decision.clone()]);
-    replay.add(vec![end.clone(), labelled]);
+    replay.add(vec![end.clone(), decision.clone()]);
     let path = dir.join("state.npz");
     let options = serde_json::json!({"replay_rounds": 3});
     save_training_state(
@@ -440,7 +423,7 @@ fn full_trainer_snapshot_restores_optimizer_rng_and_replay_exactly() {
         .contains("schema")
     );
     let mut truncated = Npz::load(&path).unwrap();
-    truncated.arrays.remove("replay/1/combat_known");
+    truncated.arrays.remove("replay/1/action");
     truncated.save(&wrong_path).unwrap();
     assert!(
         load_training_state(
@@ -534,8 +517,6 @@ fn training_step_does_not_depend_on_the_thread_count() {
             pi,
             z: 1.0 - 2.0 * (seed % 8) as f32 / 7.0,
             action: -1,
-            combat: 0.3,
-            combat_known: seed % 3 != 0,
         });
     }
     let batch: Vec<&Sample> = samples.iter().collect();
@@ -551,7 +532,6 @@ fn training_step_does_not_depend_on_the_thread_count() {
                     wd: 0.01,
                     clip: 5.0,
                     value_weight: 0.5,
-                    combat_weight: 0.5,
                     ema_decay: 0.99,
                 },
             );
@@ -611,110 +591,4 @@ fn ema_window_is_defined_in_rounds_and_warms_up() {
             assert!((trainer.ema.tensors[i].data[j] - expected).abs() < 1e-6);
         }
     }
-}
-
-#[test]
-fn combat_labels_are_simulated_matchup_means_and_train_only_the_combat_head_where_known() {
-    use tavernagent::mcts::bot_action;
-    use tavernagent::selfplay::{combat_label, end_turn_preview};
-    // Drive a game with the bot until the last seat is about to end turn 1.
-    let mut game = Game::new(41, Budgets::default().config().unwrap());
-    select_heroes(&mut game, 41).unwrap();
-    let seat = 'outer: loop {
-        for seat in 0..game.players.len() {
-            if !game.needs_action(seat) {
-                continue;
-            }
-            let action = bot_action(&mut game, seat);
-            let others_done = (0..game.players.len())
-                .all(|p| p == seat || !game.players[p].alive || game.players[p].ended_turn);
-            if action == taverngym::Action::EndTurn && others_done {
-                break 'outer seat;
-            }
-            game.apply(seat, action).unwrap();
-        }
-    };
-    let full = end_turn_preview(&game, seat).unwrap();
-    assert!(full.players.iter().all(|p| p.ended_turn));
-    let mut rng = Pcg64Mcg::seed_from_u64(3);
-    for s in 0..full.players.len() {
-        let label = combat_label(&full, s, &full.players[s], 20, &mut rng).unwrap();
-        assert!((-1.0..=1.0).contains(&label));
-        assert!(
-            (label * 20.0).round() == label * 20.0,
-            "a mean of 20 outcomes"
-        );
-    }
-    // The label follows the seat's own final state: an empty board always loses to a
-    // non-empty one and ties an empty one; the real game is untouched.
-    let before = serde_json::to_string(&full).unwrap();
-    let (a, b) = full.pairs[0];
-    let b = b.expect("eight live players pair up");
-    let mut empty = full.players[a].clone();
-    empty.board.clear();
-    let mut empty_opponent = full.clone();
-    empty_opponent.players[b].board.clear();
-    assert_eq!(combat_label(&full, a, &empty, 5, &mut rng), Some(-1.0));
-    assert_eq!(
-        combat_label(&empty_opponent, a, &full.players[a], 5, &mut rng),
-        Some(1.0)
-    );
-    assert_eq!(
-        combat_label(&empty_opponent, a, &empty, 5, &mut rng),
-        Some(0.0)
-    );
-    assert_eq!(serde_json::to_string(&full).unwrap(), before);
-    assert_eq!(combat_label(&full, a, &full.players[a], 0, &mut rng), None);
-
-    // Self-play attaches the label to every position of a turn whose fight happened, and
-    // the End Turn decision shares its label with its ended row.
-    let mut opts = play_options(2, 0.0);
-    opts.combat_sims = 4;
-    let (samples, _) = play_one(&EndOrFirst, 31, &opts, None).unwrap();
-    let known = samples.iter().filter(|s| s.combat_known).count();
-    assert!(
-        known > samples.len() / 2,
-        "{known} of {} labelled",
-        samples.len()
-    );
-    assert!(
-        samples
-            .iter()
-            .filter(|s| s.combat_known)
-            .all(|s| (-1.0..=1.0).contains(&s.combat))
-    );
-    for (i, s) in samples.iter().enumerate() {
-        if s.action == A_END_TURN as i64 && s.combat_known {
-            assert!(samples[i + 1].is_ended());
-            assert_eq!(samples[i + 1].combat, s.combat);
-        }
-    }
-
-    // Training: rows without a label leave the combat head alone.
-    let (_, decision) = batch();
-    let mut unknown = Trainer::new(
-        PolicyValueNet::new(4, small()).unwrap(),
-        OptimizerHparams::default(),
-    );
-    unknown
-        .step(&[&decision], 1e-3, StepOptions::default())
-        .unwrap();
-    assert_eq!(unknown.last_metrics["combat_training_samples"], 0.0);
-    assert_eq!(unknown.last_metrics["combat_head_grad_norm"], 0.0);
-    assert_eq!(unknown.last_metrics["combat_loss"], 0.0);
-    let labelled = Sample {
-        combat: -0.6,
-        combat_known: true,
-        ..decision.clone()
-    };
-    let mut known = Trainer::new(
-        PolicyValueNet::new(4, small()).unwrap(),
-        OptimizerHparams::default(),
-    );
-    known
-        .step(&[&labelled], 1e-3, StepOptions::default())
-        .unwrap();
-    assert_eq!(known.last_metrics["combat_training_samples"], 1.0);
-    assert!(known.last_metrics["combat_head_grad_norm"] > 0.0);
-    assert!(known.last_metrics["combat_loss"] > 0.0);
 }

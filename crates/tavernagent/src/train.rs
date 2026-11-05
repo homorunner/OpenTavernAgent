@@ -83,6 +83,10 @@ pub struct SelfplayArgs {
     /// Fraction of the top visit count an action needs to be an LCB candidate.
     #[arg(long, default_value_t = crate::mcts::DEFAULT_LCB_MIN_VISIT_PROP)]
     pub lcb_min_visit_prop: f32,
+    /// First-play urgency: unvisited edges valued at the parent mean minus this
+    /// (negative = the original rule, unvisited edges at Q = 0).
+    #[arg(long, default_value_t = crate::mcts::DEFAULT_FPU_REDUCTION)]
+    pub fpu_reduction: f32,
     /// Probability of forcing End Turn at a decision, so that ended positions with
     /// unspent Gold appear in the value data.
     #[arg(long, default_value_t = 0.02)]
@@ -106,12 +110,6 @@ pub struct SelfplayArgs {
     pub blocks: usize,
     #[arg(long, default_value_t = 0.5)]
     pub value_weight: f32,
-    /// Weight of the auxiliary combat-outcome loss.
-    #[arg(long, default_value_t = 0.5)]
-    pub combat_weight: f32,
-    /// Simulated combats per position for the combat-outcome label (0 = no labels).
-    #[arg(long, default_value_t = 20)]
-    pub combat_sims: usize,
     #[arg(long, default_value_t = 5.0)]
     pub clip: f32,
     /// Averaging window of the EMA weights, in self-play rounds (converted to a
@@ -181,7 +179,6 @@ impl SelfplayArgs {
             wd: self.weight_decay,
             clip: self.clip,
             value_weight: self.value_weight,
-            combat_weight: self.combat_weight,
             ema_decay: ema_decay_for_window(self.ema_rounds * self.updates_per_round() as f64),
         }
     }
@@ -334,9 +331,6 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
         if provided.contains("value_weight") {
             trainer.hparams.value_weight = args.value_weight;
         }
-        if provided.contains("combat_weight") {
-            trainer.hparams.combat_weight = args.combat_weight;
-        }
         if ["ema_rounds", "max_samples", "batch", "epochs"]
             .iter()
             .any(|k| provided.contains(*k))
@@ -346,7 +340,6 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
         args.weight_decay = trainer.hparams.wd;
         args.clip = trainer.hparams.clip;
         args.value_weight = trainer.hparams.value_weight;
-        args.combat_weight = trainer.hparams.combat_weight;
     } else {
         trainer.net.save(&with_stem(&out, ".initial.npz"))?;
     }
@@ -388,12 +381,12 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
                 root_temperature: args.root_temperature,
                 lcb_stdevs: args.lcb_stdevs,
                 lcb_min_visit_prop: args.lcb_min_visit_prop,
+                fpu_reduction: args.fpu_reduction,
                 keep_games: false,
             },
             temperature,
             end_explore: args.end_explore,
             budgets: args.budgets,
-            combat_sims: args.combat_sims,
             search_prob: args.search_prob,
         };
         let seeds: Vec<u64> = (0..args.games as u64)
@@ -472,9 +465,8 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
         let train_seconds = t1.elapsed().as_secs_f64();
         let batches = trained.div_ceil(args.batch) * args.epochs;
         println!(
-            "step {step:3}: {trained:6} samples from {} games (gen {collect_seconds:5.1}s, train {train_seconds:5.1}s, {batches} batches)  policy {pl:.3}  value {vl:.3}  combat {:.3}  lr {lr:.6}",
-            places.len(),
-            epoch_metrics.get("combat_loss").copied().unwrap_or(0.0)
+            "step {step:3}: {trained:6} samples from {} games (gen {collect_seconds:5.1}s, train {train_seconds:5.1}s, {batches} batches)  policy {pl:.3}  value {vl:.3}  lr {lr:.6}",
+            places.len()
         );
 
         let probe_start = Instant::now();

@@ -272,7 +272,7 @@ With `RulesConfig::record_log`, `Game::log` holds a text event log and each `Com
   (combat never leaks into the persistent warband) and content tests; modules carry unit tests
   (e.g. `batch`: thread independence, exact save/load); pytest (`tests/`) covers the Python side.
 - `crates/tavernagent/tests/` covers the agent: numerical gradient checks, search information
-  boundaries, self-play samples and combat labels, replay persistence and exact resume.
+  boundaries, self-play samples, replay persistence and exact resume.
 - CI runs `cargo fmt --check`, `cargo clippy --release --all-targets -- -D warnings`,
   `cargo test --release`, `pip install -e ".[test]"` and `pytest`.
 

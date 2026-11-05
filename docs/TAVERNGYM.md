@@ -68,9 +68,8 @@ while True:
 - `env.save(i)` / `env.load(i, s)` save and restore game `i` exactly; `env.game(i)` returns an
   independent copy to inspect or search from.
 
-**Observation.** A player view plus visible host action budgets: `features` (3,238 floats:
-global state, warband, hand, Tavern, pending choice, quests, opponents' last seen warbands,
-then remaining total-action / Move / Freeze budgets)
+**Observation.** A player view: `features` (3,235 floats: global state, warband, hand,
+Tavern, pending choice, quests, opponents' last seen warbands)
 and `cards` (124 card-embedding indices into the `N_CARDS` card vocabulary, 0 = empty;
 `taverngym.card_info(i)` describes index `i`). `taverngym.layout()` lists the sizes of every
 block, so a model can slice the vector without hard-coding offsets.
@@ -80,9 +79,8 @@ Stat encoding: minion Attack/current Health/maximum Health use
 Tavern/card tiers are divided by 7; other features use their existing linear scales.
 Each opponent's 10-value summary ends with `last_seen_turn / 20` (0 = never seen),
 paired with that opponent's historical board, including an observed empty board.
-The final three floats are remaining actions/100, Moves/10 and Freeze presses/5; -1 means
-unlimited and 0 means exhausted. `Game.action_budgets(seat)` returns the exact counts
-(`None` for unlimited). The global block ends (before the lobby races) with `ended_turn`
+Host per-turn budgets are not part of the observation. `Game.action_budgets(seat)` returns
+the remaining counts (`None` for unlimited) for callers that need them. The global block ends (before the lobby races) with `ended_turn`
 (`layout()["ENDED_TURN_F"]`): 1 once the seat has finished recruiting and has no legal
 action. `Game.end_turn_effects(seat)` ends a seat's turn on a copy without starting the
 fight, even for the last seat: end-of-turn effects run and their choices resolve randomly,

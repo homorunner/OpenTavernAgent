@@ -33,8 +33,6 @@ pub const N_OPP: usize = 7;
 /// Opponent warband memory (last seen boards, 7 minions each).
 pub const OPP_BOARD_F: usize = N_OPP * N_BOARD * MINION_F;
 pub const PENDING_KINDS: usize = 9;
-/// Remaining total-action / Move / Freeze host budgets.
-pub const ACTION_BUDGET_F: usize = 3;
 
 pub const OBS_FLOATS: usize = GLOBAL_F
     + N_QUESTS * QUEST_F
@@ -44,8 +42,7 @@ pub const OBS_FLOATS: usize = GLOBAL_F
     + N_SHOP * ITEM_F
     + N_CHOICE * ITEM_F
     + N_OPP * OPP_F
-    + OPP_BOARD_F
-    + ACTION_BUDGET_F;
+    + OPP_BOARD_F;
 /// hero, hero powers, Deity, source of the pending choice, board, hand, shop, choices, owned
 /// trinkets (8), Quests with their Rewards, owned Rewards, Secrets, opponent heroes, opponent
 /// last boards.
@@ -437,25 +434,6 @@ pub fn observe_view(g: &Game, p: PlayerId, all: bool) -> Observation {
             c.push(m.map(|m| card_index(m.card)).unwrap_or(0));
         }
     }
-    // Fixed typical scales preserve absolute remaining budgets across experiments.
-    // -1 explicitly denotes no limit; 0 denotes an exhausted budget.
-    let remaining = |cap: u32, used: u32, scale: f32| {
-        if cap == 0 {
-            -1.0
-        } else {
-            cap.saturating_sub(used) as f32 / scale
-        }
-    };
-    let total = g.action_cap_of(p);
-    f.extend([
-        if pl.uncapped || total == u32::MAX {
-            -1.0
-        } else {
-            total.saturating_sub(pl.actions_this_turn) as f32 / 100.0
-        },
-        remaining(g.cfg.move_actions_per_turn, pl.moves_this_turn, 10.0),
-        remaining(g.cfg.freeze_presses_per_turn, pl.freezes_this_turn, 5.0),
-    ]);
     debug_assert_eq!(f.len(), OBS_FLOATS);
     debug_assert_eq!(c.len(), OBS_CARDS);
     Observation {

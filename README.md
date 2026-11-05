@@ -110,7 +110,7 @@ It exposes the player-visible state, an exact legal action mask, and seeded save
 | `BattlegroundsEnv` | Connect one learning seat against seven scripted bots. |
 | `BatchEnv` | Step many games together, with any set of controlled seats, including self-play. |
 
-The learning interface provides 245 discrete actions, 3,238 numeric features and 124 card
+The learning interface provides 245 discrete actions, 3,235 numeric features and 124 card
 indices per observation. Rules and lobby settings can be configured explicitly.
 
 [Environment guide](docs/TAVERNGYM.md) · [Architecture](docs/ARCHITECTURE.md) ·
