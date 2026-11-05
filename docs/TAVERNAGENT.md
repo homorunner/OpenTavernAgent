@@ -102,6 +102,17 @@ observable outcomes of one action (a Refresh, a Discover) become separate child 
 the action edge aggregates their visits. The real game and its random stream are never
 touched.
 
+The agent also plays under a must-spend rule (`mcts::MUST_SPEND_GOLD = 3`): a seat holding
+at least 3 Gold may not end its turn, full stop. This is a training rule, not a game rule —
+the engine still offers End Turn and the scripted bot still takes it. The check is a plain
+Gold comparison rather than "is there something to buy", because the shop being empty right
+now says nothing: a free Refresh may turn up something affordable, and that Refresh is
+exactly what the seat should be pushed into. Since the rule keys on Gold alone it could empty
+the mask, so one safety net remains: past the turn's action cap the engine returns End Turn
+alone, and that single bit is restored. Gold does not carry over, so ending a turn with 3 or more
+unspent Gold is always a wasted resource, and the early game converges faster when the policy
+cannot learn to stop with a full purse.
+
 - PUCT over all legal actions, unvisited actions at Q = 0. Default `--c-puct 1.9`; `--sims 64`
   in evaluation, 256 in self-play.
 - Self-play searches a `--search-prob 0.33` fraction of the decisions and records only those
@@ -223,7 +234,8 @@ below; the bot itself scores 4.60); Elo is a Plackett-Luce fit on eight-player l
 
 - Ended-position value labels come only from where the policy actually stopped (plus
   `--end-explore`); asking "stop now" in mid-turn is still extrapolation. `patterns`'
-  `mean_gold_left` at End Turn measures this directly.
+  `mean_gold_left` at End Turn measures this directly — under the must-spend rule it cannot
+  exceed 2 by construction, so high-Gold endings are now unreachable rather than measured.
 - Policy, value and search gain are not evaluated separately; eight weak copies in
   self-play may give a thin learning signal early on.
 - Dynamic card counters, attached cards and persistent effects are not fully encoded

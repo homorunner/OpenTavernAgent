@@ -5,11 +5,13 @@ use rand_pcg::Pcg64Mcg;
 use serde_json::Value;
 use tavernagent::heroes::select_heroes;
 use tavernagent::mcts::{
-    self, A_END_TURN, Evaluator, Horizon, Observation, SearchOptions, observe_seat, reseeded,
+    self, A_END_TURN, Evaluator, Horizon, MUST_SPEND_GOLD, Observation, SearchOptions, agent_mask,
+    observe_seat, reseeded,
 };
 use tavernagent::net::{ENDED_TURN_FEATURE, N_ACTIONS, input_feature_indices};
 use tavernagent::rules::Budgets;
 use taverngym::Game;
+use taverngym::actions::A_REFRESH;
 
 fn position(seed: u64) -> Game {
     let mut game = Game::new(seed, Budgets::default().config().unwrap());
@@ -21,6 +23,13 @@ fn position(seed: u64) -> Game {
     me["skipping"] = Value::Bool(false);
     me["gold"] = Value::from(30);
     serde_json::from_value(state).unwrap()
+}
+
+/// `position` with too little Gold for the must-spend rule to bite.
+fn broke_position(seed: u64) -> Game {
+    let mut game = position(seed);
+    game.players[0].gold = MUST_SPEND_GOLD - 1;
+    game
 }
 
 fn state_without_rng(game: &Game) -> Value {
@@ -153,7 +162,7 @@ fn deterministic_actions_reuse_nodes_despite_new_simulation_rng() {
 
 #[test]
 fn turn_search_ends_the_turn_without_fighting_or_advancing_other_seats() {
-    let mut game = position(19);
+    let mut game = broke_position(19);
     // The controlled seat is the last seat: a real EndTurn would resolve combat.
     for seat in 1..game.players.len() {
         while game.needs_action(seat) {
@@ -279,8 +288,68 @@ fn root_noise_keeps_zero_prior_legal_actions_available() {
         &mut Pcg64Mcg::seed_from_u64(5),
     )
     .unwrap();
-    let mask = game.legal_mask(0);
+    let mask = agent_mask(&game, 0);
     let legal: Vec<usize> = (0..N_ACTIONS).filter(|a| mask[*a]).collect();
     assert_eq!(result.root.actions, legal);
     assert!(legal.iter().all(|a| result.root.prior[*a] > 0.0));
+}
+
+#[test]
+fn the_must_spend_rule_hides_end_turn_while_gold_is_left() {
+    let mut game = position(23);
+    assert!(game.legal_mask(0)[A_END_TURN], "the game itself allows it");
+    let mask = agent_mask(&game, 0);
+    assert!(!mask[A_END_TURN], "30 Gold is not a place to stop");
+    assert!(
+        mask.iter().any(|m| *m),
+        "masking End Turn never leaves the seat without an action"
+    );
+    // The rule is a plain Gold check, so it releases only once Gold itself is gone.
+    let mut steps = 0;
+    while !agent_mask(&game, 0)[A_END_TURN] {
+        let pending = !game.players[0].pending.is_empty();
+        let mask = agent_mask(&game, 0);
+        let from = if pending { 0 } else { A_REFRESH };
+        let action = (from..N_ACTIONS).find(|a| mask[*a]).unwrap();
+        game.apply_index(0, action).unwrap();
+        steps += 1;
+        assert!(steps < 512, "the rule never released End Turn");
+    }
+    assert!(game.players[0].gold < MUST_SPEND_GOLD);
+    assert!(game.legal_mask(0)[A_END_TURN]);
+}
+
+#[test]
+fn a_free_refresh_does_not_unlock_end_turn() {
+    let mut game = position(29);
+    let mut state: Value = serde_json::to_value(&game).unwrap();
+    let me = &mut state["players"][0];
+    me["gold"] = Value::from(MUST_SPEND_GOLD);
+    me["shop"] = Value::Array(vec![]);
+    me["free_refreshes"] = Value::from(1);
+    me["tier"] = Value::from(6);
+    me["powers"] = Value::Array(vec![]);
+    me["hand"] = Value::Array(vec![]);
+    me["board"] = Value::Array(vec![]);
+    game = serde_json::from_value(state).unwrap();
+    // Nothing is affordable right now, but a free Refresh may turn something up: the rule
+    // keys on Gold alone and keeps End Turn masked, so the seat has to take the Refresh.
+    let mask = agent_mask(&game, 0);
+    assert!(!mask[A_END_TURN], "3 Gold is still Gold");
+    assert!(
+        mask[A_REFRESH],
+        "the free Refresh is what the rule pushes toward"
+    );
+}
+
+#[test]
+fn the_action_cap_overrides_the_must_spend_rule() {
+    let mut game = position(31);
+    game.players[0].actions_this_turn = game.action_cap_of(0);
+    let mask = agent_mask(&game, 0);
+    assert!(
+        mask[A_END_TURN],
+        "past the cap End Turn is the only legal action, so the rule steps aside"
+    );
+    assert!(mask.iter().any(|m| *m), "the mask is never emptied");
 }

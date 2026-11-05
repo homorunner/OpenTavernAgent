@@ -20,10 +20,15 @@ use taverngym::{Game, bot, rng::Rng};
 
 use crate::net::{N_ACTIONS, PolicyValueNet};
 
-pub const SEARCH_VERSION: &str = "ended-state-v4-lcb";
+pub const SEARCH_VERSION: &str = "ended-state-v6-gold-gate";
 pub const MAX_PLIES: usize = 2000;
 pub const MAX_DEPTH: usize = 100;
 pub const A_END_TURN: usize = A_END;
+/// Training rule, not a game rule: a seat holding this much Gold may not end its turn
+/// while it could still spend some. It shortens the early game (every unspent Gold piece
+/// is wasted anyway, since Gold does not carry over) and keeps the value head from
+/// learning to stop with a full purse.
+pub const MUST_SPEND_GOLD: i32 = 3;
 /// Exploration constant. 1.3–1.9 were indistinguishable at 200 rounds across seeds; at
 /// 1000 rounds 1.9 led 1.5 narrowly and 1.7 clearly, so 1.9 is the default.
 pub const DEFAULT_C_PUCT: f32 = 1.9;
@@ -294,8 +299,25 @@ pub fn observe_seat(game: &Game, seat: usize) -> Observation {
     Observation {
         x: o.floats,
         cards: o.cards,
-        mask: game.legal_mask(seat),
+        mask: agent_mask(game, seat),
     }
+}
+
+/// The seat's legal actions with the must-spend rule applied: End Turn is illegal for a seat
+/// holding `MUST_SPEND_GOLD` Gold or more, whatever the shop currently offers. A free
+/// Refresh is exactly the case that matters — nothing is affordable now, a Refresh may turn
+/// up something that is — so the rule must not try to predict whether Gold *can* be spent.
+/// It only ever removes End Turn, and never leaves the mask empty: past the action cap the
+/// engine returns End Turn alone, and that one bit is restored.
+pub fn agent_mask(game: &Game, seat: usize) -> Vec<bool> {
+    let mut mask = game.legal_mask(seat);
+    if mask[A_END_TURN] && game.players[seat].gold >= MUST_SPEND_GOLD {
+        mask[A_END_TURN] = false;
+        if !mask.iter().any(|legal| *legal) {
+            mask[A_END_TURN] = true;
+        }
+    }
+    mask
 }
 
 /// Observable outcome key: the observation and legal mask, never the hidden future RNG.
