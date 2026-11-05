@@ -17,7 +17,7 @@ use crate::rules::Budgets;
 use crate::selfplay::{
     OptimizerHparams, PlayOptions, ReplayWindow, Sample, Stats, StepOptions, Trainer,
     TrainingState, cosine_lr, ema_decay_for_window, load_training_state, play_one,
-    read_training_meta, save_training_state, subsample, train_epoch,
+    read_training_meta, save_training_state, train_epoch,
 };
 
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
@@ -28,9 +28,13 @@ pub struct SelfplayArgs {
     /// Self-play games per round.
     #[arg(long, default_value_t = 128)]
     pub games: usize,
-    /// MCTS simulations per decision.
-    #[arg(long, default_value_t = 64)]
+    /// MCTS simulations per searched decision.
+    #[arg(long, default_value_t = 256)]
     pub sims: usize,
+    /// Fraction of decisions that are searched and recorded; the others sample the
+    /// network prior at the play temperature and are not training rows.
+    #[arg(long, default_value_t = 0.33)]
+    pub search_prob: f32,
     /// Training passes per round; each draws `max_samples` from the replay window.
     #[arg(long, default_value_t = 1)]
     pub epochs: usize,
@@ -45,16 +49,17 @@ pub struct SelfplayArgs {
     /// Threads running the self-play searches (and evaluating probes).
     #[arg(long, default_value_t = 10)]
     pub workers: usize,
-    /// Fresh samples kept per round (split across games) and the size of the uniform
-    /// draw from the replay window that each epoch trains on.
-    #[arg(long, default_value_t = 65536)]
+    /// Size of the uniform draw from the replay window that each epoch trains on.
+    #[arg(long, default_value_t = 65_536)]
     pub max_samples: usize,
     #[command(flatten)]
     #[serde(flatten)]
     pub budgets: Budgets,
     #[arg(long, default_value = "turn", value_parser = Horizon::parse)]
     pub horizon: Horizon,
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 1.1)]
+    pub root_temperature: f32,
+    #[arg(long, default_value_t = 1.0)]
     pub temperature: f32,
     /// Temperature for the first `warm_steps` rounds.
     #[arg(long, default_value_t = 1.0)]
@@ -72,6 +77,12 @@ pub struct SelfplayArgs {
     pub noise: f32,
     #[arg(long, default_value_t = 0.3)]
     pub noise_alpha: f32,
+    /// LCB move selection: stdevs below the mean (0 = plain visit argmax).
+    #[arg(long, default_value_t = crate::mcts::DEFAULT_LCB_STDEVS)]
+    pub lcb_stdevs: f32,
+    /// Fraction of the top visit count an action needs to be an LCB candidate.
+    #[arg(long, default_value_t = crate::mcts::DEFAULT_LCB_MIN_VISIT_PROP)]
+    pub lcb_min_visit_prop: f32,
     /// Probability of forcing End Turn at a decision, so that ended positions with
     /// unspent Gold appear in the value data.
     #[arg(long, default_value_t = 0.02)]
@@ -374,14 +385,17 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
                 max_depth: mcts::MAX_DEPTH,
                 root_noise: args.noise,
                 noise_alpha: args.noise_alpha,
+                root_temperature: args.root_temperature,
+                lcb_stdevs: args.lcb_stdevs,
+                lcb_min_visit_prop: args.lcb_min_visit_prop,
                 keep_games: false,
             },
             temperature,
             end_explore: args.end_explore,
             budgets: args.budgets,
             combat_sims: args.combat_sims,
+            search_prob: args.search_prob,
         };
-        let per_game = args.max_samples.div_ceil(args.games);
         let seeds: Vec<u64> = (0..args.games as u64)
             .map(|i| args.seed + step as u64 * 10_000 + i)
             .collect();
@@ -390,7 +404,7 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
             let (samples, place) = play_one(net_ref, seed, &play, Some(&pool))
                 .map_err(|e| format!("self-play seed={seed}: {e}"))?;
             let decisions = samples.len();
-            Ok((subsample(samples, per_game, seed), place, decisions))
+            Ok((samples, place, decisions))
         };
         // Every game walks on its own thread and only hands its searches to the pool.
         // Games as pool tasks would let a worker that waits for its ply's searches steal

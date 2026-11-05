@@ -20,13 +20,21 @@ use taverngym::{Game, bot, rng::Rng};
 
 use crate::net::{N_ACTIONS, PolicyValueNet};
 
-pub const SEARCH_VERSION: &str = "ended-state-v3";
+pub const SEARCH_VERSION: &str = "ended-state-v4-lcb";
 pub const MAX_PLIES: usize = 2000;
 pub const MAX_DEPTH: usize = 100;
 pub const A_END_TURN: usize = A_END;
 /// Exploration constant. 1.3–1.9 were indistinguishable at 200 rounds across seeds; at
 /// 1000 rounds 1.9 led 1.5 narrowly and 1.7 clearly, so 1.9 is the default.
 pub const DEFAULT_C_PUCT: f32 = 1.9;
+/// LCB move selection (after KataGo): among root actions with at least
+/// `DEFAULT_LCB_MIN_VISIT_PROP` of the top visit count, the highest `Q - k * stdev` wins.
+/// KataGo uses 5 at ~600 visits; at 64 sims, k = 1-2 scored 1.873 against 1.917 (plain
+/// argmax) and 1.957 (k = 5) on the same 2,048 games, so 2 is the default.
+pub const DEFAULT_LCB_STDEVS: f32 = 2.0;
+pub const DEFAULT_LCB_MIN_VISIT_PROP: f32 = 0.15;
+/// Range of the value head's output; the variance prior at low visit counts.
+const VALUE_RANGE_RADIUS: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -59,6 +67,11 @@ pub struct SearchOptions {
     pub max_depth: usize,
     pub root_noise: f32,
     pub noise_alpha: f32,
+    /// Prior temperature at the root (1 = unchanged); applied before the Dirichlet noise.
+    pub root_temperature: f32,
+    /// Stdevs for the LCB used by `best_action` (0 disables LCB, keeping the visit argmax).
+    pub lcb_stdevs: f32,
+    pub lcb_min_visit_prop: f32,
     /// Keep a snapshot of the position in every node (for inspection; costs a clone each).
     pub keep_games: bool,
 }
@@ -72,6 +85,9 @@ impl Default for SearchOptions {
             max_depth: MAX_DEPTH,
             root_noise: 0.0,
             noise_alpha: 0.3,
+            root_temperature: 1.0,
+            lcb_stdevs: DEFAULT_LCB_STDEVS,
+            lcb_min_visit_prop: DEFAULT_LCB_MIN_VISIT_PROP,
             keep_games: false,
         }
     }
@@ -91,6 +107,15 @@ impl SearchOptions {
         {
             return Err("noise must be in [0, 1] and noise_alpha must be positive".into());
         }
+        if !self.root_temperature.is_finite() || self.root_temperature <= 0.0 {
+            return Err("root_temperature must be positive".into());
+        }
+        if !self.lcb_stdevs.is_finite()
+            || self.lcb_stdevs < 0.0
+            || !(0.0..=1.0).contains(&self.lcb_min_visit_prop)
+        {
+            return Err("lcb_stdevs must be nonnegative and lcb_min_visit_prop in [0, 1]".into());
+        }
         Ok(())
     }
 }
@@ -104,6 +129,8 @@ pub struct Node {
     pub w: f32,
     pub cn: Vec<f32>,
     pub cw: Vec<f32>,
+    /// Sum of squared backed-up values per edge (for the LCB's variance estimate).
+    pub cw2: Vec<f32>,
     pub value: f32,
     /// Representative snapshot of the position (never used to sample a transition).
     pub game: Option<Box<Game>>,
@@ -120,6 +147,7 @@ impl Node {
             w: 0.0,
             cn: vec![0.0; n],
             cw: vec![0.0; n],
+            cw2: vec![0.0; n],
             value,
             game,
         }
@@ -131,6 +159,23 @@ impl Node {
             self.w / self.n as f32
         }
     }
+    /// Lower confidence bound of edge `i`'s mean value: `mean - stdevs * sqrt(var / n)`,
+    /// with a small prior towards the maximum variance so that one or two visits do not
+    /// produce a confident bound (KataGo's `getSelfUtilityLCBAndRadius`).
+    pub fn edge_lcb(&self, i: usize, stdevs: f32) -> f32 {
+        let n = self.cn[i];
+        if n <= 0.0 {
+            return -2.0 * VALUE_RANGE_RADIUS * stdevs;
+        }
+        let mean = self.cw[i] / n;
+        let mut sq_mean = (self.cw2[i] / n).max(mean * mean + 1e-8);
+        let prior_weight = 1.0 / (n * n);
+        sq_mean = (sq_mean * n
+            + (sq_mean + VALUE_RANGE_RADIUS * VALUE_RANGE_RADIUS) * prior_weight)
+            / (n + prior_weight);
+        let variance = (sq_mean - mean * mean).max(0.0);
+        mean - stdevs * (variance / (n + prior_weight)).sqrt()
+    }
 }
 
 pub struct SearchResult {
@@ -139,17 +184,38 @@ pub struct SearchResult {
     pub value: f32,
     pub visits: Vec<f32>,
     pub root: Node,
+    /// The LCB settings the search ran with (used by `best_action`).
+    pub lcb_stdevs: f32,
+    pub lcb_min_visit_prop: f32,
 }
 
 impl SearchResult {
-    /// Most visited action; ties keep the lowest index.
+    /// The action to play: the most visited one, unless LCB selection is on and another
+    /// action with at least `lcb_min_visit_prop` of the top visit count has a higher lower
+    /// confidence bound on its value (then that one). Ties keep the lowest index.
     pub fn best_action(&self) -> usize {
-        let source = if self.visits.iter().any(|v| *v > 0.0) {
-            &self.visits
-        } else {
-            &self.policy
-        };
-        argmax(source)
+        if !self.visits.iter().any(|v| *v > 0.0) {
+            return argmax(&self.policy);
+        }
+        let top = argmax(&self.visits);
+        if self.lcb_stdevs <= 0.0 {
+            return top;
+        }
+        let threshold = self.lcb_min_visit_prop * self.visits[top];
+        let root = &self.root;
+        let mut best = top;
+        let mut best_lcb = f32::NEG_INFINITY;
+        for (i, &a) in root.actions.iter().enumerate() {
+            if root.cn[i] <= 0.0 || root.cn[i] < threshold {
+                continue;
+            }
+            let lcb = root.edge_lcb(i, self.lcb_stdevs);
+            if lcb > best_lcb {
+                best_lcb = lcb;
+                best = a;
+            }
+        }
+        best
     }
 }
 
@@ -292,6 +358,34 @@ fn add_root_noise(root: &mut Node, epsilon: f32, alpha: f32, rng: &mut impl rand
     }
 }
 
+/// Raise the root prior to `1 / temperature` over the legal actions and renormalise.
+fn apply_root_temperature(root: &mut Node, temperature: f32) {
+    if temperature == 1.0 || root.actions.is_empty() {
+        return;
+    }
+    let top = root
+        .actions
+        .iter()
+        .map(|&a| root.prior[a])
+        .fold(0.0f32, f32::max);
+    if top <= 0.0 {
+        return;
+    }
+    let mut total = 0.0f32;
+    for &a in &root.actions {
+        let p = root.prior[a];
+        root.prior[a] = if p > 0.0 {
+            ((p.ln() - top.ln()) / temperature).exp()
+        } else {
+            0.0
+        };
+        total += root.prior[a];
+    }
+    for &a in &root.actions {
+        root.prior[a] /= total;
+    }
+}
+
 /// A symmetric Dirichlet(alpha) sample of length `n`: normalized Gamma(alpha, 1) draws.
 pub fn dirichlet(alpha: f32, n: usize, rng: &mut impl rand::Rng) -> Vec<f32> {
     let gamma = Gamma::new(alpha as f64, 1.0).expect("valid Gamma");
@@ -358,6 +452,7 @@ pub fn search_with_seeds<E: Evaluator + ?Sized>(
     let root_copy = opts.keep_games.then(|| Box::new(reseeded(game, root_seed)));
     let mut root = expand(net, &observation, root_copy)?;
     let root_value = root.value;
+    apply_root_temperature(&mut root, opts.root_temperature);
     add_root_noise(&mut root, opts.root_noise, opts.noise_alpha, rng);
 
     for _ in 0..opts.sims {
@@ -432,6 +527,8 @@ pub fn search_with_seeds<E: Evaluator + ?Sized>(
         value: root_value,
         visits,
         root,
+        lcb_stdevs: opts.lcb_stdevs,
+        lcb_min_visit_prop: opts.lcb_min_visit_prop,
     })
 }
 
@@ -442,6 +539,7 @@ fn backup(root: &mut Node, path: &[(usize, u64)], value: f32) {
         node.w += value;
         node.cn[index] += 1.0;
         node.cw[index] += value;
+        node.cw2[index] += value * value;
         match node.children[index].get_mut(&key) {
             Some(child) => node = child,
             None => break, // terminal transition: no decision node below

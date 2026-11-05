@@ -15,7 +15,6 @@ use tavernagent::rules::Budgets;
 use tavernagent::selfplay::{
     OptimizerHparams, PlayOptions, ReplayWindow, Sample, Stats, StepOptions, Trainer,
     TrainingState, cosine_lr, ended_sample, load_training_state, play_one, save_training_state,
-    subsample,
 };
 use tavernagent::train::{self, SelfplayArgs};
 use taverngym::Game;
@@ -187,6 +186,7 @@ fn play_options(sims: usize, end_explore: f32) -> PlayOptions {
         end_explore,
         budgets: Budgets::default(),
         combat_sims: 0,
+        search_prob: 1.0,
     }
 }
 
@@ -249,6 +249,46 @@ fn self_play_records_one_ended_position_per_end_turn() {
     );
 }
 
+/// Only searched decisions become training rows; the ended positions are kept either
+/// way, and the split is a function of the seed.
+#[test]
+fn unsearched_decisions_play_the_prior_and_leave_no_policy_row() {
+    let full = play_options(2, 0.0);
+    let mut none = play_options(2, 0.0);
+    none.search_prob = 0.0;
+    let mut half = play_options(2, 0.0);
+    half.search_prob = 0.5;
+    let (all, _) = play_one(&EndOrFirst, 31, &full, None).unwrap();
+    let (direct, _) = play_one(&EndOrFirst, 31, &none, None).unwrap();
+    let (mixed, _) = play_one(&EndOrFirst, 31, &half, None).unwrap();
+    let policy_rows = |s: &[Sample]| s.iter().filter(|r| !r.is_ended()).count();
+    let ended_rows = |s: &[Sample]| s.iter().filter(|r| r.is_ended()).count();
+    assert!(policy_rows(&all) > 0);
+    assert_eq!(policy_rows(&direct), 0);
+    assert!(ended_rows(&direct) > 0);
+    assert!(policy_rows(&mixed) > 0 && policy_rows(&mixed) < policy_rows(&all));
+    assert!(
+        mixed
+            .iter()
+            .all(|s| s.is_ended() || s.mask[s.action as usize])
+    );
+    let (again, _) = play_one(&EndOrFirst, 31, &half, None).unwrap();
+    assert_eq!(again.len(), mixed.len());
+    assert!(
+        again
+            .iter()
+            .zip(&mixed)
+            .all(|(a, b)| a.action == b.action && a.pi == b.pi)
+    );
+    let mut bad = play_options(2, 0.0);
+    bad.search_prob = 1.5;
+    assert!(
+        play_one(&EndOrFirst, 31, &bad, None)
+            .unwrap_err()
+            .contains("search_prob")
+    );
+}
+
 #[test]
 fn replay_window_evicts_old_rounds_and_draws_without_replacement() {
     let (_, s) = batch();
@@ -272,13 +312,6 @@ fn replay_window_evicts_old_rounds_and_draws_without_replacement() {
     assert_eq!(replay.draw(3, &mut rng).len(), 3);
     assert!((cosine_lr(0.001, 0.0001, 199, 100) - 0.0001).abs() < 1e-12);
     assert!(ReplayWindow::new(0).is_err());
-    let many: Vec<Sample> = (0..10).map(|i| tagged(i as f32)).collect();
-    let kept = subsample(many, 4, 1);
-    assert_eq!(kept.len(), 4);
-    assert!(
-        kept.windows(2).all(|w| w[0].z < w[1].z),
-        "order is preserved"
-    );
 }
 
 #[test]
@@ -466,11 +499,75 @@ fn training_resumes_exactly_across_the_replay_window() {
     assert_eq!(history.len(), 3);
     assert_eq!(history[2]["replay_rounds"], 2);
     assert!(history[2]["ended_samples"].as_f64().unwrap() >= 0.0);
+    // Every self-play decision enters the replay window; `max_samples` (40 here) only
+    // bounds the draw each epoch trains on.
+    for round in &history {
+        assert_eq!(round["fresh_samples"], round["rollout_decisions"]);
+        assert!(round["samples"].as_u64().unwrap() <= 40);
+    }
     // Resuming without a target beyond the saved step is an error.
     let mut stale = selfplay_args(dir.join("stale.npz"), 3);
     stale.resume_state = Some(dir.join("split.trainer.npz"));
     assert!(train::run(stale, &HashSet::from(["resume_state".to_string()])).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn training_step_does_not_depend_on_the_thread_count() {
+    use tavernagent::selfplay::STEP_CHUNK_ROWS;
+    // Several chunks' worth of rows from a few positions, so the chunked reduction runs.
+    let mut samples = Vec::new();
+    for seed in 0..(3 * STEP_CHUNK_ROWS as u64 + 5) {
+        let mut game = Game::new(100 + seed, Budgets::default().config().unwrap());
+        select_heroes(&mut game, seed).unwrap();
+        let obs = observe_seat(&game, (seed % 8) as usize);
+        let legal = obs.mask.iter().filter(|m| **m).count() as f32;
+        let pi = obs
+            .mask
+            .iter()
+            .map(|m| if *m { 1.0 / legal } else { 0.0 })
+            .collect();
+        samples.push(Sample {
+            x: obs.x,
+            cards: obs.cards,
+            mask: obs.mask,
+            pi,
+            z: 1.0 - 2.0 * (seed % 8) as f32 / 7.0,
+            action: -1,
+            combat: 0.3,
+            combat_known: seed % 3 != 0,
+        });
+    }
+    let batch: Vec<&Sample> = samples.iter().collect();
+    let run = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let mut trainer = Trainer::new(
+                PolicyValueNet::new(5, small()).unwrap(),
+                OptimizerHparams {
+                    wd: 0.01,
+                    clip: 5.0,
+                    value_weight: 0.5,
+                    combat_weight: 0.5,
+                    ema_decay: 0.99,
+                },
+            );
+            let mut losses = Vec::new();
+            for _ in 0..3 {
+                losses.push(trainer.step(&batch, 3e-4, StepOptions::default()).unwrap());
+            }
+            (losses, trainer.net.p, trainer.ema, trainer.last_metrics)
+        })
+    };
+    let (la, pa, ea, ma) = run(1);
+    let (lb, pb, eb, mb) = run(7);
+    assert_eq!(la, lb);
+    assert_eq!(pa, pb);
+    assert_eq!(ea, eb);
+    assert_eq!(ma, mb);
 }
 
 #[test]

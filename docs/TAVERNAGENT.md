@@ -14,7 +14,7 @@ combat head. Weights are model format v4; the search protocol is `ended-state-v3
 cargo build --release -p tavernagent
 A=target/release/tavernagent
 
-# Train 100 rounds (128 games and 64 simulations per decision by default).
+# Train 100 rounds (128 games; a third of the decisions searched at 256 simulations by default).
 $A selfplay --steps 100 --workers 32 --save-trainer-state --save-every 50 --out runs/agent/model.npz
 
 # Continue exactly from the saved trainer state to round 200; saved options apply unless
@@ -68,9 +68,18 @@ Results do not depend on the thread count.
 - Hero selection is a uniform random choice outside the network (`heroes::select_heroes`,
   seeded); the chosen hero is still an input. Discovers, trinkets and targets are decided
   by the model.
-- The backward pass is written by hand (`net.rs`); batched products use `matrixmultiply`,
-  and the single-row forward used by search skips zero inputs (about 30 µs per
-  evaluation). `tests/net.rs` checks every gradient against central differences.
+- The backward pass is written by hand (`net.rs`); batched products use `matrixmultiply`
+  (its AVX-512 kernels, one thread per call). `tests/net.rs` checks every gradient against
+  central differences.
+- **Search-time inference** (`PolicyValueNet::infer`) is separate from the training
+  forward: the weight matrices are kept as a bfloat16 copy (`linalg::Bf16Mat`, half the
+  bytes, so the whole network stays in a core's L2 cache), products accumulate in f32 in a
+  hand-written AVX-512 kernel that skips zero inputs (runtime-dispatched, with a portable
+  fallback), and GELU/SiLU use a clamped rational tanh. About 10 µs per evaluation against
+  33 µs for the exact f32 path; the deviation from the f32 network is tiny (max policy
+  probability difference ~4e-4, KL ~2e-7 on fresh weights). Training (`forward`/`backward`)
+  stays exact f32; `infer_f32` is the bit-identical reference path. The bfloat16 copy is
+  rebuilt lazily after `params_changed`, which `Trainer::step` calls.
 
 `--hidden`, `--blocks`, `--embedding-dim`, `--activation gelu|silu|relu`,
 `--residual-scale` and the parameter-free `--head-norm` define the architecture and are
@@ -91,16 +100,25 @@ observable outcomes of one action (a Refresh, a Discover) become separate child 
 the action edge aggregates their visits. The real game and its random stream are never
 touched.
 
-- PUCT over all legal actions, unvisited actions at Q = 0; the played action is the most
-  visited one (ties: lowest index). Default `--c-puct 1.9`, `--sims 64`.
-- Self-play mixes Dirichlet noise into the root prior (`--noise 0.20`, `--noise-alpha 0.3`);
-  evaluation does not.
+- PUCT over all legal actions, unvisited actions at Q = 0. Default `--c-puct 1.9`; `--sims 64`
+  in evaluation, 256 in self-play.
+- Self-play searches a `--search-prob 0.33` fraction of the decisions and records only those
+  (visit distribution as the policy target); the other decisions sample the network prior at
+  the play temperature and leave no training row, like KataGo's full/cheap search split.
+  Ended positions are recorded for every End Turn either way.
+- The played action (evaluation, and self-play at temperature 0) is chosen by LCB after
+  KataGo: among root actions with at least `--lcb-min-visit-prop 0.15` of the top visit
+  count, the highest `Q - k * stdev(Q)` wins (`--lcb-stdevs 2`; 0 restores the plain visit
+  argmax, ties: lowest index). Search protocol `ended-state-v4-lcb`.
+- Self-play raises the root prior to `1 / --root-temperature` (1.1) and mixes Dirichlet
+  noise into it (`--noise 0.20`, `--noise-alpha 0.3`); evaluation does neither.
 - Per-turn host budgets (100 actions, 10 Moves, 5 Freeze presses) are enforced by the
   engine, reset every turn and visible to the network; `--action-cap/--move-cap/--freeze-cap`
   must be positive.
 - `--horizon game` advances the other seats with the scripted bot using hidden state; it is
   an experimental full-information mode only.
-- One 64-simulation decision takes 45-60 µs per simulation on one core.
+- One 64-simulation decision takes about 23 µs per simulation on one core, of which roughly
+  10 µs is the network; the rest is the game copy, the action, the observation and the tree.
 
 ## Training
 
@@ -125,10 +143,20 @@ MSE over all rows; `--combat-weight` (0.5) times the combat MSE over labelled ro
 Optional `--pg-weight` adds a REINFORCE term with the value as baseline. AdamW (decay on
 weight matrices only), global gradient-norm clipping, cosine learning-rate schedule.
 
-**Data.** Each round keeps up to `--max-samples` (65,536) of the roughly 150,000 decisions
-of 128 games (uniform per game) and adds them to a replay window of `--replay-rounds` (3)
-rounds; each epoch (`--epochs 1`) trains on a uniform draw of `--max-samples` from the
-window, so a sample is used about once on average.
+**Parallel step.** A minibatch is processed in fixed chunks of `STEP_CHUNK_ROWS` (32) rows,
+each running the forward and backward pass on its own thread (rayon); chunk gradients are
+summed in chunk order and the gradient reduction and the AdamW/EMA update are split over
+the parameter vector. The chunk size is a constant, so results do not depend on the number
+of threads (`tests/training.rs` checks one against seven threads bit for bit). A 512-row
+step takes about 12 ms on eight cores against 50 ms single-threaded; the elementwise code
+(tanh, LayerNorm, assembling inputs, the optimizer) dominated, not the matrix products.
+
+**Data.** Every decision of a round (about 200,000-240,000 from 128 games; the count grows
+as the policy takes more actions per turn) enters a replay window of `--replay-rounds` (3)
+rounds; nothing is discarded at collection. Each epoch (`--epochs 1`) trains on a uniform
+draw of `--max-samples` (196,608) from the window, so a sample is used about once on
+average over its three rounds in the window. The per-game cap that used to keep 65,536
+decisions per round (about 28% of them) was removed.
 
 **EMA.** An EMA copy of the weights is updated every minibatch with a decay derived from
 `--ema-rounds` (2): `1 - 1 / (ema_rounds x updates per round)`, warmed up as
@@ -137,18 +165,20 @@ window, so a sample is used about once on average.
 | option | default |
 | --- | --- |
 | `--steps` / `--games` | 200 / 128 |
-| `--sims` / `--c-puct` | 64 / 1.9 |
+| `--sims` / `--c-puct` | 256 / 1.9 |
 | `--replay-rounds` / `--epochs` / `--max-samples` / `--batch` | 3 / 1 / 65,536 / 512 |
 | `--lr` / `--lr-min` / `--lr-decay-steps` | 3e-4 / 3e-5 / 200 |
 | `--noise` / `--noise-alpha` / `--end-explore` | 0.20 / 0.3 / 0.02 |
-| `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 1.0 / 0.5 |
+| `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 1.0 / 1.0 |
+| `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 2 / 0.15 |
+| `--search-prob` | 0.33 |
 | `--hidden` / `--blocks` / `--embedding-dim` | 192 / 4 / 16 |
 | `--value-weight` / `--combat-weight` / `--combat-sims` | 0.5 / 0.5 / 20 |
 | `--weight-decay` / `--clip` / `--ema-rounds` | 0.01 / 5.0 / 2 |
 
 `--save-trainer-state` writes the network, AdamW moments, EMA, RNG states, history, options
-and the **whole replay window** to `<out>.trainer.npz` after every round (about 2.9 GB at the
-defaults); `--save-every N` keeps immutable `<out>.stepN.npz` / `.ema.npz` / `.trainer.npz`.
+and the **whole replay window** to `<out>.trainer.npz` after every round (about 6 GB at the
+defaults, 9 KB per stored decision); `--save-every N` keeps immutable `<out>.stepN.npz` / `.ema.npz` / `.trainer.npz`.
 `--resume-state` restores all of it bit-exactly (a smaller `--replay-rounds` keeps the newest
 rounds); `--resume` loads weights only. `<out>.history.json` records per-round losses,
 gradient norms, entropies, target KL, the combat and ended sample counts and timings.

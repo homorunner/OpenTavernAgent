@@ -226,6 +226,66 @@ fn gradient_check(activation: Activation, head_norm: bool) {
 }
 
 #[test]
+fn search_inference_matches_the_training_forward() {
+    for (activation, head_norm) in [
+        (Activation::Gelu, false),
+        (Activation::Silu, true),
+        (Activation::Relu, true),
+    ] {
+        let net = PolicyValueNet::new(11, cfg(activation, head_norm)).unwrap();
+        for seed in [3u64, 4, 5] {
+            let game = position(seed);
+            for seat in 0..2 {
+                let obs = observe_seat(&game, seat);
+                let (logits, value, _, _) = net.forward(&[&obs.x], &[&obs.cards]).unwrap();
+                // The f32 path repeats the training arithmetic exactly.
+                let (exact_logits, exact_value) = net.infer_f32(&obs.x, &obs.cards).unwrap();
+                assert_eq!(logits.row(0), &exact_logits[..]);
+                assert_eq!(value[0], exact_value);
+                // The search path (bfloat16 weights, polynomial tanh) stays close to it.
+                let (fast_logits, fast_value) = net.infer(&obs.x, &obs.cards).unwrap();
+                let span = logits
+                    .row(0)
+                    .iter()
+                    .fold(0.0f32, |m, v| m.max(v.abs()))
+                    .max(1.0);
+                for (a, b) in exact_logits.iter().zip(&fast_logits) {
+                    assert!((a - b).abs() < 0.01 * span, "{a} vs {b}");
+                }
+                assert!(
+                    (exact_value - fast_value).abs() < 0.01,
+                    "{exact_value} vs {fast_value}"
+                );
+                let (policy, v) = net.predict(&obs.x, &obs.cards, &obs.mask).unwrap();
+                assert_eq!(policy, masked_softmax(&fast_logits, &obs.mask));
+                assert_eq!(v, fast_value);
+            }
+        }
+    }
+}
+
+#[test]
+fn search_inference_follows_parameter_updates() {
+    let mut net = PolicyValueNet::new(2, cfg(Activation::Gelu, false)).unwrap();
+    let game = position(8);
+    let obs = observe_seat(&game, 0);
+    let before = net.infer(&obs.x, &obs.cards).unwrap();
+    let wp = net.p.wp();
+    for v in &mut net.p.tensors[wp].data {
+        *v += 0.5;
+    }
+    // Without the notification the bfloat16 copy is stale; with it the change is visible.
+    assert_eq!(net.infer(&obs.x, &obs.cards).unwrap().0, before.0);
+    net.params_changed();
+    let after = net.infer(&obs.x, &obs.cards).unwrap();
+    assert_ne!(after.0, before.0);
+    let (exact, _) = net.infer_f32(&obs.x, &obs.cards).unwrap();
+    for (a, b) in exact.iter().zip(&after.0) {
+        assert!((a - b).abs() < 0.005 * a.abs().max(1.0), "{a} vs {b}");
+    }
+}
+
+#[test]
 fn gradients_match_central_differences() {
     gradient_check(Activation::Gelu, false);
     gradient_check(Activation::Silu, true);

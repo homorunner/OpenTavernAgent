@@ -35,6 +35,9 @@ pub struct EvalArgs {
     pub horizon: Horizon,
     #[arg(long, default_value_t = crate::mcts::DEFAULT_C_PUCT)]
     pub c_puct: f32,
+    /// LCB move selection: stdevs below the mean (0 = plain visit argmax).
+    #[arg(long, default_value_t = crate::mcts::DEFAULT_LCB_STDEVS)]
+    pub lcb_stdevs: f32,
     /// Skip the scripted-bot baseline.
     #[arg(long, default_value_t = false)]
     pub no_baselines: bool,
@@ -120,6 +123,7 @@ pub fn run(args: EvalArgs) -> Result<(), String> {
         sims: args.sims,
         c_puct: args.c_puct,
         horizon: args.horizon,
+        lcb_stdevs: args.lcb_stdevs,
         ..SearchOptions::default()
     };
     search.validate()?;
