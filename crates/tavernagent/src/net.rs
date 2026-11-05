@@ -2,12 +2,8 @@
 //!
 //! ```text
 //! numeric features + flattened card embeddings -> 192 -> residual blocks
-//!     -> {245 policy logits, 1 tanh value, 1 tanh combat outcome}
+//!     -> {245 policy logits, 1 tanh value}
 //! ```
-//!
-//! The combat head is auxiliary: it predicts the expected result of this turn's fight
-//! if the seat stopped now (see `selfplay::combat_label`), a dense low-variance signal
-//! next to the final-placement value.
 //!
 //! Forward passes return their cache instead of storing it, so one network can serve
 //! many search threads at once. Backward is written by hand and checked numerically
@@ -31,11 +27,10 @@ pub const N_ACTIONS: usize = a::N_ACTIONS;
 pub const N_FEATURES: usize = o::OBS_FLOATS;
 pub const N_CARD_SLOTS: usize = o::OBS_CARDS;
 pub const DEFAULT_HIDDEN: usize = 192;
-pub const DEFAULT_BLOCKS: usize = 4;
-pub const MODEL_VERSION: i64 = 4;
+pub const DEFAULT_BLOCKS: usize = 6;
+pub const MODEL_VERSION: i64 = 6;
 pub const N_OPP_BOARD_SLOTS: usize = o::N_OPP * a::N_BOARD;
-pub const BUDGET_FEATURE_START: usize = N_FEATURES - o::ACTION_BUDGET_F;
-pub const OPP_BOARD_FEATURE_START: usize = BUDGET_FEATURE_START - N_OPP_BOARD_SLOTS * o::MINION_F;
+pub const OPP_BOARD_FEATURE_START: usize = N_FEATURES - N_OPP_BOARD_SLOTS * o::MINION_F;
 /// The ended-turn flag: the seat has finished recruiting and has no legal action.
 pub const ENDED_TURN_FEATURE: usize = o::ENDED_TURN_F;
 /// Global flags the network never needs: hero selection (1), game over (2) and the
@@ -43,11 +38,10 @@ pub const ENDED_TURN_FEATURE: usize = o::ENDED_TURN_F;
 const EXCLUDED_GLOBALS: [usize; 3] = [1, 2, 15];
 
 /// Observation features that enter the network: everything but the historical opponent
-/// warbands and three redundant global flags, then the remaining action budgets.
+/// warbands and three redundant global flags.
 pub fn input_feature_indices() -> Vec<usize> {
     (0..OPP_BOARD_FEATURE_START)
         .filter(|i| !EXCLUDED_GLOBALS.contains(i))
-        .chain(BUDGET_FEATURE_START..N_FEATURES)
         .collect()
 }
 
@@ -233,7 +227,7 @@ impl Default for NetConfig {
 }
 
 /// Named tensors in a fixed order: E, W0, b0, g0, k0, (Wi, bi, gi, ki) per block, Wp, bp,
-/// Wv, bv, Wc, bc.
+/// Wv, bv.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Params {
     pub blocks: usize,
@@ -275,14 +269,7 @@ pub fn tensor_names(blocks: usize) -> Vec<String> {
             names.push(format!("{prefix}{i}"));
         }
     }
-    names.extend([
-        "Wp".into(),
-        "bp".into(),
-        "Wv".into(),
-        "bv".into(),
-        "Wc".into(),
-        "bc".into(),
-    ]);
+    names.extend(["Wp".into(), "bp".into(), "Wv".into(), "bv".into()]);
     names
 }
 
@@ -299,13 +286,6 @@ impl Params {
     }
     pub fn bv(&self) -> usize {
         block(self.blocks) + 3
-    }
-    /// Combat head weight / bias.
-    pub fn wc(&self) -> usize {
-        block(self.blocks) + 4
-    }
-    pub fn bc(&self) -> usize {
-        block(self.blocks) + 5
     }
     pub fn names(&self) -> Vec<String> {
         tensor_names(self.blocks)
@@ -330,7 +310,6 @@ impl Params {
         index == W0
             || index == self.wp()
             || index == self.wv()
-            || index == self.wc()
             || (0..self.blocks).any(|i| index == w(i))
     }
 }
@@ -434,7 +413,6 @@ pub struct Cache {
     h_final: Mat,
     head_ln: Option<LnCache>,
     value: Vec<f32>,
-    combat: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -480,7 +458,7 @@ impl PolicyValueNet {
         if !(cfg.residual_scale > 0.0 && cfg.residual_scale <= 1.0) {
             return Err("residual_scale must be in (0, 1]".into());
         }
-        if N_FEATURES != 3238 || N_CARD_SLOTS != 124 {
+        if N_FEATURES != 3235 || N_CARD_SLOTS != 124 {
             return Err("observation schema changed; update the network".into());
         }
         let input_features = input_feature_indices();
@@ -500,7 +478,7 @@ impl PolicyValueNet {
         };
         let he = |fan_in: usize| (2.0 / fan_in as f32).sqrt();
         let in_dim = input_features.len() + card_slots.len() * d;
-        let mut tensors = Vec::with_capacity(11 + 4 * cfg.blocks);
+        let mut tensors = Vec::with_capacity(9 + 4 * cfg.blocks);
         let mut e = randn(n_cards, d, 0.1);
         for v in e.row_mut(0) {
             *v = 0.0;
@@ -518,8 +496,6 @@ impl PolicyValueNet {
         }
         tensors.push(randn(h, N_ACTIONS, he(h) * 0.1));
         tensors.push(Mat::zeros(1, N_ACTIONS));
-        tensors.push(randn(h, 1, he(h) * 0.1));
-        tensors.push(Mat::zeros(1, 1));
         tensors.push(randn(h, 1, he(h) * 0.1));
         tensors.push(Mat::zeros(1, 1));
         Ok(PolicyValueNet {
@@ -608,14 +584,12 @@ impl PolicyValueNet {
         Ok((x_in, used))
     }
 
-    /// Logits (batch x actions), values (batch), combat predictions (batch) and the cache
-    /// for `backward`.
-    #[allow(clippy::type_complexity)]
+    /// Logits (batch x actions), values (batch) and the cache for `backward`.
     pub fn forward(
         &self,
         xs: &[&[f32]],
         cards: &[&[i32]],
-    ) -> Result<(Mat, Vec<f32>, Vec<f32>, Cache), String> {
+    ) -> Result<(Mat, Vec<f32>, Cache), String> {
         let (x_in, used) = self.assemble(xs, cards)?;
         let p = &self.p.tensors;
         let act = self.cfg.activation;
@@ -649,26 +623,15 @@ impl PolicyValueNet {
             h = normed;
             head_ln = Some(cache);
         }
-        let (wp, bp, wv, bv, wc, bc) = (
-            self.p.wp(),
-            self.p.bp(),
-            self.p.wv(),
-            self.p.bv(),
-            self.p.wc(),
-            self.p.bc(),
-        );
+        let (wp, bp, wv, bv) = (self.p.wp(), self.p.bp(), self.p.wv(), self.p.bv());
         let mut logits = linear(&h, &p[wp]);
         logits.add_row(&p[bp].data);
         let mut value_mat = linear(&h, &p[wv]);
         value_mat.add_row(&p[bv].data);
         let value: Vec<f32> = value_mat.data.iter().map(|v| v.tanh()).collect();
-        let mut combat_mat = linear(&h, &p[wc]);
-        combat_mat.add_row(&p[bc].data);
-        let combat: Vec<f32> = combat_mat.data.iter().map(|v| v.tanh()).collect();
         Ok((
             logits,
             value.clone(),
-            combat.clone(),
             Cache {
                 x_in,
                 cards: used,
@@ -676,7 +639,6 @@ impl PolicyValueNet {
                 h_final: h,
                 head_ln,
                 value,
-                combat,
             },
         ))
     }
@@ -755,39 +717,22 @@ impl PolicyValueNet {
 
     // ---- backward ----------------------------------------------------------
 
-    /// Parameter gradients for upstream gradients of the logits (batch x actions), of the
-    /// tanh value (batch) and of the tanh combat prediction (batch).
-    pub fn backward(
-        &self,
-        cache: &Cache,
-        dlogits: &Mat,
-        dvalue: &[f32],
-        dcombat: &[f32],
-    ) -> Params {
+    /// Parameter gradients for upstream gradients of the logits (batch x actions) and of
+    /// the tanh value (batch).
+    pub fn backward(&self, cache: &Cache, dlogits: &Mat, dvalue: &[f32]) -> Params {
         let p = &self.p.tensors;
         let act = self.cfg.activation;
         let bsz = cache.h_final.rows;
         let dvalue = Mat::from_vec(bsz, 1, dvalue.to_vec());
-        let dcombat = Mat::from_vec(bsz, 1, dcombat.to_vec());
         let hidden = self.cfg.hidden;
-        let (wp, bp, wv, bv, wc, bc) = (
-            self.p.wp(),
-            self.p.bp(),
-            self.p.wv(),
-            self.p.bv(),
-            self.p.wc(),
-            self.p.bc(),
-        );
+        let (wp, bp, wv, bv) = (self.p.wp(), self.p.bp(), self.p.wv(), self.p.bv());
         let mut grads = self.p.zeros_like();
         grads.tensors[wp] = cache.h_final.t_matmul(dlogits);
         grads.tensors[bp] = Mat::from_vec(1, N_ACTIONS, dlogits.sum_rows());
         grads.tensors[wv] = cache.h_final.t_matmul(&dvalue);
         grads.tensors[bv] = Mat::from_vec(1, 1, dvalue.sum_rows());
-        grads.tensors[wc] = cache.h_final.t_matmul(&dcombat);
-        grads.tensors[bc] = Mat::from_vec(1, 1, dcombat.sum_rows());
         let mut dh = dlogits.matmul_t(&p[wp]);
         dh.add_assign(&dvalue.matmul_t(&p[wv]));
-        dh.add_assign(&dcombat.matmul_t(&p[wc]));
         if let Some(head) = &cache.head_ln {
             let ones = vec![1.0f32; hidden];
             dh = layer_norm_backward(&dh, head, &ones).0;
@@ -843,9 +788,9 @@ impl PolicyValueNet {
         grads
     }
 
-    /// The values and combat predictions a forward pass produced.
-    pub fn cached_outputs(cache: &Cache) -> (&[f32], &[f32]) {
-        (&cache.value, &cache.combat)
+    /// The values a forward pass produced.
+    pub fn cached_values(cache: &Cache) -> &[f32] {
+        &cache.value
     }
 
     // ---- persistence -------------------------------------------------------

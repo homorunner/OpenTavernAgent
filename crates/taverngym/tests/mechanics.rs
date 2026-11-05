@@ -5728,12 +5728,12 @@ fn observation_hides_this_turns_opponent_boards() {
 
 #[test]
 fn observation_shows_only_the_warbands_the_player_fought() {
-    use taverngym::obs::{ACTION_BUDGET_F, MINION_F, OPP_BOARD_F, observe};
+    use taverngym::obs::{MINION_F, OPP_BOARD_F, observe};
     let mut g = game(9203);
     // Per opponent slot of p0's observation: how many minions it holds.
     let seen = |g: &Game| -> Vec<usize> {
         let o = observe(g, 0);
-        let start = o.floats.len() - OPP_BOARD_F - ACTION_BUDGET_F;
+        let start = o.floats.len() - OPP_BOARD_F;
         (0..7)
             .map(|i| {
                 (0..7)

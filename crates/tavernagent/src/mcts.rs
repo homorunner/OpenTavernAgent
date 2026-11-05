@@ -33,6 +33,10 @@ pub const DEFAULT_C_PUCT: f32 = 1.9;
 /// argmax) and 1.957 (k = 5) on the same 2,048 games, so 2 is the default.
 pub const DEFAULT_LCB_STDEVS: f32 = 2.0;
 pub const DEFAULT_LCB_MIN_VISIT_PROP: f32 = 0.15;
+/// First-play urgency: an unvisited edge is valued at the parent's mean value minus this
+/// amount. Negative restores the original rule (unvisited edges at Q = 0). At 1,000
+/// rounds, 0.2 scored 2.14 / 2.67 (two seeds) against 2.54 without it.
+pub const DEFAULT_FPU_REDUCTION: f32 = -1.0;
 /// Range of the value head's output; the variance prior at low visit counts.
 const VALUE_RANGE_RADIUS: f32 = 1.0;
 
@@ -72,6 +76,8 @@ pub struct SearchOptions {
     /// Stdevs for the LCB used by `best_action` (0 disables LCB, keeping the visit argmax).
     pub lcb_stdevs: f32,
     pub lcb_min_visit_prop: f32,
+    /// First-play urgency reduction (see `DEFAULT_FPU_REDUCTION`).
+    pub fpu_reduction: f32,
     /// Keep a snapshot of the position in every node (for inspection; costs a clone each).
     pub keep_games: bool,
 }
@@ -88,6 +94,7 @@ impl Default for SearchOptions {
             root_temperature: 1.0,
             lcb_stdevs: DEFAULT_LCB_STDEVS,
             lcb_min_visit_prop: DEFAULT_LCB_MIN_VISIT_PROP,
+            fpu_reduction: DEFAULT_FPU_REDUCTION,
             keep_games: false,
         }
     }
@@ -333,12 +340,24 @@ fn expand<E: Evaluator + ?Sized>(
     Ok(Node::new(value, prior, actions, game))
 }
 
-fn select(node: &Node, c_puct: f32) -> usize {
+fn select(node: &Node, c_puct: f32, fpu_reduction: f32) -> usize {
     let sqrt_n = ((node.n + 1) as f32).sqrt();
+    // Value of an edge that has not been tried: the parent's mean (its own network value
+    // before any visit) minus the reduction, or 0 under the original rule.
+    let unvisited_q = if fpu_reduction < 0.0 {
+        0.0
+    } else {
+        let parent = if node.n == 0 { node.value } else { node.q() };
+        parent - fpu_reduction
+    };
     let mut best = 0;
     let mut best_u = f32::NEG_INFINITY;
     for (i, &a) in node.actions.iter().enumerate() {
-        let q = node.cw[i] / node.cn[i].max(1.0);
+        let q = if node.cn[i] > 0.0 {
+            node.cw[i] / node.cn[i]
+        } else {
+            unvisited_q
+        };
         let u = q + c_puct * node.prior[a] * sqrt_n / (1.0 + node.cn[i]);
         if u > best_u {
             best_u = u;
@@ -475,7 +494,7 @@ pub fn search_with_seeds<E: Evaluator + ?Sized>(
                     value = node.value;
                     break;
                 }
-                let index = select(node, opts.c_puct);
+                let index = select(node, opts.c_puct, opts.fpu_reduction);
                 let action = node.actions[index];
                 match opts.horizon {
                     Horizon::Game => advance(&mut simulation, seat, action)?,
