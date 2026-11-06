@@ -153,12 +153,11 @@ target/release/tavernagent selfplay --steps 200 --workers 32 --save-every 100 --
 target/release/tavernagent eval --model runs/agent/model.step200.npz --games 1024 --workers 32
 ```
 
-A 0.8M-parameter network (policy, value and an auxiliary combat-outcome head over a shared
-card embedding) drives a PUCT search that stays inside the seat's own recruit phase and
-evaluates the position handed to combat. All eight seats self-play; training uses AdamW on
-a replay window with an EMA copy of the weights. After 1,000 rounds of 128 games the agent
-places 2.7 on average against seven scripted bots (the bot itself places 4.6).
-[Details, options and results](docs/TAVERNAGENT.md).
+A 867,845-parameter policy/value network with shared card embeddings drives PUCT search
+within the seat's recruit phase and evaluates the position handed to combat. All eight
+seats self-play; training uses AdamW, a replay window and EMA weights. Defaults use a
+constant learning rate of 3e-5, one binary rollout split before turn-4 combat, and visit-count
+action selection. [Implementation, options and recent results](docs/TAVERNAGENT.md).
 
 ## Documentation
 

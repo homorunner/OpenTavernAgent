@@ -32,11 +32,10 @@ pub const MUST_SPEND_GOLD: i32 = 3;
 /// Exploration constant. 1.3–1.9 were indistinguishable at 200 rounds across seeds; at
 /// 1000 rounds 1.9 led 1.5 narrowly and 1.7 clearly, so 1.9 is the default.
 pub const DEFAULT_C_PUCT: f32 = 1.9;
-/// LCB move selection (after KataGo): among root actions with at least
-/// `DEFAULT_LCB_MIN_VISIT_PROP` of the top visit count, the highest `Q - k * stdev` wins.
-/// KataGo uses 5 at ~600 visits; at 64 sims, k = 1-2 scored 1.873 against 1.917 (plain
-/// argmax) and 1.957 (k = 5) on the same 2,048 games, so 2 is the default.
-pub const DEFAULT_LCB_STDEVS: f32 = 2.0;
+/// LCB selection is opt-in; by default play the most visited root action. Paired
+/// evaluations of the e2 checkpoints favored visit argmax over LCB at 64 and 256 sims.
+/// When enabled, candidates need `DEFAULT_LCB_MIN_VISIT_PROP` of the top visit count.
+pub const DEFAULT_LCB_STDEVS: f32 = 0.0;
 pub const DEFAULT_LCB_MIN_VISIT_PROP: f32 = 0.15;
 /// First-play urgency: an unvisited edge is valued at the parent's mean value minus this
 /// amount. Negative restores the original rule (unvisited edges at Q = 0), which on a

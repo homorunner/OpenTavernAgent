@@ -36,14 +36,16 @@ pub struct SelfplayArgs {
     #[arg(long, default_value_t = 0.33)]
     pub search_prob: f32,
     /// Binary splits after these turns' end effects, before combat (e.g. 4,8).
-    #[arg(long, value_delimiter = ',')]
+    /// Pass --split-turn without values to disable splitting.
+    #[arg(long, value_delimiter = ',', num_args = 0.., default_value = "4")]
     #[serde(default)]
     pub split_turn: Vec<u32>,
     /// Training passes per round; each draws `max_samples` from the replay window.
     #[arg(long, default_value_t = 1)]
     pub epochs: usize,
-    #[arg(long, default_value_t = 3e-4)]
+    #[arg(long, default_value_t = 3e-5)]
     pub lr: f64,
+    /// Final learning rate when --lr-decay-steps is positive; otherwise ignored.
     #[arg(long, default_value_t = 3e-5)]
     pub lr_min: f64,
     #[arg(long, default_value_t = 0.01)]
@@ -135,8 +137,8 @@ pub struct SelfplayArgs {
     /// Self-play rounds kept in the replay window that training draws from.
     #[arg(long, default_value_t = 3)]
     pub replay_rounds: usize,
-    /// Length of the cosine schedule in rounds (independent of `steps`).
-    #[arg(long, default_value_t = 200)]
+    /// Length of the cosine schedule in rounds (0 = constant learning rate).
+    #[arg(long, default_value_t = 0)]
     pub lr_decay_steps: usize,
     /// Keep an immutable checkpoint every N rounds (0 = off).
     #[arg(long, default_value_t = 0)]
@@ -214,11 +216,19 @@ impl SelfplayArgs {
                 return Err(format!("{name} must be in [0, 1]"));
             }
         }
-        if !(0.0 <= self.lr_min && self.lr_min <= self.lr) {
-            return Err("expected 0 <= lr-min <= lr".into());
+        if !self.lr.is_finite() || self.lr < 0.0 {
+            return Err("lr must be finite and nonnegative".into());
         }
-        if self.replay_rounds < 1 || self.lr_decay_steps < 1 {
-            return Err("replay-rounds and lr-decay-steps must be positive".into());
+        if !self.lr_min.is_finite()
+            || self.lr_min < 0.0
+            || (self.lr_decay_steps > 0 && self.lr_min > self.lr)
+        {
+            return Err(
+                "lr-min must be finite and nonnegative, and <= lr when decay is enabled".into(),
+            );
+        }
+        if self.replay_rounds < 1 {
+            return Err("replay-rounds must be positive".into());
         }
         if !(self.ema_rounds.is_finite() && self.ema_rounds > 0.0) {
             return Err("ema-rounds must be positive".into());
@@ -236,6 +246,9 @@ impl SelfplayArgs {
         let (Some(map), Some(cur)) = (merged.as_object_mut(), current.as_object()) else {
             return Err("saved options are not an object".into());
         };
+        // Snapshots predating tree rollouts used ordinary games. A new CLI default
+        // must not change their rollout semantics unless explicitly requested.
+        map.entry("split_turn").or_insert_with(|| json!([]));
         for (key, value) in cur {
             let forced = matches!(key.as_str(), "steps" | "resume" | "resume_state");
             if forced || provided.contains(key) || !map.contains_key(key) {
@@ -566,4 +579,41 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
             "wd": args.weight_decay,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_lr_allows_rates_below_the_unused_cosine_minimum() {
+        let mut args = SelfplayArgs {
+            lr: 1e-5,
+            ..SelfplayArgs::default()
+        };
+        assert!(args.validate().is_ok());
+        args.lr_decay_steps = 200;
+        assert!(args.validate().is_err());
+        args.lr_min = 1e-6;
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_resume_keeps_unsplit_rollouts_unless_explicitly_overridden() {
+        let args = SelfplayArgs::default();
+        let mut saved = serde_json::to_value(&args).unwrap();
+        saved.as_object_mut().unwrap().remove("split_turn");
+        assert!(
+            args.inherit(&saved, &HashSet::new())
+                .unwrap()
+                .split_turn
+                .is_empty()
+        );
+        assert_eq!(
+            args.inherit(&saved, &HashSet::from(["split_turn".into()]))
+                .unwrap()
+                .split_turn,
+            vec![4]
+        );
+    }
 }

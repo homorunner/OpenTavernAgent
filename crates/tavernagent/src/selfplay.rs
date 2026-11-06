@@ -434,6 +434,9 @@ pub fn sample_action(policy: &[f32], temperature: f32, rng: &mut impl Rng) -> us
 }
 
 pub fn cosine_lr(initial: f64, minimum: f64, index: usize, total: usize) -> f64 {
+    if total == 0 {
+        return initial;
+    }
     let progress = (index as f64 / (total.max(2) - 1) as f64).min(1.0);
     minimum + 0.5 * (initial - minimum) * (1.0 + (std::f64::consts::PI * progress).cos())
 }
