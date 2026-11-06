@@ -303,6 +303,7 @@ impl Game {
             eliminated: vec![],
             ghost_player: None,
             ending_turn: false,
+            combat_pause: None,
             last_combats: vec![],
             truncated_combats: 0,
             truncated_recruit_contexts: 0,
@@ -945,6 +946,10 @@ impl Game {
     }
 
     pub fn combat_round(&mut self) {
+        if let Some(pause) = &mut self.combat_pause {
+            pause.reached = true;
+            return;
+        }
         // Records (and replay frames) describe only the most recent round.
         self.last_combats.clear();
         let alive: Vec<PlayerId> = (0..self.players.len())

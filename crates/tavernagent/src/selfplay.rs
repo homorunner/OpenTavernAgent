@@ -36,7 +36,9 @@ use crate::net::{
 use crate::npz::{NpyArray, Npz};
 use crate::rules::Budgets;
 
-pub const TRAINER_FORMAT: i64 = 6;
+pub const TRAINER_FORMAT: i64 = 7;
+/// Per-child sample weight multiplier. Label expectations always use 1/2 instead.
+pub const SPLIT_SAMPLE_WEIGHT: f32 = 0.55;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
@@ -45,6 +47,8 @@ pub struct Sample {
     pub mask: Vec<bool>,
     pub pi: Vec<f32>,
     pub z: f32,
+    /// Relative weight in both value and policy objectives.
+    pub weight: f32,
     /// The action actually played, or -1 when unknown (ended positions).
     pub action: i64,
 }
@@ -76,6 +80,7 @@ pub fn ended_sample_of(preview: &Game, seat: usize) -> Result<Sample, String> {
         mask: obs.mask,
         pi: vec![0.0; N_ACTIONS],
         z: 0.0,
+        weight: 1.0,
         action: -1,
     })
 }
@@ -92,9 +97,12 @@ pub struct PlayOptions {
     pub budgets: Budgets,
     /// Probability that a decision is searched (and recorded); the rest play the prior.
     pub search_prob: f32,
+    /// Split after these turns' end effects, immediately before combat.
+    pub split_turn: Vec<u32>,
 }
 
 /// How one decision was made: a full search (recorded) or a direct prior sample.
+#[derive(Clone)]
 pub enum Decision {
     Searched(Box<mcts::SearchResult>),
     Direct(Vec<f32>),
@@ -199,9 +207,42 @@ pub fn game_rng(seed: u64) -> Pcg64Mcg {
     Pcg64Mcg::seed_from_u64(seed ^ 0x504C_4159)
 }
 
-/// Play one all-seat self-play game; returns every recorded sample with its final label
-/// and seat 0's reward.
-/// Each ply's searches run concurrently in `pool` (see `presearch_ply`); the game itself
+/// Validate the chronological split schedule for both the CLI and library callers.
+pub fn validate_split_turns(turns: &[u32]) -> Result<(), String> {
+    if turns.contains(&0) || turns.windows(2).any(|w| w[0] >= w[1]) {
+        return Err("split-turn must contain strictly increasing positive turns (e.g. 4,8)".into());
+    }
+    Ok(())
+}
+
+/// Keep the seat cursor and outstanding searches across combat, including a split.
+/// This preserves the ordinary ply order even if combat starts before the final seat.
+#[derive(Clone)]
+struct RolloutState {
+    game: Game,
+    rng: Pcg64Mcg,
+    presearched: Vec<Option<(Observation, Decision)>>,
+    next_seat: usize,
+    acted: bool,
+}
+
+impl RolloutState {
+    fn new(game: Game, rng: Pcg64Mcg) -> Self {
+        let next_seat = game.players.len();
+        Self {
+            game,
+            rng,
+            presearched: Vec::new(),
+            next_seat,
+            acted: true,
+        }
+    }
+}
+
+/// Play one root and all its binary continuations. Shared prefix rows occur once;
+/// their labels are conditional means of the two child subtrees. The returned seat-0
+/// reward uses the same probability weights, independent of training sample weights.
+/// Each ply's searches run concurrently in `pool` (see `presearch_ply`); the driver
 /// must run outside it. `None` uses rayon's global pool.
 pub fn play_one<E: Evaluator + ?Sized>(
     net: &E,
@@ -215,91 +256,156 @@ pub fn play_one<E: Evaluator + ?Sized>(
     if !(0.0..=1.0).contains(&opts.search_prob) {
         return Err("search_prob must be a probability".into());
     }
+    validate_split_turns(&opts.split_turn)?;
     let mut game = Game::new(seed, opts.budgets.config()?);
     select_heroes(&mut game, seed)?;
-    let mut rng = game_rng(seed);
+    let state = RolloutState::new(game, game_rng(seed));
+    let (samples, rewards) = play_branch(net, state, opts, pool, 1.0)?;
+    Ok((samples, rewards[0]))
+}
+
+fn play_branch<E: Evaluator + ?Sized>(
+    net: &E,
+    mut state: RolloutState,
+    opts: &PlayOptions,
+    pool: Option<&rayon::ThreadPool>,
+    weight: f32,
+) -> Result<(Vec<Sample>, Vec<f32>), String> {
+    let seed = state.game.seed;
     let mut samples: Vec<Sample> = Vec::new();
     let mut seats: Vec<usize> = Vec::new();
-    while !game.is_over() {
-        let mut acted = false;
-        let mut presearched = presearch_ply(&game, net, opts, &mut rng, pool)?;
-        for seat in 0..game.players.len() {
-            if !game.needs_action(seat) {
-                continue;
-            }
-            acted = true;
-            // A pre-searched seat is used only while its legal actions are still those
-            // of the ply's start; otherwise it is searched again on the live position.
-            let pre = presearched
-                .get_mut(seat)
-                .and_then(|p| p.take())
-                .filter(|(o, _)| o.mask == agent_mask(&game, seat));
-            let (obs, pre_result) = match pre {
-                Some((o, r)) => (o, Some(r)),
-                None => (observe_seat(&game, seat), None),
-            };
-            if !obs.mask.iter().any(|m| *m) {
-                // An engine state the policy cannot act in; keep it for diagnosis.
-                if let Ok(dir) = std::env::var("TAVERNAGENT_DUMP_DIR") {
-                    let path = format!(
-                        "{dir}/no_legal_action_seed{seed}_seat{seat}_turn{}.json",
-                        game.turn
-                    );
-                    let _ = std::fs::write(&path, serde_json::to_string(&game).unwrap_or_default());
-                }
+    let mut descendants = Vec::new();
+    let rewards = loop {
+        if state.game.is_over() {
+            break state
+                .game
+                .players
+                .iter()
+                .map(|p| placement_reward(p.placement))
+                .collect();
+        }
+        if state.next_seat == state.game.players.len() {
+            if !state.acted {
                 return Err(format!(
-                    "seat {seat} needs an action but has no legal one: seed={seed}, turn={}, pending={:?}",
-                    game.turn,
-                    game.players[seat].pending.last()
+                    "self-play stalled before game end: seed={seed}, turn={}",
+                    state.game.turn
                 ));
             }
-            let decision = match pre_result {
-                Some(r) => r,
-                None => {
-                    let (full, seed) = draw_decision(opts, &mut rng);
-                    decide(&game, seat, &obs, net, opts, full, seed)?
-                }
-            };
-            let mut action = decision.choose(opts.temperature, &mut rng);
-            if opts.end_explore > 0.0
-                && obs.mask[A_END_TURN]
-                && rng.random::<f32>() < opts.end_explore
-            {
-                // Exploration only changes what is played; the search policy stays the target.
-                action = A_END_TURN;
-            }
-            // Only searched decisions are training rows (their visit distribution is
-            // the policy target); the ended position below is recorded either way.
-            if let Decision::Searched(result) = decision {
-                samples.push(Sample {
-                    x: obs.x,
-                    cards: obs.cards,
-                    mask: obs.mask,
-                    pi: result.policy,
-                    z: 0.0,
-                    action: action as i64,
-                });
-                seats.push(seat);
-            }
-            if action == A_END_TURN {
-                let preview = end_turn_preview(&game, seat)?;
-                samples.push(ended_sample_of(&preview, seat)?);
-                seats.push(seat);
-            }
-            // Plain step: every seat is the network here, so nothing may drive the bots.
-            game.apply_index(seat, action).map_err(|e| e.to_string())?;
+            state.presearched = presearch_ply(&state.game, net, opts, &mut state.rng, pool)?;
+            state.next_seat = 0;
+            state.acted = false;
         }
-        if !acted {
+        let seat = state.next_seat;
+        state.next_seat += 1;
+        if !state.game.needs_action(seat) {
+            continue;
+        }
+        state.acted = true;
+        // A pre-searched seat is used only while its legal actions are still those
+        // of the ply's start; otherwise it is searched again on the live position.
+        let pre = state
+            .presearched
+            .get_mut(seat)
+            .and_then(|p| p.take())
+            .filter(|(o, _)| o.mask == agent_mask(&state.game, seat));
+        let (obs, pre_result) = match pre {
+            Some((o, r)) => (o, Some(r)),
+            None => (observe_seat(&state.game, seat), None),
+        };
+        if !obs.mask.iter().any(|m| *m) {
+            // An engine state the policy cannot act in; keep it for diagnosis.
+            if let Ok(dir) = std::env::var("TAVERNAGENT_DUMP_DIR") {
+                let path = format!(
+                    "{dir}/no_legal_action_seed{seed}_seat{seat}_turn{}.json",
+                    state.game.turn
+                );
+                let _ = std::fs::write(
+                    &path,
+                    serde_json::to_string(&state.game).unwrap_or_default(),
+                );
+            }
             return Err(format!(
-                "self-play stalled before game end: seed={seed}, turn={}",
-                game.turn
+                "seat {seat} needs an action but has no legal one: seed={seed}, turn={}, pending={:?}",
+                state.game.turn,
+                state.game.players[seat].pending.last()
             ));
         }
+        let decision = match pre_result {
+            Some(r) => r,
+            None => {
+                let (full, seed) = draw_decision(opts, &mut state.rng);
+                decide(&state.game, seat, &obs, net, opts, full, seed)?
+            }
+        };
+        let mut action = decision.choose(opts.temperature, &mut state.rng);
+        if opts.end_explore > 0.0
+            && obs.mask[A_END_TURN]
+            && state.rng.random::<f32>() < opts.end_explore
+        {
+            // Exploration only changes what is played; the search policy stays the target.
+            action = A_END_TURN;
+        }
+        // Only searched decisions are training rows (their visit distribution is
+        // the policy target); the ended position below is recorded either way.
+        if let Decision::Searched(result) = decision {
+            samples.push(Sample {
+                x: obs.x,
+                cards: obs.cards,
+                mask: obs.mask,
+                pi: result.policy,
+                z: 0.0,
+                weight,
+                action: action as i64,
+            });
+            seats.push(seat);
+        }
+        if action == A_END_TURN {
+            let preview = end_turn_preview(&state.game, seat)?;
+            let mut ended = ended_sample_of(&preview, seat)?;
+            ended.weight = weight;
+            samples.push(ended);
+            seats.push(seat);
+        }
+        // Pause only on configured turns; all end effects precede the fork and
+        // even this turn's combat randomness belongs to the children.
+        let split = if opts.split_turn.binary_search(&state.game.turn).is_ok() {
+            state
+                .game
+                .apply_index_until_combat(seat, action)
+                .map_err(str::to_string)?
+        } else {
+            state
+                .game
+                .apply_index(seat, action)
+                .map_err(str::to_string)?;
+            false
+        };
+        if split {
+            let mut mean = vec![0.0; state.game.players.len()];
+            // Draw both stream seeds for each child from the parent, never from a
+            // completed sibling. Scheduling and subtree size cannot change them.
+            let seeds: [(u64, u64); 2] =
+                std::array::from_fn(|_| (state.rng.random(), state.rng.random()));
+            for (environment_seed, policy_seed) in seeds {
+                let mut child = state.clone();
+                child.game.rng = taverngym::rng::Rng::new(environment_seed);
+                child.rng = Pcg64Mcg::seed_from_u64(policy_seed);
+                child.game.resume_combat().map_err(str::to_string)?;
+                let (rows, rewards) =
+                    play_branch(net, child, opts, pool, weight * SPLIT_SAMPLE_WEIGHT)?;
+                for (m, r) in mean.iter_mut().zip(rewards) {
+                    *m += 0.5 * r;
+                }
+                descendants.extend(rows);
+            }
+            break mean;
+        }
+    };
+    for (s, seat) in samples.iter_mut().zip(seats) {
+        s.z = rewards[seat];
     }
-    for (s, &seat) in samples.iter_mut().zip(&seats) {
-        s.z = placement_reward(game.players[seat].placement);
-    }
-    Ok((samples, placement_reward(game.players[0].placement)))
+    samples.extend(descendants);
+    Ok((samples, rewards))
 }
 
 /// Sample an action from a visit distribution at `temperature`, in log space so low
@@ -422,6 +528,9 @@ impl Trainer {
             return Err("empty training batch".into());
         }
         for s in batch {
+            if !s.weight.is_finite() || s.weight < 0.0 {
+                return Err("sample weights must be finite and nonnegative".into());
+            }
             if s.action < -1 || s.action >= N_ACTIONS as i64 {
                 return Err("expected selected actions, with -1 for unknown".into());
             }
@@ -435,10 +544,23 @@ impl Trainer {
         // A row without legal actions is an ended position: it carries a value label but
         // no policy target, and contributes nothing to the policy loss or its gradient.
         let n_policy = batch.iter().filter(|s| !s.is_ended()).count();
-        let norm_policy = 1.0 / n_policy.max(1) as f32;
+        let weight_sum: f32 = batch.iter().map(|s| s.weight).sum();
+        let policy_weight_sum: f32 = batch
+            .iter()
+            .filter(|s| !s.is_ended())
+            .map(|s| s.weight)
+            .sum();
+        if !weight_sum.is_finite() || weight_sum <= 0.0 {
+            return Err("training batch must have positive finite total sample weight".into());
+        }
+        let norm_policy = if policy_weight_sum > 0.0 {
+            1.0 / policy_weight_sum
+        } else {
+            0.0
+        };
         let scales = LossScales {
             norm_policy,
-            bsz,
+            weight_sum,
             value_weight: self.hparams.value_weight,
         };
         let net = &self.net;
@@ -471,7 +593,7 @@ impl Trainer {
         });
         let value: Vec<f32> = parts.iter().flat_map(|p| p.value.iter().copied()).collect();
         let policy_loss: f32 = parts.iter().map(|p| p.policy_loss).sum::<f32>() * norm_policy;
-        let value_loss: f32 = parts.iter().map(|p| p.value_loss).sum::<f32>() / bsz as f32;
+        let value_loss: f32 = parts.iter().map(|p| p.value_loss).sum::<f32>() / weight_sum;
         let policy_entropy: f64 = parts.iter().map(|p| p.policy_entropy).sum();
         let target_entropy: f64 = parts.iter().map(|p| p.target_entropy).sum();
         let target_kl: f64 = parts.iter().map(|p| p.target_kl).sum();
@@ -496,8 +618,8 @@ impl Trainer {
                 .sqrt()
         };
         let per_policy = |total: f64| {
-            if n_policy > 0 {
-                total / n_policy as f64
+            if policy_weight_sum > 0.0 {
+                total / policy_weight_sum as f64
             } else {
                 0.0
             }
@@ -525,6 +647,8 @@ impl Trainer {
         );
         metrics.insert("policy_training_samples".into(), n_policy as f64);
         metrics.insert("ended_samples".into(), (bsz - n_policy) as f64);
+        metrics.insert("sample_weight_sum".into(), weight_sum as f64);
+        metrics.insert("policy_sample_weight_sum".into(), policy_weight_sum as f64);
         metrics.insert("clipped_fraction".into(), (scale < 1.0) as u8 as f64);
         metrics.insert("policy_entropy".into(), per_policy(policy_entropy));
         metrics.insert("target_entropy".into(), per_policy(target_entropy));
@@ -604,7 +728,7 @@ const OPTIMIZER_CHUNK: usize = 16_384;
 /// Batch-level normalisations shared by every chunk of a step.
 struct LossScales {
     norm_policy: f32,
-    bsz: usize,
+    weight_sum: f32,
     value_weight: f32,
 }
 
@@ -633,7 +757,6 @@ fn chunk_step(
     let masks: Vec<&[bool]> = rows.iter().map(|s| s.mask.as_slice()).collect();
     let (logits, value, cache) = net.forward(&xs, &cards)?;
     let probs = masked_softmax_rows(&logits, &masks);
-    let norm_policy = scales.norm_policy;
     // Targets with optional smoothing over the legal actions.
     let mut pis = Mat::zeros(n, N_ACTIONS);
     for (r, s) in rows.iter().enumerate() {
@@ -646,6 +769,7 @@ fn chunk_step(
     }
     let mut dlogits = Mat::zeros(n, N_ACTIONS);
     for r in 0..n {
+        let norm_policy = scales.norm_policy * rows[r].weight;
         let (p, t) = (probs.row(r), pis.row(r));
         let out = dlogits.row_mut(r);
         for a in 0..N_ACTIONS {
@@ -664,11 +788,17 @@ fn chunk_step(
     // Every row, continuing or ended, carries the final placement as its value label.
     let dvalue: Vec<f32> = (0..n)
         .map(|r| {
-            scales.value_weight * 2.0 * (value[r] - rows[r].z) * (1.0 - value[r] * value[r])
-                / scales.bsz as f32
+            scales.value_weight
+                * 2.0
+                * (value[r] - rows[r].z)
+                * (1.0 - value[r] * value[r])
+                * rows[r].weight
+                / scales.weight_sum
         })
         .collect();
-    let value_loss = (0..n).map(|r| (value[r] - rows[r].z).powi(2)).sum::<f32>();
+    let value_loss = (0..n)
+        .map(|r| rows[r].weight * (value[r] - rows[r].z).powi(2))
+        .sum::<f32>();
     let mut policy_loss = 0.0f32;
     let mut policy_entropy = 0.0f64;
     let mut target_entropy = 0.0f64;
@@ -683,16 +813,16 @@ fn chunk_step(
         for a in 0..N_ACTIONS {
             let lp = p[a].max(1e-12).ln();
             let lt = t[a].max(1e-12).ln();
-            policy_loss -= t[a] * lp;
-            policy_entropy -= (p[a] * lp) as f64;
-            target_entropy -= (t[a] * lt) as f64;
-            target_kl += (t[a] * (lt - lp)) as f64;
+            policy_loss -= sample.weight * t[a] * lp;
+            policy_entropy -= sample.weight as f64 * (p[a] * lp) as f64;
+            target_entropy -= sample.weight as f64 * (t[a] * lt) as f64;
+            target_kl += sample.weight as f64 * (t[a] * (lt - lp)) as f64;
             if sample.mask[a] {
                 lo = lo.min(logits.row(r)[a]);
                 hi = hi.max(logits.row(r)[a]);
             }
         }
-        logit_span += (hi - lo) as f64;
+        logit_span += sample.weight as f64 * (hi - lo) as f64;
     }
     let dlogits_sq = dlogits.sum_squares();
     let grads = net.backward(&cache, &dlogits, &dvalue);
@@ -755,7 +885,7 @@ pub struct ReplayWindow {
 }
 
 impl ReplayWindow {
-    pub const FIELDS: [&'static str; 6] = ["x", "cards", "mask", "pi", "z", "action"];
+    pub const FIELDS: [&'static str; 7] = ["x", "cards", "mask", "pi", "z", "action", "weight"];
 
     pub fn new(capacity: usize) -> Result<ReplayWindow, String> {
         if capacity < 1 {
@@ -804,6 +934,7 @@ impl ReplayWindow {
             let mut pi = Vec::with_capacity(n * N_ACTIONS);
             let mut z = Vec::with_capacity(n);
             let mut action = Vec::with_capacity(n);
+            let mut weight = Vec::with_capacity(n);
             for s in batch {
                 x.extend_from_slice(&s.x);
                 cards.extend_from_slice(&s.cards);
@@ -811,6 +942,7 @@ impl ReplayWindow {
                 pi.extend_from_slice(&s.pi);
                 z.push(s.z);
                 action.push(s.action);
+                weight.push(s.weight);
             }
             npz.insert(
                 format!("replay/{i}/x"),
@@ -830,11 +962,16 @@ impl ReplayWindow {
             );
             npz.insert(format!("replay/{i}/z"), NpyArray::f32(vec![n], z));
             npz.insert(format!("replay/{i}/action"), NpyArray::i64(vec![n], action));
+            npz.insert(format!("replay/{i}/weight"), NpyArray::f32(vec![n], weight));
         }
     }
 
     /// Refill from `write_arrays` output, oldest round first; a smaller window keeps the newest.
     pub fn restore(&mut self, npz: &Npz, n_rounds: usize) -> Result<(), String> {
+        self.restore_version(npz, n_rounds, false)
+    }
+
+    fn restore_version(&mut self, npz: &Npz, n_rounds: usize, legacy: bool) -> Result<(), String> {
         self.rounds.clear();
         for i in 0..n_rounds {
             let get = |field: &str| {
@@ -848,13 +985,23 @@ impl ReplayWindow {
             let z = get("z")?.as_f32()?;
             let action = get("action")?.as_i64()?;
             let n = z.len();
+            // Format 6 predates sample weights. Format 7 must store them explicitly.
+            let weight = if legacy {
+                vec![1.0; n]
+            } else {
+                get("weight")?.as_f32()?.to_vec()
+            };
             if x.len() != n * N_FEATURES
                 || cards.len() != n * N_CARD_SLOTS
                 || mask.len() != n * N_ACTIONS
                 || pi.len() != n * N_ACTIONS
                 || action.len() != n
+                || weight.len() != n
             {
                 return Err("inconsistent replay window in trainer snapshot".into());
+            }
+            if weight.iter().any(|w| !w.is_finite() || *w < 0.0) {
+                return Err("invalid sample weights in trainer snapshot".into());
             }
             let batch = (0..n)
                 .map(|j| Sample {
@@ -863,6 +1010,7 @@ impl ReplayWindow {
                     mask: mask[j * N_ACTIONS..(j + 1) * N_ACTIONS].to_vec(),
                     pi: pi[j * N_ACTIONS..(j + 1) * N_ACTIONS].to_vec(),
                     z: z[j],
+                    weight: weight[j],
                     action: action[j],
                 })
                 .collect();
@@ -978,7 +1126,7 @@ pub fn load_training_state(
 ) -> Result<TrainerMeta, String> {
     let npz = Npz::load(path)?;
     let meta = parse_meta(&npz)?;
-    if meta.format != TRAINER_FORMAT
+    if ![6, TRAINER_FORMAT].contains(&meta.format)
         || meta.search_version != mcts::SEARCH_VERSION
         || meta.card_fingerprint != trainer.net.card_fingerprint.to_string()
         || meta.net != trainer.net.cfg
@@ -1005,7 +1153,235 @@ pub fn load_training_state(
     *train_rng = meta.train_rng.clone();
     *replay_rng = meta.replay_rng.clone();
     if let Some(window) = replay {
-        window.restore(&npz, meta.replay_rounds_stored)?;
+        window.restore_version(&npz, meta.replay_rounds_stored, meta.format == 6)?;
     }
     Ok(meta)
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use taverngym::cards::cid;
+
+    struct EndOnly;
+    impl Evaluator for EndOnly {
+        fn evaluate(&self, obs: &Observation) -> Result<(Vec<f32>, f32), String> {
+            assert!(obs.mask[A_END_TURN]);
+            let mut pi = vec![0.0; N_ACTIONS];
+            pi[A_END_TURN] = 1.0;
+            Ok((pi, 0.0))
+        }
+    }
+
+    fn fixture(max_turns: u32) -> (Game, PlayOptions) {
+        let opts = PlayOptions {
+            search: SearchOptions::default(),
+            temperature: 0.0,
+            end_explore: 0.0,
+            search_prob: 0.0,
+            budgets: Budgets::default(),
+            split_turn: vec![1, 2],
+        };
+        let mut cfg = opts.budgets.config().unwrap();
+        cfg.max_turns = max_turns;
+        let mut game = Game::new(31, cfg);
+        select_heroes(&mut game, 31).unwrap();
+        // This fixture isolates combat: force End Turn as the sole recruit action.
+        game.cfg.turn_action_caps = vec![0];
+        for seat in 0..8 {
+            let board = game.with_recruit(seat, |c| {
+                (0..3)
+                    .map(|i| {
+                        let mut m = c.new_minion(0, cid("BG25_008"));
+                        m.atk = 1 + (seat + i) as i32 % 4;
+                        m.hp = 2 + (seat * 3 + i) as i32 % 5;
+                        m.max_hp = m.hp;
+                        m
+                    })
+                    .collect()
+            });
+            let p = &mut game.players[seat];
+            p.hero = Some(cid("TB_BaconShop_HERO_34"));
+            p.powers.clear();
+            p.pending.clear();
+            p.effects.clear();
+            p.quests.clear();
+            p.counters.clear();
+            p.hand.clear();
+            p.hand_queue.clear();
+            p.skipping = false;
+            p.health = 100;
+            p.armor = 0;
+            p.board = board;
+        }
+        (game, opts)
+    }
+
+    #[test]
+    fn nested_splits_store_prefix_once_and_average_children_per_seat() {
+        let (game, opts) = fixture(3);
+        let (rows, rewards) = play_branch(
+            &EndOnly,
+            RolloutState::new(game, game_rng(31)),
+            &opts,
+            None,
+            1.0,
+        )
+        .unwrap();
+        // Depth-first traversal: 1 + 2 + 4 segments, each has eight ended rows.
+        assert_eq!(rows.len(), 7 * 8);
+        for (segment, turn) in [1, 2, 3, 3, 2, 3, 3].into_iter().enumerate() {
+            for row in &rows[segment * 8..(segment + 1) * 8] {
+                assert!(row.is_ended());
+                assert_eq!(row.x[0], turn as f32 / 20.0);
+                assert_eq!(row.weight, SPLIT_SAMPLE_WEIGHT.powi(turn - 1));
+            }
+        }
+        for seat in 0..8 {
+            let z = |segment: usize| rows[segment * 8 + seat].z;
+            assert_eq!(z(1), 0.5 * (z(2) + z(3)));
+            assert_eq!(z(4), 0.5 * (z(5) + z(6)));
+            assert_eq!(z(0), 0.5 * (z(1) + z(4)));
+            assert_eq!(rewards[seat], z(0));
+        }
+        assert!(
+            (0..8).any(|seat| rows[16 + seat].cards != rows[24 + seat].cards),
+            "independent child streams should produce different shop draws"
+        );
+    }
+
+    #[test]
+    fn split_combat_can_finish_a_child_without_any_descendant_rows() {
+        let (game, mut opts) = fixture(1);
+        opts.split_turn = vec![1, 2];
+        // Independently settle the two copies of the first combat. With cheap,
+        // deterministic End Turn decisions, each of eight seats consumes one
+        // probability draw and one search seed before the split seeds are drawn.
+        let mut rng = game_rng(31);
+        for _ in 0..8 {
+            let _: f32 = rng.random();
+            let _: u64 = rng.random();
+        }
+        let seeds: [(u64, u64); 2] = std::array::from_fn(|_| (rng.random(), rng.random()));
+        let mut boundary = game.clone();
+        for seat in 0..8 {
+            boundary.end_turn_effects(seat).unwrap();
+        }
+        let mut expected = [0.0; 8];
+        for (seed, _) in seeds {
+            let mut child = boundary.clone();
+            child.rng = taverngym::rng::Rng::new(seed);
+            child.combat_round();
+            assert!(child.is_over());
+            for (e, p) in expected.iter_mut().zip(&child.players) {
+                *e += 0.5 * placement_reward(p.placement);
+            }
+        }
+        let (rows, rewards) = play_branch(
+            &EndOnly,
+            RolloutState::new(game, game_rng(31)),
+            &opts,
+            None,
+            1.0,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 8); // Neither child reaches turn 2.
+        assert_eq!(rewards, expected);
+        for (row, z) in rows.iter().zip(expected) {
+            assert_eq!(row.weight, 1.0);
+            assert_eq!(row.z, z);
+        }
+    }
+
+    #[test]
+    fn unequal_subtree_sizes_use_path_probabilities_not_leaf_counts() {
+        let (mut game, opts) = fixture(2);
+        for (seat, p) in game.players.iter_mut().enumerate() {
+            p.alive = seat < 2;
+            p.placement = if seat < 2 { 0 } else { seat as u8 + 1 };
+            p.health = 1 + seat as i32;
+            p.board.truncate(2);
+            for (i, m) in p.board.iter_mut().enumerate() {
+                // No combat hooks: depending on targets, these boards tie or seat 0 wins.
+                // A tie at the turn cap favors seat 1's higher hero Health.
+                m.card = cid("BG26_135");
+                let (atk, hp) = if seat == 0 {
+                    [(1, 1), (4, 4)][i]
+                } else {
+                    [(1, 3), (3, 1)][i]
+                };
+                m.atk = atk;
+                m.hp = hp;
+                m.max_hp = m.hp;
+            }
+        }
+        game.pairs = vec![(0, Some(1))];
+        // A tie keeps both players alive; any winner ends the game. Independently
+        // enumerate combats to find a tree with one terminal child and two grandchildren.
+        let settle = |mut g: Game, mut rng: Pcg64Mcg| {
+            for seat in 0..2 {
+                let _: f32 = rng.random();
+                let _: u64 = rng.random();
+                g.end_turn_effects(seat).unwrap();
+            }
+            std::array::from_fn::<_, 2, _>(|_| {
+                let mut child = g.clone();
+                child.rng = taverngym::rng::Rng::new(rng.random());
+                let child_rng = Pcg64Mcg::seed_from_u64(rng.random());
+                child.combat_round();
+                (child, child_rng)
+            })
+        };
+        for seed in 0..100 {
+            let children = settle(game.clone(), game_rng(seed));
+            if children.iter().filter(|(g, _)| g.is_over()).count() != 1 {
+                continue;
+            }
+            let mut leaves = Vec::new();
+            for (g, rng) in children {
+                if g.is_over() {
+                    leaves.push((0.5, g));
+                } else {
+                    for (leaf, _) in settle(g, rng) {
+                        assert!(leaf.is_over());
+                        leaves.push((0.25, leaf));
+                    }
+                }
+            }
+            let expected: Vec<f32> = (0..8)
+                .map(|seat| {
+                    leaves
+                        .iter()
+                        .map(|(p, g)| p * placement_reward(g.players[seat].placement))
+                        .sum()
+                })
+                .collect();
+            let flat: f32 = leaves
+                .iter()
+                .map(|(_, g)| placement_reward(g.players[0].placement))
+                .sum::<f32>()
+                / 3.0;
+            if (expected[0] - flat).abs() < 1e-6 {
+                continue;
+            }
+            let (rows, rewards) = play_branch(
+                &EndOnly,
+                RolloutState::new(game.clone(), game_rng(seed)),
+                &opts,
+                None,
+                1.0,
+            )
+            .unwrap();
+            assert_eq!(rows.len(), 4); // Two shared rows + two rows on the surviving child.
+            for seat in 0..8 {
+                assert!((rewards[seat] - expected[seat]).abs() < 1e-6);
+            }
+            assert_eq!(rows[0].z, rewards[0]);
+            assert_eq!(rows[1].z, rewards[1]);
+            assert!(rows[..2].iter().all(|r| r.weight == 1.0));
+            assert!(rows[2..].iter().all(|r| r.weight == SPLIT_SAMPLE_WEIGHT));
+            return;
+        }
+        panic!("fixture must produce an unequal tree with distinct returns");
+    }
 }

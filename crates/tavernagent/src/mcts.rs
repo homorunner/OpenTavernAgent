@@ -139,6 +139,7 @@ impl SearchOptions {
 }
 
 /// A decision node. Children are keyed by the observable outcome of an action.
+#[derive(Clone)]
 pub struct Node {
     pub prior: Vec<f32>,
     pub actions: Vec<usize>,
@@ -196,6 +197,7 @@ impl Node {
     }
 }
 
+#[derive(Clone)]
 pub struct SearchResult {
     /// Root visit distribution over all actions (the prior if nothing was visited).
     pub policy: Vec<f32>,
@@ -294,6 +296,7 @@ pub fn bot_action(game: &mut Game, p: usize) -> taverngym::Action {
     action
 }
 
+#[derive(Clone)]
 pub struct Observation {
     pub x: Vec<f32>,
     pub cards: Vec<i32>,

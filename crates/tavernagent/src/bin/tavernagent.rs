@@ -20,7 +20,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// All-seat self-play training with checkpoints and exact resume.
-    Selfplay(train::SelfplayArgs),
+    Selfplay(Box<train::SelfplayArgs>),
     /// Paired evaluation of checkpoints against the scripted bot.
     Eval(eval::EvalArgs),
     /// Two checkpoints against each other with seat swaps.
@@ -74,7 +74,7 @@ fn run() -> Result<(), String> {
     match cli.command {
         Command::Selfplay(args) => {
             let (_, sub) = matches.subcommand().expect("subcommand");
-            train::run(args, &provided_ids(sub))
+            train::run(*args, &provided_ids(sub))
         }
         Command::Eval(args) => eval::run(args),
         Command::Arena(args) => arena::run(args),

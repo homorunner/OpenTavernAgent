@@ -162,9 +162,34 @@ mask, root visit distribution, the action played and the final placement reward
 (0.02) forces End Turn with a small probability so that ended positions with unspent Gold
 also appear; the search distribution stays the policy target.
 
+**Tree rollouts.** `selfplay --split-turn "4,8"` splits each root into two continuations
+after turn 4 and each surviving continuation into two after turn 8. A split happens
+after all seats' end-of-turn effects and recruit eliminations, immediately before combat:
+that turn's combat is already independent in the children. Both environment and policy/search
+random streams are reseeded deterministically per child. The shared prefix is stored once;
+its value labels average the two child subtree returns with probability 1/2 each. Thus,
+when all branches reach both splits, turns 1–4 average four outcomes, turns 5–8 average
+two, and later rows use their own terminal outcome. A branch that ends early returns its
+outcome directly; tree probabilities, rather than a flat mean of unequal leaf counts,
+keep the label expectation unchanged. Ended-position rows of the split turn belong to
+the shared prefix.
+
+Every split multiplies **both policy and value sample weights** by the code constant
+`selfplay::SPLIT_SAMPLE_WEIGHT = 0.55` (no CLI option). For `4,8`, weights are 1, 0.55,
+and 0.3025 across the three stages. The multiplier affects training only, never the
+probabilities used to average labels; it gives each additional depth 1.1 times the
+aggregate sample weight when both children survive. `--games` still counts independent
+roots, and reported placement averages subtree returns per root. Replay draws remain
+uniform over stored rows; loss weighting applies after the draw. Collection cost and
+replay size grow with the continuations, while `--max-samples` still bounds each epoch's
+training draw. Splits execute depth first within each root, retaining parallel seat
+searches and parallel roots. Omit the option for ordinary rollouts; turns must be positive,
+unique and increasing (for example `--split-turn "3,6,9"`).
+
 **Loss.** Policy cross-entropy against the (smoothed, `--policy-smoothing 0.05`) visit
-distribution, averaged over rows with legal actions; `--value-weight` (0.5) times the value
-MSE over all rows. Optional `--pg-weight` adds a REINFORCE term with the value as baseline. AdamW (decay on
+distribution, normalized by the sum of weights of rows with legal actions; `--value-weight`
+(0.5) times value MSE normalized by the sum of all row weights. Optional `--pg-weight` adds
+a REINFORCE term with the same policy row weights and the value as baseline. AdamW (decay on
 weight matrices only), global gradient-norm clipping, cosine learning-rate schedule.
 
 **Parallel step.** A minibatch is processed in fixed chunks of `STEP_CHUNK_ROWS` (32) rows,
@@ -196,6 +221,7 @@ decisions per round (about 28% of them) was removed.
 | `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 1.0 / 1.0 |
 | `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 2 / 0.15 |
 | `--search-prob` / `--fpu-reduction` | 0.33 / 1.5 |
+| `--split-turn` | none (ordinary rollout) |
 | `--hidden` / `--blocks` / `--embedding-dim` | 192 / 6 / 16 |
 | `--value-weight` | 0.5 |
 | `--weight-decay` / `--clip` / `--ema-rounds` | 0.01 / 5.0 / 2 |
@@ -206,6 +232,10 @@ defaults, 9 KB per stored decision); `--save-every N` keeps immutable `<out>.ste
 `--resume-state` restores all of it bit-exactly (a smaller `--replay-rounds` keeps the newest
 rounds); `--resume` loads weights only. `<out>.history.json` records per-round losses,
 gradient norms, entropies, target KL, the ended sample counts and timings.
+Trainer format 7 also stores each replay row's weight; format 6 snapshots load with unit
+weights. Saved split turns are inherited on resume unless explicitly overridden. The
+multiplier is recorded as `split_sample_weight` in `<out>.config.json`; history includes
+`sample_weight_sum` and `policy_sample_weight_sum` alongside the raw sample counts.
 
 ## Experiments so far
 

@@ -17,7 +17,7 @@ use crate::rules::Budgets;
 use crate::selfplay::{
     OptimizerHparams, PlayOptions, ReplayWindow, Sample, Stats, StepOptions, Trainer,
     TrainingState, cosine_lr, ema_decay_for_window, load_training_state, play_one,
-    read_training_meta, save_training_state, train_epoch,
+    read_training_meta, save_training_state, train_epoch, validate_split_turns,
 };
 
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
@@ -25,7 +25,7 @@ pub struct SelfplayArgs {
     /// Cumulative target number of collect+train rounds.
     #[arg(long, default_value_t = 200)]
     pub steps: usize,
-    /// Self-play games per round.
+    /// Self-play roots per round (each can have multiple split continuations).
     #[arg(long, default_value_t = 128)]
     pub games: usize,
     /// MCTS simulations per searched decision.
@@ -35,6 +35,10 @@ pub struct SelfplayArgs {
     /// network prior at the play temperature and are not training rows.
     #[arg(long, default_value_t = 0.33)]
     pub search_prob: f32,
+    /// Binary splits after these turns' end effects, before combat (e.g. 4,8).
+    #[arg(long, value_delimiter = ',')]
+    #[serde(default)]
+    pub split_turn: Vec<u32>,
     /// Training passes per round; each draws `max_samples` from the replay window.
     #[arg(long, default_value_t = 1)]
     pub epochs: usize,
@@ -184,6 +188,7 @@ impl SelfplayArgs {
     }
 
     fn validate(&self) -> Result<(), String> {
+        validate_split_turns(&self.split_turn)?;
         if [
             self.steps,
             self.games,
@@ -346,6 +351,7 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
     let options = serde_json::to_value(&args).map_err(|e| e.to_string())?;
     let mut config = options.clone();
     config["search_version"] = json!(mcts::SEARCH_VERSION);
+    config["split_sample_weight"] = json!(crate::selfplay::SPLIT_SAMPLE_WEIGHT);
     write_json(&with_stem(&out, ".config.json"), &config)?;
     println!(
         "net {} params, {} games x {} steps, sims {}, workers {}, ema decay {:.5} ({} updates/round)",
@@ -388,6 +394,7 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
             end_explore: args.end_explore,
             budgets: args.budgets,
             search_prob: args.search_prob,
+            split_turn: args.split_turn.clone(),
         };
         let seeds: Vec<u64> = (0..args.games as u64)
             .map(|i| args.seed + step as u64 * 10_000 + i)

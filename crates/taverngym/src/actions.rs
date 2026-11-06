@@ -129,6 +129,13 @@ impl Action {
 impl Game {
     /// Apply an action for player `p`.
     pub fn apply(&mut self, p: PlayerId, a: Action) -> ActResult {
+        if self
+            .combat_pause
+            .as_ref()
+            .is_some_and(|pause| pause.reached)
+        {
+            return Err("resume the paused combat before applying an action");
+        }
         if self.phase == Phase::GameOver {
             return Err("game over");
         }
@@ -140,14 +147,37 @@ impl Game {
             let n = &mut self.players[p].actions_this_turn;
             *n = n.saturating_sub(1);
         }
-        self.recruit_deaths();
+        self.finish_action(p, true);
+        r
+    }
+
+    fn finish_action(&mut self, p: PlayerId, check_deaths: bool) {
+        if self.defer_action_cleanup(p, check_deaths) {
+            return;
+        }
+        if check_deaths {
+            self.recruit_deaths();
+            if self.defer_action_cleanup(p, false) {
+                return;
+            }
+        }
         if self.cfg.experimental_mode {
             self.players[p].normalize_timewarp_hand_limit(self.cfg.hand_size);
         }
         if self.players[p].alive && !self.players[p].hand_queue.is_empty() {
             self.flush_hand_queue(p);
         }
-        r
+    }
+
+    fn defer_action_cleanup(&mut self, p: PlayerId, check_deaths: bool) -> bool {
+        if let Some(pause) = &mut self.combat_pause
+            && pause.reached
+        {
+            pause.action_cleanup = Some((p, check_deaths));
+            true
+        } else {
+            false
+        }
     }
 
     /// The most actions seat `p` may take this turn: the turn's entry of
@@ -199,6 +229,48 @@ impl Game {
     pub fn apply_index(&mut self, p: PlayerId, a: usize) -> ActResult {
         let act = Action::decode(a).ok_or("bad action index")?;
         self.apply(p, act)
+    }
+
+    /// Apply an action normally, but stop before any resulting combat starts.
+    /// Returns true only at the combat boundary: all end-of-turn effects and
+    /// recruit-phase eliminations have resolved, no combat RNG has been drawn.
+    /// Clone/reseed this state if desired, then call `resume_combat` on each copy.
+    pub fn apply_index_until_combat(
+        &mut self,
+        p: PlayerId,
+        a: usize,
+    ) -> Result<bool, &'static str> {
+        if self.combat_pause.is_some() {
+            return Err("a combat pause is already active");
+        }
+        self.combat_pause = Some(Default::default());
+        let result = self.apply_index(p, a);
+        let reached = self
+            .combat_pause
+            .as_ref()
+            .is_some_and(|pause| pause.reached);
+        if !reached {
+            self.combat_pause = None;
+        }
+        result.map(|()| reached)
+    }
+
+    /// Complete a paused combat, including the rest of the triggering action.
+    /// End-of-turn effects are not run again. The pause is part of saved states.
+    pub fn resume_combat(&mut self) -> ActResult {
+        if !self
+            .combat_pause
+            .as_ref()
+            .is_some_and(|pause| pause.reached)
+        {
+            return Err("no combat is paused");
+        }
+        let pause = self.combat_pause.take().expect("checked pause");
+        self.combat_round();
+        if let Some((p, check_deaths)) = pause.action_cleanup {
+            self.finish_action(p, check_deaths);
+        }
+        Ok(())
     }
 
     /// Whether `p` must act now (alive, turn not ended, or a pending choice).
