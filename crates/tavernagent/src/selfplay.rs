@@ -36,7 +36,7 @@ use crate::net::{
 use crate::npz::{NpyArray, Npz};
 use crate::rules::Budgets;
 
-pub const TRAINER_FORMAT: i64 = 5;
+pub const TRAINER_FORMAT: i64 = 6;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {

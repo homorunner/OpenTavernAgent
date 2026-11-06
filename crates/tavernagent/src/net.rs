@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! numeric features + flattened card embeddings -> 192 -> residual blocks
-//!     -> {245 policy logits, 1 tanh value}
+//!     -> {196 policy logits, 1 tanh value}
 //! ```
 //!
 //! Forward passes return their cache instead of storing it, so one network can serve
@@ -23,12 +23,15 @@ use taverngym::obs as o;
 use crate::linalg::{Bf16Mat, Mat};
 use crate::npz::{NpyArray, Npz};
 
-pub const N_ACTIONS: usize = a::N_ACTIONS;
+/// The agent's action space: the engine's flat layout up to and excluding the Move block
+/// (`A_MOVE..N_ACTIONS`), which is the trailing block. Warband ordering is left to a
+/// separate model; this network never sees, predicts or trains on Move actions.
+pub const N_ACTIONS: usize = a::A_MOVE;
 pub const N_FEATURES: usize = o::OBS_FLOATS;
 pub const N_CARD_SLOTS: usize = o::OBS_CARDS;
 pub const DEFAULT_HIDDEN: usize = 192;
 pub const DEFAULT_BLOCKS: usize = 6;
-pub const MODEL_VERSION: i64 = 6;
+pub const MODEL_VERSION: i64 = 7;
 pub const N_OPP_BOARD_SLOTS: usize = o::N_OPP * a::N_BOARD;
 pub const OPP_BOARD_FEATURE_START: usize = N_FEATURES - N_OPP_BOARD_SLOTS * o::MINION_F;
 /// The ended-turn flag: the seat has finished recruiting and has no legal action.

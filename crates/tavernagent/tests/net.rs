@@ -33,7 +33,7 @@ fn parameter_count_and_input_layout() {
     let net = PolicyValueNet::new(0, NetConfig::default()).unwrap();
     assert_eq!(net.n_input_features(), 1713);
     assert_eq!(net.n_card_slots(), 69);
-    assert_eq!(net.n_params(), 877_302);
+    assert_eq!(net.n_params(), 867_845);
     assert_eq!(net.p.tensors.len(), 9 + 4 * net.cfg.blocks);
     assert_eq!(net.p.names().last().unwrap(), "bv");
     let wide = PolicyValueNet::new(

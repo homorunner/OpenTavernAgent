@@ -14,13 +14,13 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use rand_distr::{Distribution, Gamma};
-use taverngym::actions::A_END;
+use taverngym::actions::{A_CANCEL, A_END};
 use taverngym::obs::observe;
 use taverngym::{Game, bot, rng::Rng};
 
 use crate::net::{N_ACTIONS, PolicyValueNet};
 
-pub const SEARCH_VERSION: &str = "ended-state-v6-gold-gate";
+pub const SEARCH_VERSION: &str = "ended-state-v8-no-move";
 pub const MAX_PLIES: usize = 2000;
 pub const MAX_DEPTH: usize = 100;
 pub const A_END_TURN: usize = A_END;
@@ -39,9 +39,15 @@ pub const DEFAULT_C_PUCT: f32 = 1.9;
 pub const DEFAULT_LCB_STDEVS: f32 = 2.0;
 pub const DEFAULT_LCB_MIN_VISIT_PROP: f32 = 0.15;
 /// First-play urgency: an unvisited edge is valued at the parent's mean value minus this
-/// amount. Negative restores the original rule (unvisited edges at Q = 0). At 1,000
-/// rounds, 0.2 scored 2.14 / 2.67 (two seeds) against 2.54 without it.
-pub const DEFAULT_FPU_REDUCTION: f32 = -1.0;
+/// amount. Negative restores the original rule (unvisited edges at Q = 0), which on a
+/// [-1, 1] value spreads the simulations over every untried action whenever the parent is
+/// below 0. Two 1,000-round checkpoints, the same 2,048 games at 64 sims: Q = 0 scored
+/// 2.702 / 4.006, a reduction of 0.4 2.638 / 3.772, 1.0 2.490 / 3.651, 1.5 2.392 / 3.544.
+/// That is evaluation only. In training, 0.2 scored 2.14 / 2.67 (two seeds) at 1,000
+/// rounds against 2.54 without it; training with 1 is untested.
+// TODO: compute it the way KataGo does: parent value - c * sqrt(prior mass of the visited
+// children), with a smaller c at the root, instead of a fixed reduction.
+pub const DEFAULT_FPU_REDUCTION: f32 = 1.5;
 /// Range of the value head's output; the variance prior at low visit counts.
 const VALUE_RANGE_RADIUS: f32 = 1.0;
 
@@ -303,18 +309,38 @@ pub fn observe_seat(game: &Game, seat: usize) -> Observation {
     }
 }
 
-/// The seat's legal actions with the must-spend rule applied: End Turn is illegal for a seat
-/// holding `MUST_SPEND_GOLD` Gold or more, whatever the shop currently offers. A free
-/// Refresh is exactly the case that matters — nothing is affordable now, a Refresh may turn
-/// up something that is — so the rule must not try to predict whether Gold *can* be spent.
-/// It only ever removes End Turn, and never leaves the mask empty: past the action cap the
-/// engine returns End Turn alone, and that one bit is restored.
+/// The seat's legal actions over the agent's action space, with two training rules applied.
+///
+/// The agent's space is the engine's layout without the trailing Move block
+/// (`net::N_ACTIONS == A_MOVE`): warband ordering is not this network's job, and a Move
+/// line was the search's favourite way to burn the action budget. The mask is the
+/// engine's mask truncated; every other index is unchanged.
+///
+/// Must-spend: End Turn is illegal for a seat holding `MUST_SPEND_GOLD` Gold or more,
+/// whatever the shop currently offers. A free Refresh is exactly the case that matters —
+/// nothing is affordable now, a Refresh may turn up something that is — so the rule must not
+/// try to predict whether Gold *can* be spent. It only ever removes End Turn, and never
+/// leaves the mask empty: past the action cap the engine returns End Turn alone, and that
+/// one bit is restored.
+///
+/// No Cancel: a menu the agent opened (a spell's or Hero Power's target, a Choose One) must
+/// be resolved by picking an option. The engine only opens a target menu when a target
+/// exists, so an option is always there; Cancel is restored only when it is the sole legal
+/// action (a paid trinket offer with nothing in it affordable). Without this the search treats
+/// open-menu / close-menu as a free no-op pair and spends the turn's action budget on it.
 pub fn agent_mask(game: &Game, seat: usize) -> Vec<bool> {
     let mut mask = game.legal_mask(seat);
+    mask.truncate(N_ACTIONS);
     if mask[A_END_TURN] && game.players[seat].gold >= MUST_SPEND_GOLD {
         mask[A_END_TURN] = false;
         if !mask.iter().any(|legal| *legal) {
             mask[A_END_TURN] = true;
+        }
+    }
+    if mask[A_CANCEL] {
+        mask[A_CANCEL] = false;
+        if !mask.iter().any(|legal| *legal) {
+            mask[A_CANCEL] = true;
         }
     }
     mask
@@ -496,8 +522,16 @@ pub fn search_with_seeds<E: Evaluator + ?Sized>(
     apply_root_temperature(&mut root, opts.root_temperature);
     add_root_noise(&mut root, opts.root_noise, opts.noise_alpha, rng);
 
+    // One working copy for the whole search. A turn-horizon simulation only ever changes
+    // the searched seat, the pool and a few counters, so `rewind_turn` restores those and
+    // leaves the other seats alone; a game-horizon simulation moves every seat and fights,
+    // so it gets a fresh copy.
+    let mut simulation = game.clone();
     for _ in 0..opts.sims {
-        let mut simulation = reseeded(game, next_seed(rng));
+        match opts.horizon {
+            Horizon::Turn => rewind_turn(&mut simulation, game, seat, next_seed(rng)),
+            Horizon::Game => simulation = reseeded(game, next_seed(rng)),
+        }
         // Path of (node pointer, action index); nodes are owned by the tree, so walk by
         // re-descending with indices instead of holding references.
         let mut path: Vec<(usize, u64)> = Vec::new(); // (action index, outcome key) per level
@@ -593,4 +627,27 @@ pub fn reseeded(game: &Game, seed: u64) -> Game {
     let mut copy = game.clone();
     copy.rng = Rng::new(seed);
     copy
+}
+
+/// Make `sim` equal to `reseeded(root, seed)` again after a turn-horizon simulation of
+/// `seat`, restoring only what such a simulation can change. Recruit actions and
+/// end-of-turn effects act on their owner alone (the cross-seat scripts fire at turn start
+/// or on elimination), so the other seats, the phase, the pairings and the lobby tables in
+/// `sim` are still the root's — unless the simulation killed the seat (its own power or
+/// effect took its last Health): elimination rewrites the phase, the pairings, the
+/// elimination order and, through Mr. Bigglesworth, other seats, so that case falls back
+/// to a full copy. `sim` must have started as a copy of `root`.
+pub fn rewind_turn(sim: &mut Game, root: &Game, seat: usize, seed: u64) {
+    if sim.players[seat].alive != root.players[seat].alive {
+        *sim = reseeded(root, seed);
+        return;
+    }
+    sim.players[seat].clone_from(&root.players[seat]);
+    sim.pool.counts.clone_from(&root.pool.counts);
+    sim.rng = Rng::new(seed);
+    sim.next_eid = root.next_eid;
+    sim.ending_turn = root.ending_turn;
+    sim.truncated_recruit_contexts = root.truncated_recruit_contexts;
+    sim.log.clone_from(&root.log);
+    sim.last_frames.clear();
 }
