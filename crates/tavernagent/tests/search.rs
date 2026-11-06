@@ -1,17 +1,21 @@
 //! Search information boundary, chance sampling and the ended-state End Turn transition.
 
-use rand::SeedableRng;
+use rand::{Rng as _, SeedableRng};
 use rand_pcg::Pcg64Mcg;
 use serde_json::Value;
 use tavernagent::heroes::select_heroes;
 use tavernagent::mcts::{
     self, A_END_TURN, Evaluator, Horizon, MUST_SPEND_GOLD, Observation, SearchOptions, agent_mask,
-    observe_seat, reseeded,
+    observe_seat, reseeded, rewind_turn,
 };
 use tavernagent::net::{ENDED_TURN_FEATURE, N_ACTIONS, input_feature_indices};
 use tavernagent::rules::Budgets;
 use taverngym::Game;
-use taverngym::actions::A_REFRESH;
+use taverngym::actions::{
+    A_BUY, A_CANCEL, A_CHOOSE, A_HERO_POWER, A_MOVE, A_PLAY, A_REFRESH, N_BOARD, N_CHOICE, N_SHOP,
+};
+use taverngym::cards::{CardId, CardKind, cid, db};
+use taverngym::state::{Item, Pending};
 
 fn position(seed: u64) -> Game {
     let mut game = Game::new(seed, Budgets::default().config().unwrap());
@@ -84,6 +88,230 @@ fn reseeded_copy_changes_only_the_future_rng() {
         })
         .collect();
     assert!(shops.len() > 1);
+}
+
+#[test]
+fn rewind_turn_restores_the_reseeded_copy_after_any_turn_line() {
+    // Positions from several games and turns, bots driving all seats to get there; each
+    // then plays random legal lines (including End Turn and its effects) on a working copy
+    // and rewinds. The rewound copy must be byte-identical to a fresh reseeded copy.
+    let mut lines = 0;
+    for game_seed in 0..6u64 {
+        let mut game = Game::new(game_seed, Budgets::default().config().unwrap());
+        select_heroes(&mut game, game_seed).unwrap();
+        let mut rng = Pcg64Mcg::seed_from_u64(game_seed);
+        let mut visited = 0;
+        while !game.is_over() && game.turn <= 14 {
+            let seat = match (0..game.players.len()).find(|&s| game.needs_action(s)) {
+                Some(s) => s,
+                None => break,
+            };
+            // The first decision of a seat's turn, every other turn: deeper turns bring hero
+            // powers, trinkets and buddies into the lines.
+            let fresh = game.players[seat].actions_this_turn == 0;
+            if fresh && game.turn % 2 == 1 && game.players[seat].pending.is_empty() {
+                visited += 1;
+                let mut sim = game.clone();
+                for line in 0..5u64 {
+                    let seed = game_seed * 1000 + visited * 10 + line;
+                    rewind_turn(&mut sim, &game, seat, seed);
+                    for _ in 0..rng.random_range(1..12) {
+                        let mask = agent_mask(&sim, seat);
+                        let legal: Vec<usize> = (0..N_ACTIONS).filter(|a| mask[*a]).collect();
+                        if legal.is_empty() {
+                            break;
+                        }
+                        let a = legal[rng.random_range(0..legal.len())];
+                        if a == A_END_TURN {
+                            sim.end_turn_effects(seat).unwrap();
+                            break;
+                        }
+                        sim.apply_index(seat, a).unwrap();
+                    }
+                    lines += 1;
+                    rewind_turn(&mut sim, &game, seat, seed);
+                    let expect = reseeded(&game, seed);
+                    assert_eq!(
+                        serde_json::to_string(&sim).unwrap(),
+                        serde_json::to_string(&expect).unwrap(),
+                        "game {game_seed} turn {} seat {seat} line {line}",
+                        game.turn
+                    );
+                }
+            }
+            let a = mcts::bot_action(&mut game, seat);
+            game.apply(seat, a).unwrap();
+        }
+    }
+    assert!(lines > 100, "{lines} lines");
+}
+
+#[test]
+fn the_agent_cannot_cancel_a_menu_it_opened() {
+    // A targeted hand spell (Winner's Bread: give a friendly minion +2/+3) opens a target
+    // menu; the engine offers Cancel, the agent is not allowed to take it.
+    let mut game = position(19);
+    let shop_minion = game.players[0]
+        .shop
+        .iter()
+        .position(|s| s.item.as_minion().is_some())
+        .expect("a minion in the tavern");
+    game.apply_index(0, taverngym::actions::A_BUY + shop_minion)
+        .unwrap();
+    let hand = game.players[0].hand.len() - 1;
+    game.apply_index(0, A_PLAY + hand * taverngym::actions::N_POS)
+        .unwrap();
+    assert_eq!(game.players[0].board.len(), 1);
+    game.with_recruit(0, |ctx| {
+        ctx.add_to_hand(
+            0,
+            Item::Spell {
+                card: cid("BG36_883"),
+                data: 0,
+            },
+        );
+    });
+    let spell = game.players[0]
+        .hand
+        .iter()
+        .position(|h| matches!(h.item, Item::Spell { .. }))
+        .unwrap();
+    game.apply_index(0, A_PLAY + spell * taverngym::actions::N_POS)
+        .unwrap();
+    assert!(matches!(
+        game.players[0].pending.last(),
+        Some(Pending::Target { .. })
+    ));
+    assert!(game.legal_mask(0)[A_CANCEL]);
+    let mask = agent_mask(&game, 0);
+    assert!(!mask[A_CANCEL]);
+    let choices: Vec<usize> = (A_CHOOSE..A_CHOOSE + N_CHOICE)
+        .filter(|a| mask[*a])
+        .collect();
+    assert!(!choices.is_empty());
+    assert_eq!(
+        mask.iter().filter(|m| **m).count(),
+        choices.len(),
+        "only the menu's options are open"
+    );
+    let atk = game.players[0].board[0].atk;
+    game.apply_index(0, choices[0]).unwrap();
+    assert!(game.players[0].pending.is_empty());
+    assert_eq!(game.players[0].board[0].atk, atk + 2);
+
+    // Same for a Hero Power's target menu (Lich Baz'hial: steal a Tavern card).
+    game.players[0].set_hero_power(0, cid("TB_BaconShop_HP_049"));
+    game.apply_index(0, A_HERO_POWER).unwrap();
+    assert!(game.legal_mask(0)[A_CANCEL]);
+    let mask = agent_mask(&game, 0);
+    assert!(!mask[A_CANCEL]);
+    assert!((A_CHOOSE..A_CHOOSE + N_CHOICE).any(|a| mask[a]));
+}
+
+#[test]
+fn cancel_stays_when_it_is_the_only_legal_action() {
+    // A paid trinket offer with nothing affordable is the one state where the engine makes
+    // Cancel the sole legal action. `offer_trinkets` skips such an offer, so build it by
+    // hand: the rule's empty-mask guard must leave Cancel in place.
+    let mut game = position(19);
+    game.players[0].gold = 0;
+    let dear: Vec<_> = (0..db().len() as u16)
+        .map(CardId)
+        .filter(|c| db().get(*c).kind == CardKind::TrinketGreater && db().get(*c).cost > 0)
+        .take(3)
+        .collect();
+    assert_eq!(dear.len(), 3);
+    game.players[0].pending.push(Pending::Trinket {
+        options: dear,
+        free: false,
+        replace: None,
+    });
+    let legal = game.legal_mask(0);
+    assert!(legal[A_CANCEL]);
+    assert_eq!(legal.iter().filter(|m| **m).count(), 1);
+    assert_eq!(agent_mask(&game, 0), legal[..N_ACTIONS]);
+}
+
+#[test]
+fn the_agent_has_no_move_actions() {
+    // The engine's layout ends with the Move block; the agent's space stops right before it,
+    // and every index below is the engine's own.
+    assert_eq!(N_ACTIONS, A_MOVE);
+    assert_eq!(taverngym::actions::N_ACTIONS, A_MOVE + N_BOARD * N_BOARD);
+    // Two minions on the warband make a Move legal for the engine but not for the agent.
+    let mut game = position(7);
+    for _ in 0..2 {
+        let buy = (A_BUY..A_BUY + N_SHOP)
+            .find(|a| {
+                game.legal_mask(0)[*a]
+                    && matches!(game.players[0].shop[*a - A_BUY].item, Item::Minion(_))
+            })
+            .unwrap();
+        game.apply_index(0, buy).unwrap();
+        let play = (A_PLAY..A_MOVE).find(|a| game.legal_mask(0)[*a]).unwrap();
+        game.apply_index(0, play).unwrap();
+    }
+    let legal = game.legal_mask(0);
+    assert!(
+        legal[A_MOVE..].iter().any(|m| *m),
+        "the engine offers a Move"
+    );
+    let mask = agent_mask(&game, 0);
+    assert_eq!(mask.len(), N_ACTIONS);
+    // Index 0 is End Turn, hidden by the must-spend rule at 30 Gold; the rest is the engine's.
+    assert_eq!(mask[1..], legal[1..N_ACTIONS]);
+}
+
+#[test]
+fn rewind_turn_falls_back_to_a_full_copy_when_the_seat_died() {
+    // Lich Baz'hial's power costs 2 Health; at 1 Health it kills the seat mid-turn, which
+    // eliminates it (phase, pairings, elimination order, pool) and may end the game.
+    let mut game = position(19);
+    game.players[0].health = 1;
+    game.players[0].armor = 0;
+    game.players[0].set_hero_power(0, cid("TB_BaconShop_HP_049"));
+    let seed = 77;
+    let mut sim = game.clone();
+    rewind_turn(&mut sim, &game, 0, seed);
+    assert!(agent_mask(&sim, 0)[A_HERO_POWER]);
+    sim.apply_index(0, A_HERO_POWER).unwrap();
+    // The power asks for a Tavern target: take the first one offered (not Cancel).
+    let mut guard = 0;
+    while sim.needs_action(0) && !sim.players[0].pending.is_empty() {
+        let mask = agent_mask(&sim, 0);
+        let a = (A_CANCEL + 1..N_ACTIONS).find(|a| mask[*a]).unwrap();
+        sim.apply_index(0, a).unwrap();
+        guard += 1;
+        assert!(guard < 10);
+    }
+    assert!(!sim.players[0].alive, "the power did not kill the seat");
+    assert_ne!(sim.eliminated, game.eliminated);
+    rewind_turn(&mut sim, &game, 0, seed);
+    assert_eq!(
+        serde_json::to_string(&sim).unwrap(),
+        serde_json::to_string(&reseeded(&game, seed)).unwrap()
+    );
+    // And a search from that position (End Turn, Hero Power and the rest all legal) is
+    // still a pure function of the seeds, and leaves the real game untouched.
+    let before = serde_json::to_string(&game).unwrap();
+    let a = mcts::search(
+        &game,
+        0,
+        &SingleAction(A_HERO_POWER),
+        &opts(32, Horizon::Turn),
+        &mut Pcg64Mcg::seed_from_u64(3),
+    )
+    .unwrap();
+    let b = mcts::search(
+        &game,
+        0,
+        &SingleAction(A_HERO_POWER),
+        &opts(32, Horizon::Turn),
+        &mut Pcg64Mcg::seed_from_u64(3),
+    )
+    .unwrap();
+    assert_eq!(a.visits, b.visits);
+    assert_eq!(serde_json::to_string(&game).unwrap(), before);
 }
 
 #[test]

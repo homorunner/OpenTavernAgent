@@ -5,8 +5,8 @@ self-play. It is the Rust crate `crates/tavernagent` and the `tavernagent` binar
 on the `taverngym` crate directly and needs no Python. Checkpoints are numpy-readable `.npz`
 files, so weights stay inspectable from Python.
 
-The current model has **877,878 parameters**: a policy head and a value head. Weights are
-model format v5; the search protocol is `ended-state-v3`.
+The current model has **867,845 parameters**: a policy head and a value head. Weights are
+model format v7; the search protocol is `ended-state-v8-no-move`.
 
 ## Commands
 
@@ -49,9 +49,14 @@ Results do not depend on the thread count.
 ```
 1713 numeric features + 69 card slots x 16-dim shared card embedding
   -> 192 -> 6 residual blocks  h <- h + GELU(LN(W h))
-  -> 245 policy logits (masked softmax) / tanh value
+  -> 196 policy logits (masked softmax) / tanh value
 ```
 
+- The policy head covers the engine's action layout **without the trailing Move block**
+  (`net::N_ACTIONS = A_MOVE = 196`, the engine has 245). Warband ordering is left to a
+  separate model; this network never predicts, searches or trains on a Move, and
+  `agent_mask` truncates the engine's mask to the 196 agent actions (all lower indices are
+  the engine's own).
 - The environment exposes 3,235 floats and 124 card indices; the network drops the 1,519
   historical-opponent-warband floats, the 49 historical warband card slots and three
   redundant global flags (hero selection, game over, the Tavern-wide freeze flag), keeping
@@ -113,8 +118,23 @@ alone, and that single bit is restored. Gold does not carry over, so ending a tu
 unspent Gold is always a wasted resource, and the early game converges faster when the policy
 cannot learn to stop with a full purse.
 
-- PUCT over all legal actions, unvisited actions at Q = 0. Default `--c-puct 1.9`; `--sims 64`
-  in evaluation, 256 in self-play.
+A second training rule in the same `agent_mask`: the agent may not Cancel. A target menu
+(a hand spell, a Hero Power, an Activate) or a Choose One the agent opened must be resolved by
+picking an option. The engine refuses to open a target menu with no target, so an option is
+always available; Cancel comes back only when it is the sole legal action (a paid trinket
+offer with nothing affordable). Without it the search treats open-menu / close-menu as a free
+no-op pair — `patterns` showed up to 49 consecutive `Play`/`Cancel` pairs in one turn,
+burning the action budget for nothing. The rule removes the agent's option to back out of a
+choice; the plugin's human player keeps it.
+
+Move is not a rule but an absence: it is outside the agent's action space altogether (see
+"Network and inputs"). Before that, `patterns` traces showed ~14.8k Move actions in 128
+games — pure board reordering the turn-horizon search cannot value, the other major no-op
+loop next to Play/Cancel.
+
+- PUCT over all legal actions. An unvisited action is valued at the parent's mean minus
+  `--fpu-reduction` (default 1.5; negative restores the old fixed Q = 0). Default
+  `--c-puct 1.9`; `--sims 64` in evaluation, 256 in self-play.
 - Self-play searches a `--search-prob 0.33` fraction of the decisions and records only those
   (visit distribution as the policy target); the other decisions sample the network prior at
   the play temperature and leave no training row, like KataGo's full/cheap search split.
@@ -175,7 +195,7 @@ decisions per round (about 28% of them) was removed.
 | `--noise` / `--noise-alpha` / `--end-explore` | 0.20 / 0.3 / 0.02 |
 | `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 1.0 / 1.0 |
 | `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 2 / 0.15 |
-| `--search-prob` | 0.33 |
+| `--search-prob` / `--fpu-reduction` | 0.33 / 1.5 |
 | `--hidden` / `--blocks` / `--embedding-dim` | 192 / 6 / 16 |
 | `--value-weight` | 0.5 |
 | `--weight-decay` / `--clip` / `--ema-rounds` | 0.01 / 5.0 / 2 |
@@ -236,6 +256,9 @@ below; the bot itself scores 4.60); Elo is a Plackett-Luce fit on eight-player l
   `--end-explore`); asking "stop now" in mid-turn is still extrapolation. `patterns`'
   `mean_gold_left` at End Turn measures this directly — under the must-spend rule it cannot
   exceed 2 by construction, so high-Gold endings are now unreachable rather than measured.
+- First-play urgency is a fixed reduction. TODO: KataGo's form, parent value minus
+  `c * sqrt(prior mass of the visited children)` with a smaller `c` at the root. The default
+  of 1 was chosen on evaluation alone; self-play with 1 has not been compared.
 - Policy, value and search gain are not evaluated separately; eight weak copies in
   self-play may give a thin learning signal early on.
 - Dynamic card counters, attached cards and persistent effects are not fully encoded
