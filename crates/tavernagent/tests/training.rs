@@ -39,6 +39,7 @@ fn batch() -> (Game, Sample) {
         mask: obs.mask,
         pi,
         z: 1.0,
+        weight: 1.0,
         action: -1,
     };
     (game, sample)
@@ -179,6 +180,7 @@ fn play_options(sims: usize, end_explore: f32) -> PlayOptions {
         end_explore,
         budgets: Budgets::default(),
         search_prob: 1.0,
+        split_turn: Vec::new(),
     }
 }
 
@@ -202,6 +204,18 @@ fn self_play_does_not_depend_on_the_search_pool() {
         assert_eq!(a.z, b.z);
         assert!(a.is_ended() || a.mask[a.action as usize]);
     }
+    let mut unreachable = opts.clone();
+    unreachable.split_turn = vec![u32::MAX];
+    assert_eq!(
+        play_one(&EndOrFirst, 31, &unreachable, Some(&single)).unwrap(),
+        global
+    );
+    let mut tree = opts;
+    tree.split_turn = vec![4, 8];
+    assert_eq!(
+        play_one(&EndOrFirst, 31, &tree, Some(&single)).unwrap(),
+        play_one(&EndOrFirst, 31, &tree, None).unwrap()
+    );
 }
 
 #[test]
@@ -309,6 +323,7 @@ fn full_trainer_snapshot_restores_optimizer_rng_and_replay_exactly() {
     let (game, decision) = batch();
     let mut end = ended_sample(&game, 0).unwrap();
     end.z = -0.5;
+    end.weight = 0.55;
     let hparams = OptimizerHparams {
         wd: 0.02,
         clip: 2.0,
@@ -436,6 +451,41 @@ fn full_trainer_snapshot_restores_optimizer_rng_and_replay_exactly() {
         .unwrap_err()
         .contains("incomplete replay window")
     );
+    let mut legacy = Npz::load(&path).unwrap();
+    for i in 0..2 {
+        legacy.arrays.remove(&format!("replay/{i}/weight"));
+    }
+    legacy.save(&wrong_path).unwrap();
+    assert!(
+        load_training_state(
+            &wrong_path,
+            &mut restored,
+            &mut rng2,
+            &mut replay_rng2,
+            Some(&mut restored_replay)
+        )
+        .unwrap_err()
+        .contains("incomplete replay window")
+    );
+    // Preserve the RNG's u128 integers verbatim (Value would round them via f64).
+    let meta = meta_text.replace("\"format\":7", "\"format\":6");
+    legacy.insert("metadata", tavernagent::npz::NpyArray::text(&meta));
+    legacy.save(&wrong_path).unwrap();
+    load_training_state(
+        &wrong_path,
+        &mut restored,
+        &mut rng2,
+        &mut replay_rng2,
+        Some(&mut restored_replay),
+    )
+    .unwrap();
+    assert!(
+        restored_replay
+            .rounds
+            .iter()
+            .flatten()
+            .all(|s| s.weight == 1.0)
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -496,6 +546,143 @@ fn training_resumes_exactly_across_the_replay_window() {
 }
 
 #[test]
+fn split_training_resumes_with_saved_schedule_and_weights() {
+    let dir = tmp("split-resume");
+    let args = |name: &str, steps| SelfplayArgs {
+        hidden: 16,
+        blocks: 1,
+        split_turn: vec![4, 8],
+        ..selfplay_args(dir.join(name), steps)
+    };
+    train::run(args("full.npz", 2), &HashSet::new()).unwrap();
+    train::run(args("split.npz", 1), &HashSet::new()).unwrap();
+    let mut resumed = args("ignored.npz", 2);
+    resumed.resume_state = Some(dir.join("split.trainer.npz"));
+    resumed.split_turn.clear(); // Not explicitly provided: inherit the saved 4,8.
+    train::run(
+        resumed,
+        &HashSet::from(["steps".into(), "resume_state".into()]),
+    )
+    .unwrap();
+    let a = Npz::load(&dir.join("full.trainer.npz")).unwrap();
+    let b = Npz::load(&dir.join("split.trainer.npz")).unwrap();
+    for (key, value) in &a.arrays {
+        if key != "metadata" {
+            assert_eq!(value, b.get(key).unwrap(), "{key}");
+        }
+    }
+    let meta = tavernagent::selfplay::read_training_meta(&dir.join("split.trainer.npz")).unwrap();
+    assert_eq!(meta.options["split_turn"], serde_json::json!([4, 8]));
+    let weights = b.get("replay/0/weight").unwrap().as_f32().unwrap();
+    assert!(weights.contains(&1.0) && weights.contains(&0.55) && weights.contains(&(0.55 * 0.55)));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn split_turn_cli_and_old_options() {
+    use clap::Parser;
+    use tavernagent::selfplay::validate_split_turns;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: SelfplayArgs,
+    }
+    assert_eq!(
+        Cli::try_parse_from(["test", "--split-turn", "4,8"])
+            .unwrap()
+            .args
+            .split_turn,
+        vec![4, 8]
+    );
+    assert!(
+        Cli::try_parse_from(["test"])
+            .unwrap()
+            .args
+            .split_turn
+            .is_empty()
+    );
+    assert!(Cli::try_parse_from(["test", "--split-turn", "4,no"]).is_err());
+    assert!(validate_split_turns(&[3, 6, 9]).is_ok());
+    for turns in [&[0][..], &[4, 4], &[8, 4]] {
+        assert!(validate_split_turns(turns).is_err());
+    }
+    let mut saved = serde_json::to_value(SelfplayArgs::default()).unwrap();
+    saved.as_object_mut().unwrap().remove("split_turn");
+    assert!(
+        serde_json::from_value::<SelfplayArgs>(saved)
+            .unwrap()
+            .split_turn
+            .is_empty()
+    );
+}
+
+#[test]
+fn weighted_losses_and_gradients_match_repeated_samples() {
+    let (game, mut first) = batch();
+    let action = first.mask.iter().position(|m| *m).unwrap();
+    first.action = action as i64;
+    let mut second = first.clone();
+    second.pi.fill(0.0);
+    second.pi[action] = 1.0;
+    second.z = -0.5;
+    second.weight = 0.5;
+    let mut end = ended_sample(&game, 0).unwrap();
+    end.z = 0.25;
+    end.weight = 0.5;
+    let run = |rows: &[&Sample]| {
+        let mut trainer = Trainer::new(
+            PolicyValueNet::new(
+                8,
+                NetConfig {
+                    hidden: 16,
+                    blocks: 1,
+                    ..small()
+                },
+            )
+            .unwrap(),
+            OptimizerHparams {
+                clip: 1000.0,
+                wd: 0.0,
+                ..Default::default()
+            },
+        );
+        let losses = trainer
+            .step(
+                rows,
+                0.0,
+                StepOptions {
+                    pg_weight: 0.3,
+                    smoothing: 0.05,
+                },
+            )
+            .unwrap();
+        (trainer, losses)
+    };
+    let (weighted, a) = run(&[&first, &second, &end]);
+    second.weight = 1.0;
+    end.weight = 1.0;
+    let (repeated, b) = run(&[&first, &first, &second, &end]);
+    assert!((a.0 - b.0).abs() < 1e-5 && (a.1 - b.1).abs() < 1e-5);
+    for (a, b) in weighted.m.tensors.iter().zip(&repeated.m.tensors) {
+        for (x, y) in a.data.iter().zip(&b.data) {
+            assert!((x - y).abs() < 1e-6, "{x} != {y}");
+        }
+    }
+    assert_eq!(weighted.last_metrics["sample_weight_sum"], 2.0);
+    assert_eq!(weighted.last_metrics["policy_sample_weight_sum"], 1.5);
+    let mut trainer = weighted;
+    for bad in [f32::NAN, f32::INFINITY, -0.1, 0.0] {
+        first.weight = bad;
+        assert!(
+            trainer
+                .step(&[&first], 0.0, StepOptions::default())
+                .unwrap_err()
+                .contains("weight")
+        );
+    }
+}
+
+#[test]
 fn training_step_does_not_depend_on_the_thread_count() {
     use tavernagent::selfplay::STEP_CHUNK_ROWS;
     // Several chunks' worth of rows from a few positions, so the chunked reduction runs.
@@ -516,6 +703,7 @@ fn training_step_does_not_depend_on_the_thread_count() {
             mask: obs.mask,
             pi,
             z: 1.0 - 2.0 * (seed % 8) as f32 / 7.0,
+            weight: 0.55f32.powi((seed % 3) as i32),
             action: -1,
         });
     }

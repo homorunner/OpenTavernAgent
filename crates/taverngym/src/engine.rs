@@ -70,6 +70,14 @@ pub struct CombatFrame {
     pub attacks: Vec<(EntityId, EntityId)>,
 }
 
+/// Driver-only pause at the entrance to combat. The action's remaining cleanup
+/// must run after combat, just as it does with ordinary `apply`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct CombatPause {
+    pub reached: bool,
+    pub action_cleanup: Option<(PlayerId, bool)>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Game {
     pub cfg: RulesConfig,
@@ -104,6 +112,8 @@ pub struct Game {
     /// A player's end of turn is resolving: no triples until the next turn start.
     #[serde(default)]
     pub ending_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) combat_pause: Option<CombatPause>,
     pub last_combats: Vec<CombatRecord>,
     /// Combats of this game that a simulator guard cut short (attack, effect-depth or
     /// death-loop limit): they end as ties, which is not a game rule. Counted so that
