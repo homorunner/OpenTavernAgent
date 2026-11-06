@@ -314,6 +314,9 @@ fn replay_window_evicts_old_rounds_and_draws_without_replacement() {
     assert_eq!(drawn, vec![3.0, 4.0, 5.0, 6.0]);
     assert_eq!(replay.draw(3, &mut rng).len(), 3);
     assert!((cosine_lr(0.001, 0.0001, 199, 100) - 0.0001).abs() < 1e-12);
+    for index in [0, 1, 199] {
+        assert_eq!(cosine_lr(0.001, 0.0001, index, 0), 0.001);
+    }
     assert!(ReplayWindow::new(0).is_err());
 }
 
@@ -594,8 +597,12 @@ fn split_turn_cli_and_old_options() {
             .split_turn,
         vec![4, 8]
     );
+    assert_eq!(
+        Cli::try_parse_from(["test"]).unwrap().args.split_turn,
+        vec![4]
+    );
     assert!(
-        Cli::try_parse_from(["test"])
+        Cli::try_parse_from(["test", "--split-turn", "--steps", "1"])
             .unwrap()
             .args
             .split_turn

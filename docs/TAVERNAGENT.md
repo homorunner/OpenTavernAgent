@@ -14,7 +14,8 @@ model format v7; the search protocol is `ended-state-v8-no-move`.
 cargo build --release -p tavernagent
 A=target/release/tavernagent
 
-# Train 100 rounds (128 games; a third of the decisions searched at 256 simulations by default).
+# Train 100 rounds (128 roots per round, binary split before turn-4 combat;
+# a third of decisions searched at 256 simulations; constant lr 3e-5).
 $A selfplay --steps 100 --workers 32 --save-trainer-state --save-every 50 --out runs/agent/model.npz
 
 # Continue exactly from the saved trainer state to round 200; saved options apply unless
@@ -82,10 +83,9 @@ Results do not depend on the thread count.
   forward: the weight matrices are kept as a bfloat16 copy (`linalg::Bf16Mat`, half the
   bytes, so the whole network stays in a core's L2 cache), products accumulate in f32 in a
   hand-written AVX-512 kernel that skips zero inputs (runtime-dispatched, with a portable
-  fallback), and GELU/SiLU use a clamped rational tanh. About 10 µs per evaluation against
-  33 µs for the exact f32 path; the deviation from the f32 network is tiny (max policy
-  probability difference ~4e-4, KL ~2e-7 on fresh weights). Training (`forward`/`backward`)
-  stays exact f32; `infer_f32` is the bit-identical reference path. The bfloat16 copy is
+  fallback), and GELU/SiLU use a clamped rational tanh. Precision error depends on the
+  trained weights and should be checked on trained checkpoints. Training
+  (`forward`/`backward`) stays f32; `infer_f32` is the reference inference path. The bfloat16 copy is
   rebuilt lazily after `params_changed`, which `Trainer::step` calls.
 
 `--hidden`, `--blocks`, `--embedding-dim`, `--activation gelu|silu|relu`,
@@ -102,10 +102,11 @@ legal actions, evaluated by the same value head. The search therefore compares "
 position after more actions" with "the position actually handed to combat", instead of
 reusing a mid-turn value as the stopping value.
 
-Each simulation uses an exact clone of the game with a fresh random stream; distinct
-observable outcomes of one action (a Refresh, a Discover) become separate child nodes and
-the action edge aggregates their visits. The real game and its random stream are never
-touched.
+Each simulation starts from the same game state with a fresh random stream. Turn-horizon
+search reuses a working copy and rewinds recruit-state changes between simulations,
+falling back to a full clone when necessary. Distinct observable outcomes of one action
+(a Refresh, a Discover) become separate child nodes, and the action edge aggregates their
+visits. The real game and its random stream are never touched.
 
 The agent also plays under a must-spend rule (`mcts::MUST_SPEND_GOLD = 3`): a seat holding
 at least 3 Gold may not end its turn, full stop. This is a training rule, not a game rule —
@@ -128,21 +129,21 @@ burning the action budget for nothing. The rule removes the agent's option to ba
 choice; the plugin's human player keeps it.
 
 Move is not a rule but an absence: it is outside the agent's action space altogether (see
-"Network and inputs"). Before that, `patterns` traces showed ~14.8k Move actions in 128
-games — pure board reordering the turn-horizon search cannot value, the other major no-op
-loop next to Play/Cancel.
+"Network and inputs").
 
 - PUCT over all legal actions. An unvisited action is valued at the parent's mean minus
   `--fpu-reduction` (default 1.5; negative restores the old fixed Q = 0). Default
-  `--c-puct 1.9`; `--sims 64` in evaluation, 256 in self-play.
+  `--c-puct 1.9`; `eval` defaults to 48 simulations and self-play to 256. The recorded
+  primary evaluations explicitly used `--sims 64 --c-puct 1.5`.
 - Self-play searches a `--search-prob 0.33` fraction of the decisions and records only those
   (visit distribution as the policy target); the other decisions sample the network prior at
   the play temperature and leave no training row, like KataGo's full/cheap search split.
   Ended positions are recorded for every End Turn either way.
-- The played action (evaluation, and self-play at temperature 0) is chosen by LCB after
-  KataGo: among root actions with at least `--lcb-min-visit-prop 0.15` of the top visit
-  count, the highest `Q - k * stdev(Q)` wins (`--lcb-stdevs 2`; 0 restores the plain visit
-  argmax, ties: lowest index). Search protocol `ended-state-v4-lcb`.
+- The played action (evaluation, and self-play at temperature 0) defaults to the most
+  visited root action (`--lcb-stdevs 0`, ties: lowest index). Optional LCB selection uses
+  the highest `Q - k * stdev(Q)` among actions with at least `--lcb-min-visit-prop 0.15`
+  of the top visit count. Positive-temperature self-play samples the visit distribution
+  instead, so LCB does not affect training at the default temperature of 1.
 - Self-play raises the root prior to `1 / --root-temperature` (1.1) and mixes Dirichlet
   noise into it (`--noise 0.20`, `--noise-alpha 0.3`); evaluation does neither.
 - Per-turn host budgets (100 actions, 10 Moves, 5 Freeze presses) are enforced by the
@@ -150,20 +151,21 @@ loop next to Play/Cancel.
   The network does not see them.
 - `--horizon game` advances the other seats with the scripted bot using hidden state; it is
   an experimental full-information mode only.
-- One 64-simulation decision takes about 23 µs per simulation on one core, of which roughly
-  10 µs is the network; the rest is the game copy, the action, the observation and the tree.
+- Use `bench` to measure inference and search latency on the target machine; costs depend
+  on the checkpoint, search budget, CPU instruction set and position.
 
 ## Training
 
-All eight seats play the current network. Every decision records the observation, legal
+All eight seats play the current network. Every searched decision records the observation, legal
 mask, root visit distribution, the action played and the final placement reward
 `1 - 2 (placement - 1) / 7`. Each End Turn also records the ended position
 (`end_turn_effects` on a copy): no policy target, the same value label. `--end-explore`
 (0.02) forces End Turn with a small probability so that ended positions with unspent Gold
 also appear; the search distribution stays the policy target.
 
-**Tree rollouts.** `selfplay --split-turn "4,8"` splits each root into two continuations
-after turn 4 and each surviving continuation into two after turn 8. A split happens
+**Tree rollouts.** Self-play defaults to `--split-turn 4`: each root splits once into
+two continuations after turn 4. `selfplay --split-turn "4,8"` splits each root into two
+continuations after turn 4 and each surviving continuation into two after turn 8. A split happens
 after all seats' end-of-turn effects and recruit eliminations, immediately before combat:
 that turn's combat is already independent in the children. Both environment and policy/search
 random streams are reseeded deterministically per child. The shared prefix is stored once;
@@ -183,29 +185,28 @@ roots, and reported placement averages subtree returns per root. Replay draws re
 uniform over stored rows; loss weighting applies after the draw. Collection cost and
 replay size grow with the continuations, while `--max-samples` still bounds each epoch's
 training draw. Splits execute depth first within each root, retaining parallel seat
-searches and parallel roots. Omit the option for ordinary rollouts; turns must be positive,
-unique and increasing (for example `--split-turn "3,6,9"`).
+searches and parallel roots. Pass `--split-turn` without values for ordinary rollouts;
+turns must be positive, unique and increasing (for example `--split-turn "3,6,9"`).
 
 **Loss.** Policy cross-entropy against the (smoothed, `--policy-smoothing 0.05`) visit
 distribution, normalized by the sum of weights of rows with legal actions; `--value-weight`
 (0.5) times value MSE normalized by the sum of all row weights. Optional `--pg-weight` adds
 a REINFORCE term with the same policy row weights and the value as baseline. AdamW (decay on
-weight matrices only), global gradient-norm clipping, cosine learning-rate schedule.
+weight matrices only), global gradient-norm clipping, and a constant learning rate by
+default (`--lr 3e-5 --lr-decay-steps 0`). Set a positive `--lr-decay-steps` and a lower
+`--lr-min` to enable cosine decay; `--lr-min` is unused when decay is disabled.
 
 **Parallel step.** A minibatch is processed in fixed chunks of `STEP_CHUNK_ROWS` (32) rows,
 each running the forward and backward pass on its own thread (rayon); chunk gradients are
 summed in chunk order and the gradient reduction and the AdamW/EMA update are split over
 the parameter vector. The chunk size is a constant, so results do not depend on the number
-of threads (`tests/training.rs` checks one against seven threads bit for bit). A 512-row
-step takes about 12 ms on eight cores against 50 ms single-threaded; the elementwise code
-(tanh, LayerNorm, assembling inputs, the optimizer) dominated, not the matrix products.
+of threads (`tests/training.rs` checks one against seven threads bit for bit). Compare
+`train_seconds` and optimizer updates alongside placement when changing batch size.
 
-**Data.** Every decision of a round (about 200,000-240,000 from 128 games; the count grows
-as the policy takes more actions per turn) enters a replay window of `--replay-rounds` (3)
-rounds; nothing is discarded at collection. Each epoch (`--epochs 1`) trains on a uniform
-draw of `--max-samples` (196,608) from the window, so a sample is used about once on
-average over its three rounds in the window. The per-game cap that used to keep 65,536
-decisions per round (about 28% of them) was removed.
+**Data.** Every recorded search decision and ended position enters a replay window of
+`--replay-rounds` (3) rounds. Each epoch (`--epochs 1`) trains on a uniform draw of
+`--max-samples` (65,536) from the window. Tree rollouts add rows without increasing this
+training cap, so they also change the average reuse of a row at the same epoch count.
 
 **EMA.** An EMA copy of the weights is updated every minibatch with a decay derived from
 `--ema-rounds` (2): `1 - 1 / (ema_rounds x updates per round)`, warmed up as
@@ -216,97 +217,77 @@ decisions per round (about 28% of them) was removed.
 | `--steps` / `--games` | 200 / 128 |
 | `--sims` / `--c-puct` | 256 / 1.9 |
 | `--replay-rounds` / `--epochs` / `--max-samples` / `--batch` | 3 / 1 / 65,536 / 512 |
-| `--lr` / `--lr-min` / `--lr-decay-steps` | 3e-4 / 3e-5 / 200 |
+| `--lr` / `--lr-min` / `--lr-decay-steps` | 3e-5 / 3e-5 (unused without decay) / 0 (constant) |
 | `--noise` / `--noise-alpha` / `--end-explore` | 0.20 / 0.3 / 0.02 |
 | `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 1.0 / 1.0 |
-| `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 2 / 0.15 |
+| `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 0 / 0.15 |
 | `--search-prob` / `--fpu-reduction` | 0.33 / 1.5 |
-| `--split-turn` | none (ordinary rollout) |
+| `--split-turn` | 4 (one binary split) |
 | `--hidden` / `--blocks` / `--embedding-dim` | 192 / 6 / 16 |
 | `--value-weight` | 0.5 |
 | `--weight-decay` / `--clip` / `--ema-rounds` | 0.01 / 5.0 / 2 |
 
 `--save-trainer-state` writes the network, AdamW moments, EMA, RNG states, history, options
-and the **whole replay window** to `<out>.trainer.npz` after every round (about 6 GB at the
-defaults, 9 KB per stored decision); `--save-every N` keeps immutable `<out>.stepN.npz` / `.ema.npz` / `.trainer.npz`.
+and the **whole replay window** to `<out>.trainer.npz` after every round. Snapshot size
+depends on the number of stored rows, including tree continuations; `--save-every N` keeps
+immutable `<out>.stepN.npz` / `.ema.npz` / `.trainer.npz`.
 `--resume-state` restores all of it bit-exactly (a smaller `--replay-rounds` keeps the newest
 rounds); `--resume` loads weights only. `<out>.history.json` records per-round losses,
-gradient norms, entropies, target KL, the ended sample counts and timings.
+gradient norms, entropies, target KL, the ended sample counts and timings. Losses and
+per-epoch metrics currently describe the last training epoch, not an independent
+validation set; `samples` counts that epoch's draw, not the total across all epochs.
 Trainer format 7 also stores each replay row's weight; format 6 snapshots load with unit
-weights. Saved split turns are inherited on resume unless explicitly overridden. The
-multiplier is recorded as `split_sample_weight` in `<out>.config.json`; history includes
+weights. Saved split turns are inherited on resume unless explicitly overridden; old
+snapshots without this option keep ordinary rollouts. The multiplier is recorded as
+`split_sample_weight` in `<out>.config.json`; history includes
 `sample_weight_sum` and `policy_sample_weight_sum` alongside the raw sample counts.
 
-## Experiments so far
+## Recent results (2026-11-06)
 
-Settings: 128 games and 64 simulations per round, batch 512. Placement is the mean final
-placement of seat 0 against seven scripted bots over 1,024 paired seeds (2,048 for the runs
-below; the bot itself scores 4.60); Elo is a Plackett-Luce fit on eight-player leagues.
+After the FPU correction, both cohorts used 128 games/round, 256 search simulations,
+batch 512, max-samples 65,536, seed 444444444, constant learning rates and no rollout
+splitting. E1 used one epoch, replay 3 and FPU=1.0; e2 used two epochs, replay 5 and
+FPU=1.5, so their differences cannot be attributed to epochs alone. EMA placement against
+seven scripted bots over 2,048 shared seeds (64 simulations, c-puct=1.5, LCB=2 and each
+run's FPU setting; lower is better):
 
-- **`c_puct` at 200 rounds is noise.** Two seeds ranked 1.3/1.5/1.7/1.9 in opposite orders.
-  At 1,000 rounds (3e-4 with a 200-round cosine, then 3e-5) 1.9 led: placement 2.71 vs
-  2.78 (1.5), 2.91 (1.3), 3.05 (1.7); in a 16,000-game league of the 100-round checkpoints
-  1.9 was ahead from round 300 on (+146 Elo at 1,000 vs +124 for 1.5), hence the default.
-- **Every run was still improving at 1,000 rounds**; all 1,000-round checkpoints beat all
-  500-round ones.
-- **The learning rate matters far more.** With a 1,000-round cosine, 6e-4 and 1.2e-3 fell
-  below the bot for the first 400 rounds (placement 5.6 and 7.1 at round 200) and never
-  caught up; 1.5e-4 was stable but slow. The best run so far spent 800 of its 1,000 rounds
-  at 3e-5, which suggests the useful learning rate is small; lower peaks are being tested.
-- **A 1,000-round cosine at 3e-4 is worse than annealing by round 200 and staying at 3e-5.**
-  Both are about 1.8 placements better than the bot (2.71 and 2.81 against 4.60), but in a
-  4,096-game paired arena the 200-round anneal wins by 24 Elo (network) and 18 Elo (EMA),
-  95% CI [20, 29] and [13, 23] -- the placement difference between them is not significant
-  on its own.
-- **5,000 rounds, four seeds, 200-round anneal.** All four seeds still gained between 4,000
-  and 5,000 rounds except the best one, which is flat from 4,000 on. Network placement at
-  round 5,000 against the bots is 1.88 (seed 444444), 2.07 (333333), 2.11 (111111) and 2.13
-  (222222). A 6,000-game league of the 20 EMA checkpoints (every 1,000 rounds, all four
-  seeds, about 2,400 games each) gives, in Elo:
+| Run / learning rate | 500 | 1000 | 1500 | 2000 | 2500 | 3000 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| e1 / 3e-5 | 2.177 | 2.013 | 1.688 | 1.799 | 1.601 | — |
+| e1 / 1e-4 | 1.948 | 1.743 | 1.762 | 1.670 | 1.588 | 1.550 |
+| e2 / 3e-5 | 1.913 | 1.652 | 1.590 | — | — | — |
+| e2 / 1e-4 | 1.833 | 2.111 | 2.230 | — | — | — |
 
-  | seed | 1,000 | 2,000 | 3,000 | 4,000 | 5,000 | EMA placement at 5,000 |
-  | --- | --- | --- | --- | --- | --- | --- |
-  | 444444 | -35 | +28 | +54 | +90 | **+93** | 1.95 (EMA) |
-  | 333333 | -141 | -34 | +8 | +44 | +70 | 2.08 |
-  | 222222 | -95 | -15 | +15 | +40 | +48 | 2.19 |
-  | 111111 | -96 | -81 | -40 | +5 | +44 | 2.10 |
+E1 stopped at round 2970 for lr=3e-5 and 3046 for lr=1e-4. Dashes indicate no completed
+evaluation; the last evaluated checkpoints were rounds 2500 and 3000 respectively.
 
-  Two things follow. The seed spread at round 5,000 is about 49 Elo, wider than the gap
-  between neighbouring checkpoints of one seed, so **one seed per configuration cannot rank
-  configurations** -- which is what the earlier sections do. And a seed that is last at
-  1,000 rounds ends third, so early rankings do not predict the final one.
-- **Placement against the bots saturates near 2.0.** The four final checkpoints are 1.88 to
-  2.13, inside two standard errors of each other (0.05 per checkpoint over 2,048 games);
-  only the league separates them. A 2,048-game evaluation resolves about 0.1 placements
-  (2 sigma); 1,024 games leave 0.06 per checkpoint and 0.11 on the difference of two.
+- **E1 kept improving after round 1500.** The 3e-5 run recovered from a dip at round 2000;
+  the 1e-4 run also improved, so the higher rate did not cause general regression.
+  At the same round 2500 their difference was only −0.013 placements (1e-4 minus 3e-5;
+  paired 95% CI [−0.075, 0.048]). The 1e-4 gain from 2500 to 3000 was also inconclusive
+  (−0.038, CI [−0.099, 0.024]); later progress was slower. Late replay value MSE stayed
+  near 0.25 in both runs despite improving placement.
+- **E2 was more sensitive to learning rate.** In 512-game arenas, the 3e-5 round-1500
+  model scored 64.3% against round 500, but only 52.1% against round 1000. At 1e-4,
+  round 1500 scored 47.6% against round 500. Scores compare cross-model placements,
+  not first-place rates.
+- **LCB hurt e2 evaluation.** On 1,024 paired seeds at 64 simulations, disabling LCB
+  improved round-1500 placement from 1.607 to 1.538 (3e-5), and 2.227 to 2.023 (1e-4).
+  Temperature-1 self-play does not use LCB action selection.
+- **E2 training loss was misleading at 1e-4.** From round 500 to 1500, replay value MSE fell
+  from 0.226 to 0.206 while MSE on fresh self-play rose from 0.246 to 0.268. Increasing
+  batch size should be tested alongside training intensity, not treated as a proven fix.
+
+Next comparison: batch 512/1024 × epochs 1/2, with lr=3e-5, LCB=0 and split-turn=4.
+Tree training benefits remain unmeasured. Older pre-FPU results are omitted; raw results
+and checkpoints are archived on `experiment` at
+`<workspace>/runs/archive/20261106/`.
 
 ## Open problems
 
-- Ended-position value labels come only from where the policy actually stopped (plus
-  `--end-explore`); asking "stop now" in mid-turn is still extrapolation. `patterns`'
-  `mean_gold_left` at End Turn measures this directly — under the must-spend rule it cannot
-  exceed 2 by construction, so high-Gold endings are now unreachable rather than measured.
-- First-play urgency is a fixed reduction. TODO: KataGo's form, parent value minus
-  `c * sqrt(prior mass of the visited children)` with a smaller `c` at the root. The default
-  of 1 was chosen on evaluation alone; self-play with 1 has not been compared.
-- Policy, value and search gain are not evaluated separately; eight weak copies in
-  self-play may give a thin learning signal early on.
-- Dynamic card counters, attached cards and persistent effects are not fully encoded
-  (`obs.rs` TODOs); opponents' historical warbands are not network inputs.
-- The input projection is per slot (70% of the parameters): the same card in two Tavern
-  slots uses different weights. A shared per-entity encoder would be the structural fix.
-
-## Code map
-
-| `crates/tavernagent/src/` | purpose |
-| --- | --- |
-| `net.rs`, `linalg.rs`, `npz.rs` | network and hand-written backward; matrices; numpy-compatible checkpoints |
-| `mcts.rs` | PUCT, per-simulation random streams, chance branches, End Turn to the ended state |
-| `selfplay.rs`, `train.rs` | self-play, AdamW/EMA, replay window, exact resume, the training loop |
-| `eval.rs`, `arena.rs`, `tournament.rs`, `league.rs` | evaluation against the bot and between checkpoints |
-| `probe.rs`, `patterns.rs`, `bench.rs`, `play.rs` | behaviour summaries, action traces, latency, games |
-| `heroes.rs`, `rules.rs` | hero selection outside the network; host action budgets |
-
-`cargo test --release -p tavernagent` covers gradients, input encoding, search boundaries,
-ended samples, replay persistence and exact resume. `tools/league_elo.py`
-fits and plots league ratings.
+- Ended-position labels come from actual stopping states plus `--end-explore`. Scoring
+  hypothetical earlier stops remains extrapolation; fresh value validation is needed.
+- Search improvement under visit-count selection and the fixed FPU reduction needs
+  controlled comparisons. Tree splits also change sample counts, weights and data reuse.
+- The input projection is per slot: the same card in two Tavern slots uses different
+  weights. A shared per-entity encoder is an architecture experiment, not a validated fix.
