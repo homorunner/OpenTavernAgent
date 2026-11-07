@@ -182,7 +182,7 @@ def main():
                     replay_schedule='min(6, 3 + step // 200)',
                     scheduling='training-only NUMA lanes; evaluation and arenas on borrowed hosts',
                     work=str(a.work), archive=str(a.archive),
-                    evaluation='remote raw/EMA eval and six EMA arenas every 100 rounds; final matched-compute arenas',
+                    evaluation='remote raw/EMA eval every 100 rounds; pooled eight-player league with Plackett-Luce Elo',
                     matched_compute='sum of collect_seconds+train_seconds; excludes pauses, evaluation and checkpoint I/O',
                     limitation='One training seed: screening only; replicate winners before concluding depth is better.')
     manifest = json.loads(json.dumps(manifest))

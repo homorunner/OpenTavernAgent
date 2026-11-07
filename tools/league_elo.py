@@ -36,19 +36,19 @@ def plackett_luce(games, names, iters=500, tol=1e-9):
         order = sorted(range(len(models)), key=lambda s: places[s])
         rankings.append([index[models[s]] for s in order])
     n = len(names)
-    wins = np.zeros(n)
-    for r in rankings:
-        for m in r[:-1]:  # the last-placed model "wins" no stage
-            wins[m] += 1
+    # Group equal table sizes; full league tables have eight distinct models.
+    groups = [np.array([r for r in rankings if len(r)==k],dtype=int)
+              for k in sorted({len(r) for r in rankings})]
+    wins = sum((np.bincount(r[:,:-1].ravel(),minlength=n) for r in groups),np.zeros(n))
     gamma = np.ones(n)
     for _ in range(iters):
         denom = np.zeros(n)
-        for r in rankings:
-            # Stage t: the remaining set is r[t:], the chosen one r[t].
-            suffix = np.cumsum(gamma[r][::-1])[::-1]  # sum over r[t:]
-            for t in range(len(r) - 1):
-                inv = 1.0 / suffix[t]
-                denom[r[t:]] += inv
+        for r in groups:
+            suffix = np.cumsum(gamma[r][:,::-1],axis=1)[:,::-1]
+            inv=1.0/suffix
+            inv[:,-1]=0
+            exposure=np.cumsum(inv,axis=1)
+            denom+=np.bincount(r.ravel(),weights=exposure.ravel(),minlength=n)
         # A model never placed above anyone (or absent from a bootstrap sample) gets a
         # small floor instead of zero so the geometric mean stays defined.
         new = np.where(denom > 0, np.maximum(wins, 0.5) / np.maximum(denom, 1e-12), gamma)

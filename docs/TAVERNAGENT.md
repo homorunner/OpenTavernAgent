@@ -445,18 +445,19 @@ Each gets 128 physical cores on one NUMA node. This is a one-seed screening expe
 `tools/agent_depth_experiment.py` trains each depth independently to **3,000 rounds**,
 matching the previous overnight campaign, and archives checkpoints every **100 rounds**.
 Training nodes do no eval, Arena or behaviour probes. `tools/agent_remote_eval.py`
-queues raw/EMA eval and all six paired EMA arenas every 100 rounds on six borrowed
+queues raw/EMA eval every 100 rounds and an ongoing eight-player league on six borrowed
 64-core BF16-capable hosts. Each host runs one job at a time. Eval uses 512 games at
-round 100 and 2048 thereafter; Arena uses 512 seat-swapped games. Both use 64 simulations
-and fixed seeds. The final six arenas match cumulative sampling+training seconds.
+round 100 and 2048 thereafter. The league puts all raw/EMA checkpoints into one pool,
+shuffles them into eight-distinct-model tables and records full placements (64 simulations).
+`tools/league_elo.py` fits Plackett–Luce Elo-scale ratings, with whole-game bootstrap uncertainty.
+Paired Arena results are historical only and are excluded from league ratings.
 Training never waits for the evaluation queue.
 
 Queue state, results and PNG figures are mirrored locally in `runs/depth_remote_eval_20261107/`.
 Completed results are also published back to the training archive. Borrowed hosts receive
 only per-job `/tmp/tavernagent-depth-eval-*` directories; finally cleanup, an independent
 watchdog and post-job verification cover normal completion, failures and abandoned jobs.
-The 20-minute notification card includes placement curves and Arena score plots/matrices.
-Arena scores measure cross-team placement comparisons, not game win rates.
+The 20-minute notification card includes placement curves and pooled league Elo curves.
 
 Scratch/replay: `/tmp/tavernagent-depth-replay-20261107/`; durable results and latest resumable
 states: `<workspace>/runs/depth_replay_20261107/` on experiment.
@@ -480,7 +481,7 @@ weights, while current replay/optimizer/RNG state is retained for exact resume.
   pooling away warband order would discard strategically relevant information.
 
 Idle evaluation slots add independent 512-game seed batches to the latest checkpoints,
-up to 16,384 games per comparison. New checkpoint evaluations take priority at job
-boundaries. Reports pool all games; Arena uncertainty remains clustered by the two
-seat-swapped games per seed. Repeated monitoring uses descriptive 95% intervals,
+up to 16,384 eval games per checkpoint. Spare slots run 64-round league batches until
+each model has at least 16,384 seat appearances. New checkpoint evaluations take priority
+at job boundaries. Reports pool all games; league uncertainty resamples whole games. Repeated monitoring uses descriptive 95% intervals,
 not a sequential significance test. Cards show only progress, placement intervals and plots.

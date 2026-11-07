@@ -9,7 +9,7 @@ import unittest
 import uuid
 
 import agent_remote_job as remote
-from agent_remote_eval import jobs_for, STAGES, DEPTHS
+from agent_remote_eval import jobs_for, league_jobs, STAGES, DEPTHS
 
 
 class PlanningTests(unittest.TestCase):
@@ -18,15 +18,32 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(len(jobs_for(index)),1)
         index['checkpoints']['d8/model.step100.ema.npz']='path2'
         jobs=jobs_for(index)
-        self.assertEqual([j['kind'] for j in jobs].count('arena'),1)
+        self.assertEqual([j['kind'] for j in jobs].count('arena'),0)
         self.assertEqual([j['kind'] for j in jobs].count('eval'),2)
         index['checkpoints']={f'd{d}/model.step{s}{suffix}':'path'
             for d in DEPTHS for s in STAGES for suffix in ['.ema.npz','.npz']}
         index['matched']={'steps':{str(d):3000 for d in DEPTHS}}
         jobs=jobs_for(index)
-        self.assertEqual(len(jobs),426)
-        self.assertEqual(len({j['id'] for j in jobs}),426)
+        self.assertEqual(len(jobs),240)
+        self.assertEqual(len({j['id'] for j in jobs}),240)
         self.assertEqual({j['step'] for j in jobs if j['kind']=='eval'},set(range(100,3001,100)))
+
+    def test_league_uses_every_checkpoint_and_disjoint_batch_seeds(self):
+        index={'checkpoints':{f'd{d}/model.step100{suffix}':'path'
+            for d in DEPTHS for suffix in ['.ema.npz','.npz']}}
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs=league_jobs(index,Path(tmp),{},3)
+        self.assertEqual(len(jobs),3)
+        seeds=[]
+        for job in jobs:
+            self.assertEqual(job['kind'],'league')
+            self.assertEqual(len(job['inputs']),8)
+            args=job['args']
+            models=[args[i+1] for i,x in enumerate(args) if x=='--model']
+            self.assertEqual(len(set(models)),8)
+            self.assertEqual(args[args.index('--rounds')+1],'64')
+            seeds.append(args[args.index('--seed')+1])
+        self.assertEqual(len(set(seeds)),3)
 
 
 class BorrowedWorkspaceTests(unittest.TestCase):

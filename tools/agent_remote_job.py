@@ -84,7 +84,10 @@ env=dict(os.environ,RAYON_NUM_THREADS=str(job['workers']))
 start=time.monotonic()
 with open('command.log','w') as log:
  p=subprocess.run(['./tavernagent',*job['args']],env=env,stdout=log,stderr=subprocess.STDOUT)
-result=json.loads(pathlib.Path('result.json').read_text()) if p.returncode==0 else None
+result=None
+if p.returncode==0:
+ text=pathlib.Path('result.json').read_text()
+ result={'matches':[json.loads(line) for line in text.splitlines() if line.strip()]} if job['args'][0]=='league' else json.loads(text)
 print(json.dumps(dict(result=result,seconds=time.monotonic()-start,exit_code=p.returncode,
  log=pathlib.Path('command.log').read_text()[-12000:])),flush=True)
 sys.exit(p.returncode)

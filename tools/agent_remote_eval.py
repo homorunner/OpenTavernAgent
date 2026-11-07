@@ -57,7 +57,7 @@ for root in [work,archive]:
    if '.trainer.' in p.name: continue
    checkpoints[f'd{d}/{p.name}']=str(p)
 results={str(p.relative_to(archive)):str(p) for p in archive.glob('d*/eval_step*.json')}
-results.update({p.name:str(p) for p in archive.glob('arena_*.json')})
+results.update({p.name:str(p) for p in archive.glob('league_batch*.json')})
 status=json.loads((archive/'status.json').read_text())
 matched=json.loads((archive/'matched_compute.json').read_text()) if (archive/'matched_compute.json').exists() else None
 print(json.dumps(dict(manifest=m,checkpoints=checkpoints,results=results,status=status,matched=matched)))
@@ -78,24 +78,35 @@ def jobs_for(index):
                     relative=f'd{depth}/eval_step{step}_{variant}.json', inputs={'model.npz': name},
                     args=['eval', '--model', 'model.npz', '--games', str(512 if step == 100 else 2048),
                           '--sims', '64', '--seed', '61000000', '--no-baselines', '--out', 'result.json']))
-        for a, b in itertools.combinations(DEPTHS, 2):
-            inputs = {'a.npz': f'd{a}/model.step{step}.ema.npz', 'b.npz': f'd{b}/model.step{step}.ema.npz'}
-            if all(p in checkpoints for p in inputs.values()):
-                jobs.append(arena_job(f'step{step}_d{a}_d{b}', inputs, step))
-    if index.get('matched'):
-        steps = index['matched']['steps']
-        for a, b in itertools.combinations(DEPTHS, 2):
-            inputs = {'a.npz': f'd{a}/model.step{steps[str(a)]}.ema.npz',
-                      'b.npz': f'd{b}/model.step{steps[str(b)]}.ema.npz'}
-            if all(p in checkpoints for p in inputs.values()):
-                jobs.append(arena_job(f'matched_compute_d{a}_d{b}', inputs, STAGES[-1]+1))
     return jobs
 
 
-def arena_job(label, inputs, step):
-    return dict(id='arena_'+label, kind='arena', step=step, relative=f'arena_{label}.json', inputs=inputs,
-                args=['arena', '--a', 'a.npz', '--b', 'b.npz', '--games', '512', '--sims', '64',
-                      '--seed', '71000000', '--out', 'result.json'])
+def league_jobs(index, root, active, count):
+    checkpoints = dict(sorted(index['checkpoints'].items()))
+    if len(checkpoints)<8:
+        return []
+    files=list((root/'results').glob('league_batch*.json'))
+    completed=[int(p.stem.removeprefix('league_batch')) for p in files]
+    running=[int(j['id'].removeprefix('league_batch')) for j,_ in active.values() if j['kind']=='league']
+    first=max(completed+running+[0])+1
+    inputs={f'm{i}.npz':name for i,name in enumerate(checkpoints)}
+    specs=[]
+    for alias,name in inputs.items():
+        depth,filename=name.split('/')
+        step=filename.split('step')[1].split('.')[0]
+        variant='ema' if '.ema.' in filename else 'raw'
+        specs += ['--model',f'{depth}_{variant}_s{step}={alias}']
+    counts={spec.split('=')[0]:0 for spec in specs[1::2]}
+    for path in files:
+        for game in json.loads(path.read_text())['matches']:
+            for name in game['models']:
+                if name in counts: counts[name]+=1
+    if counts and min(counts.values())>=16384:
+        return []
+    return [dict(id=f'league_batch{i:06d}',kind='league',step=0,inputs=inputs,
+                 relative=f'league_batch{i:06d}.json',args=['league',*specs,'--rounds','64',
+                 '--sims','64','--seed',str(81000000+i*1000000),'--out','result.json'])
+            for i in range(first,first+count)]
 
 
 def main():
@@ -112,7 +123,7 @@ def main():
     hosts = json.loads(a.hosts.read_text())
     if not hosts or len({h['host'] for h in hosts}) != len(hosts):
         p.error('Hosts must be nonempty and unique')
-    total = len(STAGES)*(len(DEPTHS)*2+6)+6
+    total = len(STAGES)*len(DEPTHS)*2
     binary = a.root/'tavernagent'
     first = snapshot(a.source, a.archive)
     digest = first['manifest']['binary_sha256']
@@ -191,8 +202,12 @@ def main():
             ready = [j for j in planned if j['id'] not in busy_jobs
                      and not complete(a.root/'results'/j['relative']) and retry_at.get(j['id'], 0) <= now]
             if not ready and not a.once:
-                ready=extras(planned,a.root,busy_jobs,complete)
-                ready=[j for j in ready if retry_at.get(j['id'],0)<=now]
+                extra=[j for j in extras(planned,a.root,busy_jobs,complete) if retry_at.get(j['id'],0)<=now]
+                league=league_jobs(index,a.root,active,len(hosts))
+                ready=[]
+                for i in range(max(len(extra),len(league))):
+                    if i<len(league): ready.append(league[i])
+                    if i<len(extra): ready.append(extra[i])
             for host in hosts:
                 if not ready or host['host'] in busy_hosts or host['host'] in quarantined:
                     continue
@@ -223,6 +238,11 @@ def main():
                     index['results'][job['relative']] = str(Path(a.archive)/job['relative'])
                     published_hashes[job['relative']]=checksum
                 published += 1
+            for local in (a.root/'results').glob('league_batch*.json'):
+                checksum=hashlib.sha256(local.read_bytes()).hexdigest()
+                if published_hashes.get(local.name)!=checksum:
+                    publish(a.source,a.archive,local.name,local)
+                    published_hashes[local.name]=checksum
             finished = published == total and not active
             state = dict(state='complete' if finished else 'running', updated=time.time(),
                 completed=published, total=total, available=len(planned), failed=failures,

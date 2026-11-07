@@ -58,53 +58,48 @@ def render(root, out):
     fig.savefig(eval_path, dpi=160)
     plt.close(fig)
 
-    fig, (trend, heat) = plt.subplots(1,2,figsize=(13,5.5),gridspec_kw={'width_ratios':[1.55,1]},layout='constrained')
-    stages = {}
-    for pair_index,(a,b) in enumerate(itertools.combinations(DEPTHS,2)):
-        rows=[]
-        for path in root.glob(f'arena_step*_d{a}_d{b}.json'):
-            result=read(path)
-            if result:
-                step=int(re.search(r'step(\d+)',path.name)[1])
-                rows.append((step,result['score'],*result['ci95']))
-                stages.setdefault(step,{})[(a,b)]=result
-        rows.sort()
-        if rows:
-            x,y,lo,hi=np.array(rows).T
-            trend.errorbar(x,y*100,yerr=np.array([y-lo,hi-y])*100,marker='o',capsize=2,color=f'C{pair_index}',label=f'{a} vs {b}')
-    trend.axhline(50,color='#64748b',ls=':',linewidth=1)
-    trend.set(title='Paired Arena scores',xlabel='Training round',ylabel='First model score (%)',ylim=(0,100))
-    trend.grid(alpha=.2)
-    trend.set_xlim(0,max(stages,default=100)+100)
-    if stages:
-        trend.legend(ncol=2,fontsize=9)
-        # Prefer the latest full comparison so cells refer to one common round.
-        full=[s for s,pairs in stages.items() if len(pairs)==6]
-        step=max(full or stages)
-        pairs=stages[step]
-        matrix=np.full((4,4),np.nan)
-        np.fill_diagonal(matrix,50)
-        for (a,b),r in pairs.items():
-            i,j=DEPTHS.index(a),DEPTHS.index(b)
-            matrix[i,j]=r['score']*100
-            matrix[j,i]=(1-r['score'])*100
-        cmap=plt.get_cmap('RdYlGn').copy()
-        cmap.set_bad('#e5e7eb')
-        heat.imshow(matrix,vmin=0,vmax=100,cmap=cmap)
-        for i in range(4):
-            for j in range(4):
-                label='—' if i==j or np.isnan(matrix[i,j]) else f'{matrix[i,j]:.1f}%'
-                heat.text(j,i,label,ha='center',va='center',fontsize=11)
-        heat.set(title=f'Round {step} | {len(pairs)}/6 pairs',xticks=range(4),yticks=range(4),
-                 xticklabels=DEPTHS,yticklabels=DEPTHS,xlabel='Opponent blocks',ylabel='Row model blocks')
+    import importlib.util
+    spec=importlib.util.spec_from_file_location("league_ratings",Path(__file__).with_name("league_elo.py"))
+    module=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    plackett_luce=module.plackett_luce
+    games=[]
+    for path in sorted(root.glob('league_batch*.json')):
+        result=read(path)
+        if result:
+            games.extend((r['models'],r['placements']) for r in result['matches'])
+    fig,ax=plt.subplots(figsize=(11,6),layout='constrained')
+    if games:
+        names=sorted({name for models,_ in games for name in models})
+        elo=plackett_luce(games,names)
+        rng=np.random.default_rng(0)
+        boots=[plackett_luce([games[i] for i in rng.integers(len(games),size=len(games))],names,iters=100) for _ in range(32)]
+        se=np.std(boots,axis=0,ddof=1)
+        groups={}
+        counts={name:sum(models.count(name) for models,_ in games) for name in names}
+        ratings={}
+        for name,value,error in zip(names,elo,se):
+            run,step=name.rsplit('_s',1)
+            groups.setdefault(run,[]).append((int(step),value,error))
+            ratings[name]=dict(elo=float(value),se=float(error),games=counts[name])
+        for run,points in sorted(groups.items()):
+            points.sort();x,y,e=np.array(points).T
+            depth=int(run.split('_')[0][1:]); variant=run.split('_')[1]
+            ax.errorbar(x,y,yerr=1.96*e,color=COLORS[DEPTHS.index(depth)],
+                ls='-' if variant=='ema' else '--',marker='o',capsize=3,
+                alpha=1 if variant=='ema' else .45,label=run)
+        ax.legend(ncol=2,fontsize=9)
+        ax.set_title(f'Eight-player league | {len(names)} models | {len(games)} games')
+        (out/'elo.json').write_text(json.dumps(ratings,indent=2))
     else:
-        heat.axis('off')
-        heat.text(.5,.5,'Awaiting paired Arena results',ha='center',transform=heat.transAxes)
-    fig.suptitle('Arena: cross-team placement score, not game win rate | Pooled independent seeds with seat swaps | 95% CI',fontsize=10)
-    arena_path=out/'arena.png'
-    fig.savefig(arena_path,dpi=160)
+        ax.text(.5,.5,'Awaiting eight-player league results',ha='center',transform=ax.transAxes)
+    ax.set(xlabel='Training round',ylabel='Elo (Plackett-Luce, pool mean = 0)')
+    ax.grid(alpha=.2)
+    fig.suptitle('All checkpoints share one pool | Random eight-player tables | Game-bootstrap 95% intervals',fontsize=10)
+    league_path=out/'elo.png'
+    fig.savefig(league_path,dpi=160)
     plt.close(fig)
-    return [eval_path,arena_path]
+    return [eval_path,league_path]
 
 
 if __name__ == '__main__':
