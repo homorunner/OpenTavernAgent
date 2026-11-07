@@ -10,7 +10,7 @@ use rand_pcg::Pcg64Mcg;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::mcts::{self, Horizon, SearchOptions};
+use crate::mcts::{self, SearchOptions};
 use crate::net::{self, Activation, NetConfig, PolicyValueNet};
 use crate::probe;
 use crate::rules::Budgets;
@@ -38,7 +38,6 @@ pub struct SelfplayArgs {
     /// Binary splits after these turns' end effects, before combat (e.g. 4,8).
     /// Pass --split-turn without values to disable splitting.
     #[arg(long, value_delimiter = ',', num_args = 0.., default_value = "4")]
-    #[serde(default)]
     pub split_turn: Vec<u32>,
     /// Training passes per round; each draws `max_samples` from the replay window.
     #[arg(long, default_value_t = 2)]
@@ -61,8 +60,6 @@ pub struct SelfplayArgs {
     #[command(flatten)]
     #[serde(flatten)]
     pub budgets: Budgets,
-    #[arg(long, default_value = "turn", value_parser = Horizon::parse)]
-    pub horizon: Horizon,
     #[arg(long, default_value_t = 1.1)]
     pub root_temperature: f32,
     #[arg(long, default_value_t = 0.5)]
@@ -246,12 +243,9 @@ impl SelfplayArgs {
         let (Some(map), Some(cur)) = (merged.as_object_mut(), current.as_object()) else {
             return Err("saved options are not an object".into());
         };
-        // Snapshots predating tree rollouts used ordinary games. A new CLI default
-        // must not change their rollout semantics unless explicitly requested.
-        map.entry("split_turn").or_insert_with(|| json!([]));
         for (key, value) in cur {
             let forced = matches!(key.as_str(), "steps" | "resume" | "resume_state");
-            if forced || provided.contains(key) || !map.contains_key(key) {
+            if forced || provided.contains(key) {
                 map.insert(key.clone(), value.clone());
             }
         }
@@ -393,7 +387,6 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
             search: SearchOptions {
                 sims: args.sims,
                 c_puct: args.c_puct,
-                horizon: args.horizon,
                 max_depth: mcts::MAX_DEPTH,
                 root_noise: args.noise,
                 noise_alpha: args.noise_alpha,
@@ -497,7 +490,6 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
                     &probe::ProbeOptions {
                         games: args.probe_games,
                         sims: args.sims,
-                        horizon: args.horizon,
                         c_puct: args.c_puct,
                         budgets: args.budgets,
                         seed: 9000,
@@ -599,10 +591,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_resume_keeps_unsplit_rollouts_unless_explicitly_overridden() {
+    fn resume_preserves_explicit_split_schedule_and_requires_complete_options() {
         let args = SelfplayArgs::default();
         let mut saved = serde_json::to_value(&args).unwrap();
-        saved.as_object_mut().unwrap().remove("split_turn");
+        saved["split_turn"] = json!([]);
         assert!(
             args.inherit(&saved, &HashSet::new())
                 .unwrap()
@@ -615,5 +607,7 @@ mod tests {
                 .split_turn,
             vec![4]
         );
+        saved.as_object_mut().unwrap().remove("split_turn");
+        assert!(args.inherit(&saved, &HashSet::new()).is_err());
     }
 }

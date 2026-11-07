@@ -1,4 +1,4 @@
-//! Where a turn-horizon search spends its time: per-simulation breakdown on the bench
+//! Where a search spends its time: per-simulation breakdown on the bench
 //! positions (clone/rewind, select, engine apply, observe+hash, net predict), plus how deep
 //! the simulations go. Run: `tavernagent_profile [sims] [games]`.
 use std::collections::HashMap;
@@ -57,7 +57,7 @@ fn positions(seed: u64, turns: &[u32]) -> Vec<(u32, Game)> {
     out
 }
 
-/// The search loop of `mcts::search`, horizon Turn, with timers; same tree logic.
+/// The search loop of `mcts::search` with timers; same tree logic.
 fn profiled_search(game: &Game, seat: usize, net: &PolicyValueNet, sims: usize, t: &mut T) {
     struct N {
         prior: Vec<f32>,

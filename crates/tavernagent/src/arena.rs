@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use taverngym::Game;
 
 use crate::heroes::select_heroes;
-use crate::mcts::{self, Horizon, SearchOptions};
+use crate::mcts::{self, SearchOptions};
 use crate::net::PolicyValueNet;
 use crate::rules::Budgets;
 use crate::selfplay::game_rng;
@@ -30,8 +30,6 @@ pub struct ArenaArgs {
     pub sims: usize,
     #[arg(long, default_value_t = 32)]
     pub workers: usize,
-    #[arg(long, default_value = "turn", value_parser = Horizon::parse)]
-    pub horizon: Horizon,
     #[arg(long, default_value_t = crate::mcts::DEFAULT_C_PUCT)]
     pub c_puct: f32,
     #[command(flatten)]
@@ -94,7 +92,6 @@ pub fn battle(args: &ArenaArgs) -> Result<Value, String> {
     let search = SearchOptions {
         sims: args.sims,
         c_puct: args.c_puct,
-        horizon: args.horizon,
         ..SearchOptions::default()
     };
     search.validate()?;
@@ -136,7 +133,7 @@ pub fn battle(args: &ArenaArgs) -> Result<Value, String> {
         "games": args.games,
         "seed_clusters": scores.len(),
         "sims": args.sims,
-        "horizon": args.horizon.name(),
+
         "c_puct": args.c_puct,
         "search_version": mcts::SEARCH_VERSION,
         "budgets": args.budgets,

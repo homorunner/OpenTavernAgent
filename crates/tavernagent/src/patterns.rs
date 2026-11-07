@@ -17,7 +17,7 @@ use taverngym::Game;
 use taverngym::actions::{A_BUY, N_SHOP};
 
 use crate::heroes::select_heroes;
-use crate::mcts::{self, A_END_TURN, Horizon, SearchOptions, bot_action, observe_seat};
+use crate::mcts::{self, A_END_TURN, SearchOptions, bot_action, observe_seat};
 use crate::net::PolicyValueNet;
 use crate::probe::family;
 use crate::rules::Budgets;
@@ -180,7 +180,6 @@ fn trace_game(
     let search = SearchOptions {
         sims: args.sims,
         c_puct: args.c_puct,
-        horizon: Horizon::Turn,
         root_noise: if selfplay { args.noise } else { 0.0 },
         noise_alpha: args.noise_alpha,
         ..SearchOptions::default()

@@ -5,7 +5,7 @@ use rand_pcg::Pcg64Mcg;
 use serde_json::Value;
 use tavernagent::heroes::select_heroes;
 use tavernagent::mcts::{
-    self, A_END_TURN, Evaluator, Horizon, MUST_SPEND_GOLD, Observation, SearchOptions, agent_mask,
+    self, A_END_TURN, Evaluator, MUST_SPEND_GOLD, Observation, SearchOptions, agent_mask,
     observe_seat, reseeded, rewind_turn,
 };
 use tavernagent::net::{ENDED_TURN_FEATURE, N_ACTIONS, input_feature_indices};
@@ -61,10 +61,9 @@ impl Evaluator for SingleAction {
     }
 }
 
-fn opts(sims: usize, horizon: Horizon) -> SearchOptions {
+fn opts(sims: usize) -> SearchOptions {
     SearchOptions {
         sims,
-        horizon,
         keep_games: true,
         ..SearchOptions::default()
     }
@@ -302,7 +301,7 @@ fn rewind_turn_falls_back_to_a_full_copy_when_the_seat_died() {
         &game,
         0,
         &SingleAction(A_HERO_POWER),
-        &opts(32, Horizon::Turn),
+        &opts(32),
         &mut Pcg64Mcg::seed_from_u64(3),
     )
     .unwrap();
@@ -310,7 +309,7 @@ fn rewind_turn_falls_back_to_a_full_copy_when_the_seat_died() {
         &game,
         0,
         &SingleAction(A_HERO_POWER),
-        &opts(32, Horizon::Turn),
+        &opts(32),
         &mut Pcg64Mcg::seed_from_u64(3),
     )
     .unwrap();
@@ -320,39 +319,37 @@ fn rewind_turn_falls_back_to_a_full_copy_when_the_seat_died() {
 
 #[test]
 fn search_is_independent_of_the_real_rng_and_does_not_mutate_the_game() {
-    for horizon in [Horizon::Turn, Horizon::Game] {
-        let game = position(19);
-        let other = reseeded(&game, 987_654_321);
-        let before = serde_json::to_string(&game).unwrap();
-        let a = mcts::search(
-            &game,
-            0,
-            &SingleAction(1),
-            &opts(24, horizon),
-            &mut Pcg64Mcg::seed_from_u64(1),
-        )
-        .unwrap();
-        let b = mcts::search(
-            &other,
-            0,
-            &SingleAction(1),
-            &opts(24, horizon),
-            &mut Pcg64Mcg::seed_from_u64(1),
-        )
-        .unwrap();
-        assert_eq!(a.visits, b.visits);
-        assert_eq!(a.root.cw, b.root.cw);
-        assert_eq!(serde_json::to_string(&game).unwrap(), before);
-        // The real next draw after a search is identical to an untouched snapshot's.
-        let mut game = game;
-        let mut reference: Game = serde_json::from_str(&before).unwrap();
-        game.apply_index(0, 1).unwrap();
-        reference.apply_index(0, 1).unwrap();
-        assert_eq!(
-            serde_json::to_string(&game).unwrap(),
-            serde_json::to_string(&reference).unwrap()
-        );
-    }
+    let game = position(19);
+    let other = reseeded(&game, 987_654_321);
+    let before = serde_json::to_string(&game).unwrap();
+    let a = mcts::search(
+        &game,
+        0,
+        &SingleAction(1),
+        &opts(24),
+        &mut Pcg64Mcg::seed_from_u64(1),
+    )
+    .unwrap();
+    let b = mcts::search(
+        &other,
+        0,
+        &SingleAction(1),
+        &opts(24),
+        &mut Pcg64Mcg::seed_from_u64(1),
+    )
+    .unwrap();
+    assert_eq!(a.visits, b.visits);
+    assert_eq!(a.root.cw, b.root.cw);
+    assert_eq!(serde_json::to_string(&game).unwrap(), before);
+    // The real next draw after a search is identical to an untouched snapshot's.
+    let mut game = game;
+    let mut reference: Game = serde_json::from_str(&before).unwrap();
+    game.apply_index(0, 1).unwrap();
+    reference.apply_index(0, 1).unwrap();
+    assert_eq!(
+        serde_json::to_string(&game).unwrap(),
+        serde_json::to_string(&reference).unwrap()
+    );
 }
 
 #[test]
@@ -362,7 +359,7 @@ fn repeated_refresh_visits_sample_several_outcomes_on_one_edge() {
         &game,
         0,
         &SingleAction(1),
-        &opts(64, Horizon::Turn),
+        &opts(64),
         &mut Pcg64Mcg::seed_from_u64(123),
     )
     .unwrap();
@@ -384,7 +381,7 @@ fn deterministic_actions_reuse_nodes_despite_new_simulation_rng() {
         &game,
         0,
         &SingleAction(2),
-        &opts(12, Horizon::Turn),
+        &opts(12),
         &mut Pcg64Mcg::seed_from_u64(9),
     )
     .unwrap();
@@ -407,7 +404,7 @@ fn turn_search_ends_the_turn_without_fighting_or_advancing_other_seats() {
         &game,
         0,
         &SingleAction(A_END_TURN),
-        &opts(16, Horizon::Turn),
+        &opts(16),
         &mut Pcg64Mcg::seed_from_u64(2),
     )
     .unwrap();
@@ -444,7 +441,7 @@ fn turn_search_ends_the_turn_without_fighting_or_advancing_other_seats() {
         &game,
         0,
         &SingleAction(1),
-        &opts(16, Horizon::Turn),
+        &opts(16),
         &mut Pcg64Mcg::seed_from_u64(3),
     )
     .unwrap();
@@ -457,7 +454,7 @@ fn turn_search_ends_the_turn_without_fighting_or_advancing_other_seats() {
         &changed,
         0,
         &SingleAction(A_END_TURN),
-        &opts(16, Horizon::Turn),
+        &opts(16),
         &mut Pcg64Mcg::seed_from_u64(2),
     )
     .unwrap();

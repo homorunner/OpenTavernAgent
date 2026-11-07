@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use taverngym::{Action, Game};
 
 use crate::heroes::select_heroes;
-use crate::mcts::{self, Horizon, SearchOptions, bot_action};
+use crate::mcts::{self, SearchOptions, bot_action};
 use crate::net::PolicyValueNet;
 use crate::rules::Budgets;
 use crate::selfplay::game_rng;
@@ -19,7 +19,6 @@ use crate::selfplay::game_rng;
 pub struct ProbeOptions {
     pub games: usize,
     pub sims: usize,
-    pub horizon: Horizon,
     pub c_puct: f32,
     pub budgets: Budgets,
     pub seed: u64,
@@ -52,7 +51,6 @@ pub fn behaviour(net: &PolicyValueNet, opts: &ProbeOptions) -> Result<Behaviour,
     let search = SearchOptions {
         sims: opts.sims,
         c_puct: opts.c_puct,
-        horizon: opts.horizon,
         ..SearchOptions::default()
     };
     let per_game: Vec<Vec<(u32, String, i32)>> = (0..opts.games as u64)

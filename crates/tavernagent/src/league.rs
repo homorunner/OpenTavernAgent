@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use taverngym::Game;
 
 use crate::heroes::select_heroes;
-use crate::mcts::{self, Horizon, SearchOptions};
+use crate::mcts::{self, SearchOptions};
 use crate::net::PolicyValueNet;
 use crate::rules::Budgets;
 use crate::selfplay::game_rng;
@@ -35,8 +35,6 @@ pub struct LeagueArgs {
     pub sims: usize,
     #[arg(long, default_value_t = crate::mcts::DEFAULT_C_PUCT)]
     pub c_puct: f32,
-    #[arg(long, default_value = "turn", value_parser = Horizon::parse)]
-    pub horizon: Horizon,
     #[arg(long, default_value_t = 64)]
     pub workers: usize,
     #[command(flatten)]
@@ -81,7 +79,6 @@ pub fn run(args: LeagueArgs) -> Result<(), String> {
     let search = SearchOptions {
         sims: args.sims,
         c_puct: args.c_puct,
-        horizon: args.horizon,
         ..SearchOptions::default()
     };
     search.validate()?;
