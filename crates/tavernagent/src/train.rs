@@ -41,9 +41,9 @@ pub struct SelfplayArgs {
     #[serde(default)]
     pub split_turn: Vec<u32>,
     /// Training passes per round; each draws `max_samples` from the replay window.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 2)]
     pub epochs: usize,
-    #[arg(long, default_value_t = 3e-5)]
+    #[arg(long, default_value_t = 1e-4)]
     pub lr: f64,
     /// Final learning rate when --lr-decay-steps is positive; otherwise ignored.
     #[arg(long, default_value_t = 3e-5)]
@@ -65,10 +65,10 @@ pub struct SelfplayArgs {
     pub horizon: Horizon,
     #[arg(long, default_value_t = 1.1)]
     pub root_temperature: f32,
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 0.5)]
     pub temperature: f32,
     /// Temperature for the first `warm_steps` rounds.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 0.5)]
     pub temperature_warm: f32,
     #[arg(long, default_value_t = 5)]
     pub warm_steps: usize,
@@ -135,7 +135,7 @@ pub struct SelfplayArgs {
     #[arg(long)]
     pub resume: Option<PathBuf>,
     /// Self-play rounds kept in the replay window that training draws from.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 5)]
     pub replay_rounds: usize,
     /// Length of the cosine schedule in rounds (0 = constant learning rate).
     #[arg(long, default_value_t = 0)]

@@ -15,7 +15,7 @@ cargo build --release -p tavernagent
 A=target/release/tavernagent
 
 # Train 100 rounds (128 roots per round, binary split before turn-4 combat;
-# a third of decisions searched at 256 simulations; constant lr 3e-5).
+# a third of decisions searched at 256 simulations; 2 epochs, constant lr 1e-4).
 $A selfplay --steps 100 --workers 32 --save-trainer-state --save-every 50 --out runs/agent/model.npz
 
 # Continue exactly from the saved trainer state to round 200; saved options apply unless
@@ -143,7 +143,7 @@ Move is not a rule but an absence: it is outside the agent's action space altoge
   visited root action (`--lcb-stdevs 0`, ties: lowest index). Optional LCB selection uses
   the highest `Q - k * stdev(Q)` among actions with at least `--lcb-min-visit-prop 0.15`
   of the top visit count. Positive-temperature self-play samples the visit distribution
-  instead, so LCB does not affect training at the default temperature of 1.
+  instead, so LCB does not affect training at the default temperature of 0.5.
 - Self-play raises the root prior to `1 / --root-temperature` (1.1) and mixes Dirichlet
   noise into it (`--noise 0.20`, `--noise-alpha 0.3`); evaluation does neither.
 - Per-turn host budgets (100 actions, 10 Moves, 5 Freeze presses) are enforced by the
@@ -193,7 +193,7 @@ distribution, normalized by the sum of weights of rows with legal actions; `--va
 (0.5) times value MSE normalized by the sum of all row weights. Optional `--pg-weight` adds
 a REINFORCE term with the same policy row weights and the value as baseline. AdamW (decay on
 weight matrices only), global gradient-norm clipping, and a constant learning rate by
-default (`--lr 3e-5 --lr-decay-steps 0`). Set a positive `--lr-decay-steps` and a lower
+default (`--lr 1e-4 --lr-decay-steps 0`). Set a positive `--lr-decay-steps` and a lower
 `--lr-min` to enable cosine decay; `--lr-min` is unused when decay is disabled.
 
 **Parallel step.** A minibatch is processed in fixed chunks of `STEP_CHUNK_ROWS` (32) rows,
@@ -204,7 +204,7 @@ of threads (`tests/training.rs` checks one against seven threads bit for bit). C
 `train_seconds` and optimizer updates alongside placement when changing batch size.
 
 **Data.** Every recorded search decision and ended position enters a replay window of
-`--replay-rounds` (3) rounds. Each epoch (`--epochs 1`) trains on a uniform draw of
+`--replay-rounds` (5) rounds. Each epoch (`--epochs 2`) trains on a uniform draw of
 `--max-samples` (65,536) from the window. Tree rollouts add rows without increasing this
 training cap, so they also change the average reuse of a row at the same epoch count.
 
@@ -216,10 +216,10 @@ training cap, so they also change the average reuse of a row at the same epoch c
 | --- | --- |
 | `--steps` / `--games` | 200 / 128 |
 | `--sims` / `--c-puct` | 256 / 1.9 |
-| `--replay-rounds` / `--epochs` / `--max-samples` / `--batch` | 3 / 1 / 65,536 / 512 |
-| `--lr` / `--lr-min` / `--lr-decay-steps` | 3e-5 / 3e-5 (unused without decay) / 0 (constant) |
+| `--replay-rounds` / `--epochs` / `--max-samples` / `--batch` | 5 / 2 / 65,536 / 512 |
+| `--lr` / `--lr-min` / `--lr-decay-steps` | 1e-4 / 3e-5 (unused without decay) / 0 (constant) |
 | `--noise` / `--noise-alpha` / `--end-explore` | 0.20 / 0.3 / 0.02 |
-| `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 1.0 / 1.0 |
+| `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 0.5 / 0.5 |
 | `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 0 / 0.15 |
 | `--search-prob` / `--fpu-reduction` | 0.33 / 1.5 |
 | `--split-turn` | 4 (one binary split) |
@@ -242,7 +242,7 @@ snapshots without this option keep ordinary rollouts. The multiplier is recorded
 `split_sample_weight` in `<out>.config.json`; history includes
 `sample_weight_sum` and `policy_sample_weight_sum` alongside the raw sample counts.
 
-## Recent results (2026-11-06)
+## Recent results (2026-11-07)
 
 After the FPU correction, both cohorts used 128 games/round, 256 search simulations,
 batch 512, max-samples 65,536, seed 444444444, constant learning rates and no rollout
@@ -278,10 +278,125 @@ evaluation; the last evaluated checkpoints were rounds 2500 and 3000 respectivel
   from 0.226 to 0.206 while MSE on fresh self-play rose from 0.246 to 0.268. Increasing
   batch size should be tested alongside training intensity, not treated as a proven fix.
 
-Next comparison: batch 512/1024 × epochs 1/2, with lr=3e-5, LCB=0 and split-turn=4.
-Tree training benefits remain unmeasured. Older pre-FPU results are omitted; raw results
-and checkpoints are archived on `experiment` at
+Older pre-FPU results are omitted; raw results and checkpoints are archived on `experiment` at
 `/home/dsec/OpenTavernAgent/runs/archive/20261106/`.
+
+### Tree rollout / batch / epochs comparison (2026-11-06–07)
+
+Four runs on `experiment`, from commit `3eb0302` and identical initial weights:
+A = batch 512 / epochs 1, B = 1024 / 1, C = 512 / 2, D = 1024 / 2.
+All completed 3,000 rounds with 128 roots/round, split-turn=4 (child weight 0.55),
+256 simulations, 128 workers, replay 5, max-samples 65,536, constant lr=3e-5,
+temperature=1, FPU=1.5, LCB=0 and seed 444444444. Records live at
+`/home/dsec/OpenTavernAgent/runs/tree4_batch_epochs_20261106/`.
+
+**Data utilization decreased.** Early collection produces roughly 140k rows/round
+versus 78k without splitting, but each epoch still draws only 65,536 rows from replay.
+At fixed epochs, expected reuse per collected row is therefore about 44% lower in
+steady state; extra generated rows do not imply proportionally more training updates.
+E2 collection takes about 19 s/round versus 8 s previously, while gradient training
+remains about 1.7 s. These historical timings also reflect different learned policies;
+this is not a comparison at equal compute cost. All four runs kept 128 roots/round.
+Across the long runs, collection accounts for 93–98% of collection-plus-training time.
+E1 draws about 0.44 training rows per fresh row and E2 about 0.88; these are average
+reuse counts, not independent-sample counts. More epochs are relatively cheap here.
+
+Every 500 rounds: raw/EMA evaluation over 2,048 games and fresh value validation on
+64 independent, unsplit games. Pairwise EMA arenas use 512 games at rounds 500, 1,500
+and 3,000. EMA placements (2,048 games, one training seed) are:
+
+| Run | Round 500 | Round 1,000 | Round 1,500 | Round 2,000 | Round 2,500 | Round 3,000 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A: batch 512 / epochs 1 | 1.895 | 1.674 | 1.522 | 1.548 | 1.568 | 1.471 |
+| B: batch 1024 / epochs 1 | 2.048 | 1.753 | 1.578 | 1.399 | 1.378 | 1.400 |
+| C: batch 512 / epochs 2 | 1.695 | 1.646 | 1.615 | 1.468 | 1.371 | 1.368 |
+| D: batch 1024 / epochs 2 | 1.810 | 1.727 | 1.658 | 1.498 | 1.434 | 1.409 |
+
+All four improved beyond round 1,500. At 3,000, direct play orders **C > D > A > B**,
+as at 2,500; a separate 2,048-game C-versus-D confirmation scores **52.3% (51.3–53.2%)**.
+Against their own round-2,500 checkpoints, the four round-3,000 models score
+**50.3% / 52.3% / 52.8% / 51.1%** in 2,048-game arenas. A is inconclusive
+(49.3–51.2%); the other three intervals exceed 50%. C's nearly unchanged bot placement
+therefore hides continued progress. B's bot placement also overstates its strength
+relative to A/D. Arena scores compare cross-team placements, not first-place rates;
+these intervals condition on one training seed per recipe.
+
+A/B/C/D make **128/64/256/128 optimizer updates per round**. Increasing batch alone
+halves updates; A and D match updates while D draws twice as many rows. C's total
+collection-plus-training time is 18.73 h versus A's 17.88 h (about 5% more), including
+differences in trajectories and machine contention. The results favor testing data
+reuse and learning rate jointly before increasing batch. They do not isolate splitting's
+variance benefit from its extra data, or validate the new temperature-.5/lr-1e-4 recipe.
+
+In 128-game bot diagnostics, C's turn-2 upgrade frequency rises from 2.3% at round 500
+to 40.6% at 3,000; mean turn-10 Tavern tier rises from 2.73 to 4.07. Strategy continues
+changing, but local behavior is still suspect: C3000 ends turn 1 with an empty board in
+72/128 games, including 66 where it buys without playing any card (50 are simply
+`Buy → EndTurn`). These are traced actions, not proof of an engine bug. A useful next
+diagnostic is to compare EndTurn/Play estimates with repeated continuations from fixed
+early positions, and track empty-board/buy-without-play rates in the new recipes.
+Fresh unsplit value MSE remains roughly .23–.26 and early-turn R² is low;
+neither establishes an irreducible noise floor. Replay loss is not directly comparable
+because split-prefix labels average continuations and training uses sample weights.
+Review artifacts are local in `runs/main_training_review_20261107/`; all 90 scheduled
+evaluations completed successfully, alongside the additional arenas and diagnostics.
+
+### Borrowed-VM parameter campaign (2026-11-06–07)
+
+Finished at **Nov 7 10:55 CST**, ahead of the noon deadline. The final audit reached
+all **310 borrowed hosts** and verified no experiment directories or related processes
+remained. Plans, checkpoints, detailed results and cleanup evidence are local in
+`runs/borrowed_hparam_20261106/`; the quality/cost comparison is available as JSON,
+CSV, PNG and SVG. One timed-out FPU replicate was excluded from complete-group analyses.
+
+A 100-setting C_PUCT / temperature / noise grid used three training seeds per setting;
+important candidates received five- or ten-seed follow-ups. The table below uses ten
+paired seeds, 400 rounds × 128 roots, and 64 training workers. Its reference is the
+pre-campaign CLI baseline: 256 simulations, epochs 1, lr=3e-5, temperature 1 and replay 3. Arena scores
+compare cross-team placements; 50% means parity, not first-place win rate. Intervals
+use training seeds as replicates and are descriptive, without selection/multiplicity
+correction. Cheap-search refinements reused the ten seeds and also had five fresh seeds.
+Standard arenas use 64 simulations, C_PUCT=1.5, FPU=1.5 and LCB=0.
+
+**Starting presets.** The balanced recipe is now the CLI default for new runs;
+resumed runs inherit their saved settings unless explicitly overridden.
+
+| Preset | Simulations / epochs / learning rate | Arena vs old CLI (95% interval) | Time / old CLI |
+| --- | --- | ---: | ---: |
+| Balanced: next general-training baseline | 256 / 2 / 1e-4 | **77.7%** (74.6–80.8%) | **1.10×** |
+| Higher endpoint quality | 256 / 8 / 3e-5 | **78.9%** (76.2–81.6%) | **1.28×** |
+| Fast parameter experiments | 64 / 4 / 3e-5 | **70.9%** (67.7–74.0%) | **0.39×** |
+
+All three use temperature **0.5**, including `--temperature-warm 0.5`, batch **512**,
+replay **5**, split-turn **4**, LCB **0**, constant learning rate and max-samples **65,536**.
+The 256-simulation presets use C_PUCT=**1.9**, noise=**.2**, FPU=**1.5**; the fast preset
+uses C_PUCT=**2.5**, noise=**.1**, FPU=**.5**. Keep value-weight=.5, policy-smoothing=.05,
+root-temperature=1.1 and noise-alpha=.3. Time ratios measure collection plus optimizer
+work, excluding evaluation/serialization; VM and learned-trajectory differences remain.
+
+E8 beats the balanced E2 recipe **51.5%** (50.1–52.9%) at round 400, for **17%** more
+time. Its small advantage also appears at rounds 100/200/300 and with 256-simulation
+evaluation. The fast E4 recipe beats cheap E2 **56.2%** (54.8–57.6%) for 20% more time.
+Against the balanced recipe's round-200 model it scores **50.6%** (46.8–54.5%) using
+78% of the time; this does not establish equivalence. Against its round-400 model it
+scores only **41.1%**, so cheaper search is a quality/cost tradeoff.
+
+Temperature .5 is the clearest exploration change: ten-seed isolated confirmation
+scores **61.7%** against temperature 1; five-seed C/noise controls show no further
+reliable gain. Continuation from one shared C500 initialization also favors lower
+temperature. Matched-update batch-1024 tests show no reliable advantage over 512;
+learning-rate decay likewise has no demonstrated benefit in the continuation tests.
+
+Search budget, epochs and loss weights must be tuned together. Cheap-search E8 was
+unstable; 128-simulation E8 regressed badly in both ten- and five-seed cohorts while
+E1/E2/E4 remained healthy. At full search/E8, raising value-weight from .5 to 1 scored
+only **17.7%** against the control across three seeds. These models had finite weights;
+lower training loss alone does not establish stronger play. Split changes data quantity,
+weights and reuse as well as target variance. Further temperature reduction (.25/.1)
+and other loss/prior changes remain candidates, not confirmed defaults. The next four
+training slots should compare balanced E2/lr=1e-4 against E8/lr=3e-5 on two shared seeds,
+both at temperature .5 and 256 simulations, through at least 3,000 rounds. Track direct
+arenas and a fixed reference checkpoint alongside bot placement and elapsed time.
 
 ## Open problems
 
