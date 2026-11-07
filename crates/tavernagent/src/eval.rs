@@ -72,10 +72,13 @@ pub fn play(
     while !game.is_over() {
         if game.needs_action(0) {
             let action = match policy {
-                Policy::Net(net) => mcts::search(&game, 0, *net, search, &mut rng)?.best_action(),
-                Policy::Bot => bot_action(&mut game, 0).encode(),
+                Policy::Net(net) => {
+                    let a = mcts::search(&game, 0, *net, search, &mut rng)?.best_action();
+                    crate::actions::engine_action(&game, 0, a).map_err(str::to_string)?
+                }
+                Policy::Bot => bot_action(&mut game, 0),
             };
-            game.apply_index(0, action).map_err(|e| e.to_string())?;
+            game.apply(0, action).map_err(|e| e.to_string())?;
             continue;
         }
         let mut moved = false;

@@ -126,7 +126,7 @@ fn rewind_turn_restores_the_reseeded_copy_after_any_turn_line() {
                             sim.end_turn_effects(seat).unwrap();
                             break;
                         }
-                        sim.apply_index(seat, a).unwrap();
+                        tavernagent::actions::apply(&mut sim, seat, a).unwrap();
                     }
                     lines += 1;
                     rewind_turn(&mut sim, &game, seat, seed);
@@ -234,9 +234,8 @@ fn cancel_stays_when_it_is_the_only_legal_action() {
 
 #[test]
 fn the_agent_has_no_move_actions() {
-    // The engine's layout ends with the Move block; the agent's space stops right before it,
-    // and every index below is the engine's own.
-    assert_eq!(N_ACTIONS, A_MOVE);
+    // Compact Play replaces both engine Play and Magnetize; Move remains engine-only.
+    assert_eq!(N_ACTIONS, 116);
     assert_eq!(taverngym::actions::N_ACTIONS, A_MOVE + N_BOARD * N_BOARD);
     // Two minions on the warband make a Move legal for the engine but not for the agent.
     let mut game = position(7);
@@ -258,8 +257,13 @@ fn the_agent_has_no_move_actions() {
     );
     let mask = agent_mask(&game, 0);
     assert_eq!(mask.len(), N_ACTIONS);
-    // Index 0 is End Turn, hidden by the must-spend rule at 30 Gold; the rest is the engine's.
-    assert_eq!(mask[1..], legal[1..N_ACTIONS]);
+    // End Turn is hidden at 30 Gold; other entries match their translated engine action.
+    for a in 1..N_ACTIONS {
+        let engine = tavernagent::actions::engine_action(&game, 0, a)
+            .unwrap()
+            .encode();
+        assert_eq!(mask[a], legal[engine]);
+    }
 }
 
 #[test]
@@ -280,7 +284,7 @@ fn rewind_turn_falls_back_to_a_full_copy_when_the_seat_died() {
     while sim.needs_action(0) && !sim.players[0].pending.is_empty() {
         let mask = agent_mask(&sim, 0);
         let a = (A_CANCEL + 1..N_ACTIONS).find(|a| mask[*a]).unwrap();
-        sim.apply_index(0, a).unwrap();
+        tavernagent::actions::apply(&mut sim, 0, a).unwrap();
         guard += 1;
         assert!(guard < 10);
     }
@@ -539,7 +543,7 @@ fn the_must_spend_rule_hides_end_turn_while_gold_is_left() {
         let mask = agent_mask(&game, 0);
         let from = if pending { 0 } else { A_REFRESH };
         let action = (from..N_ACTIONS).find(|a| mask[*a]).unwrap();
-        game.apply_index(0, action).unwrap();
+        tavernagent::actions::apply(&mut game, 0, action).unwrap();
         steps += 1;
         assert!(steps < 512, "the rule never released End Turn");
     }

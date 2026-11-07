@@ -1,8 +1,8 @@
 //! A small pre-norm residual policy/value network with a shared card embedding.
 //!
 //! ```text
-//! numeric features + flattened card embeddings -> 192 -> residual blocks
-//!     -> {196 policy logits, 1 tanh value}
+//! numeric features + flattened card embeddings + legal action mask -> 192 -> residual blocks
+//!     -> {116 policy logits, 1 tanh value}
 //! ```
 //!
 //! Forward passes return their cache instead of storing it, so one network can serve
@@ -23,15 +23,13 @@ use taverngym::obs as o;
 use crate::linalg::{Bf16Mat, Mat};
 use crate::npz::{NpyArray, Npz};
 
-/// The agent's action space: the engine's flat layout up to and excluding the Move block
-/// (`A_MOVE..N_ACTIONS`), which is the trailing block. Warband ordering is left to a
-/// separate model; this network never sees, predicts or trains on Move actions.
-pub const N_ACTIONS: usize = a::A_MOVE;
+/// Compact policy layout; resolved to engine actions using the current state.
+pub const N_ACTIONS: usize = crate::actions::N_ACTIONS;
 pub const N_FEATURES: usize = o::OBS_FLOATS;
 pub const N_CARD_SLOTS: usize = o::OBS_CARDS;
 pub const DEFAULT_HIDDEN: usize = 192;
 pub const DEFAULT_BLOCKS: usize = 6;
-pub const MODEL_VERSION: i64 = 7;
+pub const MODEL_VERSION: i64 = 9;
 pub const N_OPP_BOARD_SLOTS: usize = o::N_OPP * a::N_BOARD;
 pub const OPP_BOARD_FEATURE_START: usize = N_FEATURES - N_OPP_BOARD_SLOTS * o::MINION_F;
 /// The ended-turn flag: the seat has finished recruiting and has no legal action.
@@ -480,7 +478,7 @@ impl PolicyValueNet {
             Mat::from_vec(rows, cols, data)
         };
         let he = |fan_in: usize| (2.0 / fan_in as f32).sqrt();
-        let in_dim = input_features.len() + card_slots.len() * d;
+        let in_dim = input_features.len() + card_slots.len() * d + N_ACTIONS;
         let mut tensors = Vec::with_capacity(9 + 4 * cfg.blocks);
         let mut e = randn(n_cards, d, 0.1);
         for v in e.row_mut(0) {
@@ -553,22 +551,30 @@ impl PolicyValueNet {
     // ---- forward -----------------------------------------------------------
 
     /// Gather the network input for a batch of raw observations.
-    fn assemble(&self, xs: &[&[f32]], cards: &[&[i32]]) -> Result<(Mat, Vec<i32>), String> {
+    fn assemble(
+        &self,
+        xs: &[&[f32]],
+        cards: &[&[i32]],
+        masks: &[&[bool]],
+    ) -> Result<(Mat, Vec<i32>), String> {
         let bsz = xs.len();
-        if cards.len() != bsz {
-            return Err("feature and card batches differ in length".into());
+        if cards.len() != bsz || masks.len() != bsz {
+            return Err("feature, card and mask batches differ in length".into());
         }
         let d = self.cfg.embedding_dim;
         let n_in = self.input_features.len();
         let n_slots = self.card_slots.len();
-        let mut x_in = Mat::zeros(bsz, n_in + n_slots * d);
+        let mut x_in = Mat::zeros(bsz, n_in + n_slots * d + N_ACTIONS);
         let mut used = Vec::with_capacity(bsz * n_slots);
         let e = &self.p.tensors[E];
         for (r, (x, c)) in xs.iter().zip(cards).enumerate() {
-            if x.len() != N_FEATURES || c.len() != N_CARD_SLOTS {
+            if x.len() != N_FEATURES || c.len() != N_CARD_SLOTS || masks[r].len() != N_ACTIONS {
                 return Err("observation does not match the schema".into());
             }
             let row = x_in.row_mut(r);
+            for (dst, &legal) in row[n_in + n_slots * d..].iter_mut().zip(masks[r]) {
+                *dst = u8::from(legal) as f32;
+            }
             for (j, &i) in self.input_features.iter().enumerate() {
                 row[j] = x[i];
             }
@@ -592,8 +598,9 @@ impl PolicyValueNet {
         &self,
         xs: &[&[f32]],
         cards: &[&[i32]],
+        masks: &[&[bool]],
     ) -> Result<(Mat, Vec<f32>, Cache), String> {
-        let (x_in, used) = self.assemble(xs, cards)?;
+        let (x_in, used) = self.assemble(xs, cards, masks)?;
         let p = &self.p.tensors;
         let act = self.cfg.activation;
         let mut z0 = linear(&x_in, &p[W0]);
@@ -653,7 +660,7 @@ impl PolicyValueNet {
         cards: &[i32],
         mask: &[bool],
     ) -> Result<(Vec<f32>, f32), String> {
-        let (logits, value) = self.infer(x, cards)?;
+        let (logits, value) = self.infer(x, cards, mask)?;
         Ok((masked_softmax(&logits, mask), value))
     }
 
@@ -661,8 +668,13 @@ impl PolicyValueNet {
     /// accumulation, a polynomial tanh in the activations, no training cache. The weights
     /// are converted once per parameter update (`params_changed`); training itself stays
     /// in f32 with the exact functions (`forward`/`backward`).
-    pub fn infer(&self, x: &[f32], cards: &[i32]) -> Result<(Vec<f32>, f32), String> {
-        let (x_in, _) = self.assemble(&[x], &[cards])?;
+    pub fn infer(
+        &self,
+        x: &[f32],
+        cards: &[i32],
+        mask: &[bool],
+    ) -> Result<(Vec<f32>, f32), String> {
+        let (x_in, _) = self.assemble(&[x], &[cards], &[mask])?;
         let p = &self.p.tensors;
         let fast = self.fast();
         let act = self.cfg.activation;
@@ -689,8 +701,13 @@ impl PolicyValueNet {
 
     /// `infer` in f32: the same operations in the same order as `forward`, so the results
     /// are bit-identical to the training forward pass; for reference and tests.
-    pub fn infer_f32(&self, x: &[f32], cards: &[i32]) -> Result<(Vec<f32>, f32), String> {
-        let (x_in, _) = self.assemble(&[x], &[cards])?;
+    pub fn infer_f32(
+        &self,
+        x: &[f32],
+        cards: &[i32],
+        mask: &[bool],
+    ) -> Result<(Vec<f32>, f32), String> {
+        let (x_in, _) = self.assemble(&[x], &[cards], &[mask])?;
         let p = &self.p.tensors;
         let act = self.cfg.activation;
         let mut h = p[W0].vecmat(x_in.row(0));

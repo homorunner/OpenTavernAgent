@@ -33,7 +33,7 @@ fn parameter_count_and_input_layout() {
     let net = PolicyValueNet::new(0, NetConfig::default()).unwrap();
     assert_eq!(net.n_input_features(), 1713);
     assert_eq!(net.n_card_slots(), 69);
-    assert_eq!(net.n_params(), 867_845);
+    assert_eq!(net.n_params(), 874_677);
     assert_eq!(net.p.tensors.len(), 9 + 4 * net.cfg.blocks);
     assert_eq!(net.p.names().last().unwrap(), "bv");
     let wide = PolicyValueNet::new(
@@ -153,6 +153,7 @@ fn gradient_check(activation: Activation, head_norm: bool) {
     repeated[19..22].fill(cid);
     let xs: Vec<&[f32]> = vec![&real.x, &ended.x, &noisy];
     let cards: Vec<&[i32]> = vec![&real.cards, &ended.cards, &repeated];
+    let masks: Vec<&[bool]> = vec![&real.mask, &ended.mask, &real.mask];
     let dlogits = Mat::from_vec(
         3,
         N_ACTIONS,
@@ -161,14 +162,14 @@ fn gradient_check(activation: Activation, head_norm: bool) {
             .collect(),
     );
     let dvalue_raw = [0.03f32, -0.02, 0.05];
-    let (_, value, cache) = net.forward(&xs, &cards).unwrap();
+    let (_, value, cache) = net.forward(&xs, &cards, &masks).unwrap();
     let dvalue: Vec<f32> = (0..3)
         .map(|i| dvalue_raw[i] * (1.0 - value[i] * value[i]))
         .collect();
     let grads = net.backward(&cache, &dlogits, &dvalue);
     assert!(grads.tensors[net::E].row(0).iter().all(|v| *v == 0.0));
     let loss = |net: &PolicyValueNet| -> f64 {
-        let (logits, value, _) = net.forward(&xs, &cards).unwrap();
+        let (logits, value, _) = net.forward(&xs, &cards, &masks).unwrap();
         let mut total = 0.0f64;
         for (l, d) in logits.data.iter().zip(&dlogits.data) {
             total += *l as f64 * *d as f64;
@@ -193,6 +194,14 @@ fn gradient_check(activation: Activation, head_norm: bool) {
     probes.push((
         net::W0,
         (net.n_input_features() + slot_of_19 * net.cfg.embedding_dim) * net.cfg.hidden + 5,
+    ));
+    probes.push((
+        net::W0,
+        (net.n_input_features()
+            + net.n_card_slots() * net.cfg.embedding_dim
+            + real.mask.iter().position(|m| *m).unwrap())
+            * net.cfg.hidden
+            + 5,
     ));
     probes.push((net::E, 0)); // the empty row stays zero
     let eps = 2e-3f32;
@@ -230,13 +239,15 @@ fn search_inference_matches_the_training_forward() {
             let game = position(seed);
             for seat in 0..2 {
                 let obs = observe_seat(&game, seat);
-                let (logits, value, _) = net.forward(&[&obs.x], &[&obs.cards]).unwrap();
+                let (logits, value, _) =
+                    net.forward(&[&obs.x], &[&obs.cards], &[&obs.mask]).unwrap();
                 // The f32 path repeats the training arithmetic exactly.
-                let (exact_logits, exact_value) = net.infer_f32(&obs.x, &obs.cards).unwrap();
+                let (exact_logits, exact_value) =
+                    net.infer_f32(&obs.x, &obs.cards, &obs.mask).unwrap();
                 assert_eq!(logits.row(0), &exact_logits[..]);
                 assert_eq!(value[0], exact_value);
                 // The search path (bfloat16 weights, polynomial tanh) stays close to it.
-                let (fast_logits, fast_value) = net.infer(&obs.x, &obs.cards).unwrap();
+                let (fast_logits, fast_value) = net.infer(&obs.x, &obs.cards, &obs.mask).unwrap();
                 let span = logits
                     .row(0)
                     .iter()
@@ -262,17 +273,20 @@ fn search_inference_follows_parameter_updates() {
     let mut net = PolicyValueNet::new(2, cfg(Activation::Gelu, false)).unwrap();
     let game = position(8);
     let obs = observe_seat(&game, 0);
-    let before = net.infer(&obs.x, &obs.cards).unwrap();
+    let before = net.infer(&obs.x, &obs.cards, &obs.mask).unwrap();
     let wp = net.p.wp();
     for v in &mut net.p.tensors[wp].data {
         *v += 0.5;
     }
     // Without the notification the bfloat16 copy is stale; with it the change is visible.
-    assert_eq!(net.infer(&obs.x, &obs.cards).unwrap().0, before.0);
+    assert_eq!(
+        net.infer(&obs.x, &obs.cards, &obs.mask).unwrap().0,
+        before.0
+    );
     net.params_changed();
-    let after = net.infer(&obs.x, &obs.cards).unwrap();
+    let after = net.infer(&obs.x, &obs.cards, &obs.mask).unwrap();
     assert_ne!(after.0, before.0);
-    let (exact, _) = net.infer_f32(&obs.x, &obs.cards).unwrap();
+    let (exact, _) = net.infer_f32(&obs.x, &obs.cards, &obs.mask).unwrap();
     for (a, b) in exact.iter().zip(&after.0) {
         assert!((a - b).abs() < 0.005 * a.abs().max(1.0), "{a} vs {b}");
     }
@@ -303,7 +317,10 @@ fn checkpoints_round_trip_and_reject_other_schemas() {
     );
     // Numpy-compatible layout: the arrays carry the Python-era names and 1-D vectors.
     let npz = Npz::load(&path).unwrap();
-    assert_eq!(npz.get("W0").unwrap().shape, vec![1713 + 69 * 4, 192]);
+    assert_eq!(
+        npz.get("W0").unwrap().shape,
+        vec![1713 + 69 * 4 + N_ACTIONS, 192]
+    );
     assert_eq!(npz.get("bp").unwrap().shape, vec![N_ACTIONS]);
     let mut wrong = npz.clone();
     let meta = wrong.get("meta").unwrap().as_text().unwrap().replace(
@@ -328,4 +345,30 @@ fn checkpoints_round_trip_and_reject_other_schemas() {
     missing.arrays.remove("W2");
     assert!(PolicyValueNet::from_npz(&missing).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn mask_is_a_shared_input_and_invalid_mask_shapes_are_rejected() {
+    let net = PolicyValueNet::new(23, cfg(Activation::Gelu, false)).unwrap();
+    let obs = observe_seat(&position(23), 0);
+    let zeros = vec![false; N_ACTIONS];
+    assert_ne!(obs.mask, zeros);
+    // Same board and ended flag: changing only legality changes raw logits AND value,
+    // before the output softmax ever sees a mask.
+    let (logits, value) = net.infer_f32(&obs.x, &obs.cards, &obs.mask).unwrap();
+    let (empty_logits, empty_value) = net.infer_f32(&obs.x, &obs.cards, &zeros).unwrap();
+    assert_ne!(logits, empty_logits);
+    assert!((value - empty_value).abs() > 1e-6);
+    let (policy, value) = net.predict(&obs.x, &obs.cards, &zeros).unwrap();
+    assert!(policy.iter().all(|p| *p == 0.0));
+    assert!(value.is_finite());
+    assert!(
+        net.predict(&obs.x, &obs.cards, &zeros[..N_ACTIONS - 1])
+            .is_err()
+    );
+    assert!(net.forward(&[&obs.x], &[&obs.cards], &[]).is_err());
+    assert!(
+        net.forward(&[&obs.x], &[&obs.cards], &[&zeros[..N_ACTIONS - 1]])
+            .is_err()
+    );
 }

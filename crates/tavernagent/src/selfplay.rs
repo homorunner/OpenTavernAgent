@@ -369,15 +369,10 @@ fn play_branch<E: Evaluator + ?Sized>(
         // Pause only on configured turns; all end effects precede the fork and
         // even this turn's combat randomness belongs to the children.
         let split = if opts.split_turn.binary_search(&state.game.turn).is_ok() {
-            state
-                .game
-                .apply_index_until_combat(seat, action)
+            crate::actions::apply_until_combat(&mut state.game, seat, action)
                 .map_err(str::to_string)?
         } else {
-            state
-                .game
-                .apply_index(seat, action)
-                .map_err(str::to_string)?;
+            crate::actions::apply(&mut state.game, seat, action).map_err(str::to_string)?;
             false
         };
         if split {
@@ -758,7 +753,7 @@ fn chunk_step(
     let xs: Vec<&[f32]> = rows.iter().map(|s| s.x.as_slice()).collect();
     let cards: Vec<&[i32]> = rows.iter().map(|s| s.cards.as_slice()).collect();
     let masks: Vec<&[bool]> = rows.iter().map(|s| s.mask.as_slice()).collect();
-    let (logits, value, cache) = net.forward(&xs, &cards)?;
+    let (logits, value, cache) = net.forward(&xs, &cards, &masks)?;
     let probs = masked_softmax_rows(&logits, &masks);
     // Targets with optional smoothing over the legal actions.
     let mut pis = Mat::zeros(n, N_ACTIONS);

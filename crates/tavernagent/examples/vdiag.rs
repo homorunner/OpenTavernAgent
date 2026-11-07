@@ -2,13 +2,14 @@
 //! Usage: vdiag <model.npz> [games]
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
+use tavernagent::actions::N_POS;
 use tavernagent::heroes::select_heroes;
 use tavernagent::mcts::{self, Evaluator, SearchOptions, agent_mask, observe_seat};
 use tavernagent::net::PolicyValueNet;
 use tavernagent::rules::Budgets;
 use tavernagent::selfplay::end_turn_preview;
 use taverngym::Game;
-use taverngym::actions::{A_BUY, A_END, A_PLAY, A_REFRESH, N_POS, N_SHOP};
+use taverngym::actions::{A_BUY, A_END, A_PLAY, A_REFRESH, N_SHOP};
 use taverngym::state::Item;
 
 type Row = (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, f32, bool);
@@ -64,9 +65,9 @@ fn main() {
         // Play then end.
         let mut played = game.clone();
         let play = (A_PLAY..A_PLAY + N_POS)
-            .find(|a| played.legal_mask(0)[*a])
+            .find(|a| agent_mask(&played, 0)[*a])
             .unwrap();
-        played.apply_index(0, play).unwrap();
+        tavernagent::actions::apply(&mut played, 0, play).unwrap();
         if !played.players[0].pending.is_empty() {
             continue;
         }

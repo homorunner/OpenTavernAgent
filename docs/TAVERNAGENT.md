@@ -5,8 +5,8 @@ self-play. It is the Rust crate `crates/tavernagent` and the `tavernagent` binar
 on the `taverngym` crate directly and needs no Python. Checkpoints are numpy-readable `.npz`
 files, so weights stay inspectable from Python.
 
-The current model has **867,845 parameters**: a policy head and a value head. Weights are
-model format v7; the search protocol is `ended-state-v8-no-move`.
+The current model has **874,677 parameters**: a policy head and a value head. Weights are
+model format v9; the search protocol is `ended-state-v9-compact-play`.
 
 ## Commands
 
@@ -48,16 +48,23 @@ Results do not depend on the thread count.
 ## Network and inputs
 
 ```
-1713 numeric features + 69 card slots x 16-dim shared card embedding
+1713 numeric features + 69 card slots x 16-dim shared card embedding + 116 mask bits
   -> 192 -> 6 residual blocks  h <- h + GELU(LN(W h))
-  -> 196 policy logits (masked softmax) / tanh value
+  -> 116 policy logits (masked softmax) / tanh value
 ```
 
-- The policy head covers the engine's action layout **without the trailing Move block**
-  (`net::N_ACTIONS = A_MOVE = 196`, the engine has 245). Warband ordering is left to a
-  separate model; this network never predicts, searches or trains on a Move, and
-  `agent_mask` truncates the engine's mask to the 196 agent actions (all lower indices are
-  the engine's own).
+- The policy head has **116 actions**: indices 0–45 match the engine; indices 46–115
+  encode `Play(hand, pos)` as `46 + hand * 7 + pos`. A compatible occupied position
+  resolves to the engine's Magnetize action (including on a full board); otherwise it
+  resolves to normal Play. Appending at the empty right edge plays a Magnetic minion
+  separately. Spells still use position 0. Move is absent.
+  `actions::engine_action` translates against the current state, and the mask uses the
+  same translation. TavernGym's 245-action API is unchanged.
+- Old v7/v8 checkpoints are incompatible with this input/policy layout; v9
+  rejects them rather than interpreting old indices as new actions.
+- The 116-bit `agent_mask` enters the shared trunk as 0/1 features, so both policy and
+  value can use legality. Training and inference use the same mask; ended states use
+  an all-zero mask. The ended-turn flag remains in the original numeric input.
 - The environment exposes 3,235 floats and 124 card indices; the network drops the 1,519
   historical-opponent-warband floats, the 49 historical warband card slots and three
   redundant global flags (hero selection, game over, the Tavern-wide freeze flag), keeping

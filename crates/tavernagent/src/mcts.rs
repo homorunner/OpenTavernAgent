@@ -20,7 +20,7 @@ use taverngym::{Game, bot, rng::Rng};
 
 use crate::net::{N_ACTIONS, PolicyValueNet};
 
-pub const SEARCH_VERSION: &str = "ended-state-v8-no-move";
+pub const SEARCH_VERSION: &str = "ended-state-v9-compact-play";
 pub const MAX_PLIES: usize = 2000;
 pub const MAX_DEPTH: usize = 100;
 pub const A_END_TURN: usize = A_END;
@@ -267,7 +267,7 @@ pub fn is_hero_selection(game: &Game) -> bool {
 
 /// Full-game mode only: apply an action and drive the bots until `seat` can act again.
 pub fn advance(game: &mut Game, seat: usize, action: usize) -> Result<(), String> {
-    game.apply_index(seat, action).map_err(|e| e.to_string())?;
+    crate::actions::apply(game, seat, action).map_err(|e| e.to_string())?;
     for _ in 0..MAX_PLIES {
         if terminal_value(game, seat).is_some() || game.needs_action(seat) {
             return Ok(());
@@ -313,10 +313,8 @@ pub fn observe_seat(game: &Game, seat: usize) -> Observation {
 
 /// The seat's legal actions over the agent's action space, with two training rules applied.
 ///
-/// The agent's space is the engine's layout without the trailing Move block
-/// (`net::N_ACTIONS == A_MOVE`): warband ordering is not this network's job, and a Move
-/// line was the search's favourite way to burn the action budget. The mask is the
-/// engine's mask truncated; every other index is unchanged.
+/// Play uses seven positions per hand card and automatically magnetizes onto
+/// compatible hosts. Move is absent; see `crate::actions` for engine translation.
 ///
 /// Must-spend: End Turn is illegal for a seat holding `MUST_SPEND_GOLD` Gold or more,
 /// whatever the shop currently offers. A free Refresh is exactly the case that matters —
@@ -331,8 +329,7 @@ pub fn observe_seat(game: &Game, seat: usize) -> Observation {
 /// action (a paid trinket offer with nothing in it affordable). Without this the search treats
 /// open-menu / close-menu as a free no-op pair and spends the turn's action budget on it.
 pub fn agent_mask(game: &Game, seat: usize) -> Vec<bool> {
-    let mut mask = game.legal_mask(seat);
-    mask.truncate(N_ACTIONS);
+    let mut mask = crate::actions::legal_mask(game, seat);
     if mask[A_END_TURN] && game.players[seat].gold >= MUST_SPEND_GOLD {
         mask[A_END_TURN] = false;
         if !mask.iter().any(|legal| *legal) {
@@ -562,8 +559,7 @@ pub fn search_with_seeds<E: Evaluator + ?Sized>(
                             .end_turn_effects(seat)
                             .map_err(|e| e.to_string())?;
                     }
-                    Horizon::Turn => simulation
-                        .apply_index(seat, action)
+                    Horizon::Turn => crate::actions::apply(&mut simulation, seat, action)
                         .map_err(|e| e.to_string())?,
                 }
                 if let Some(v) = terminal_value(&simulation, seat) {

@@ -138,7 +138,7 @@ fn profiled_search(game: &Game, seat: usize, net: &PolicyValueNet, sims: usize, 
                     sim.end_turn_effects(seat).unwrap();
                     t.end += t0.elapsed();
                 } else {
-                    sim.apply_index(seat, action).unwrap();
+                    tavernagent::actions::apply(&mut sim, seat, action).unwrap();
                     t.apply += t0.elapsed();
                 }
                 if mcts::terminal_value(&sim, seat).is_some() {
