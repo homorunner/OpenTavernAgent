@@ -31,6 +31,7 @@ id_rsa*
 id_ed25519*
 .netrc
 .pypirc
+hosts
 
 # your own runs, logs and models (the released results are tavernbench/results/)
 /answers/
