@@ -966,10 +966,6 @@ impl ReplayWindow {
 
     /// Refill from `write_arrays` output, oldest round first; a smaller window keeps the newest.
     pub fn restore(&mut self, npz: &Npz, n_rounds: usize) -> Result<(), String> {
-        self.restore_version(npz, n_rounds, false)
-    }
-
-    fn restore_version(&mut self, npz: &Npz, n_rounds: usize, legacy: bool) -> Result<(), String> {
         self.rounds.clear();
         for i in 0..n_rounds {
             let get = |field: &str| {
@@ -983,12 +979,7 @@ impl ReplayWindow {
             let z = get("z")?.as_f32()?;
             let action = get("action")?.as_i64()?;
             let n = z.len();
-            // Format 6 predates sample weights. Format 7 must store them explicitly.
-            let weight = if legacy {
-                vec![1.0; n]
-            } else {
-                get("weight")?.as_f32()?.to_vec()
-            };
+            let weight = get("weight")?.as_f32()?;
             if x.len() != n * N_FEATURES
                 || cards.len() != n * N_CARD_SLOTS
                 || mask.len() != n * N_ACTIONS
@@ -1124,7 +1115,7 @@ pub fn load_training_state(
 ) -> Result<TrainerMeta, String> {
     let npz = Npz::load(path)?;
     let meta = parse_meta(&npz)?;
-    if ![6, TRAINER_FORMAT].contains(&meta.format)
+    if meta.format != TRAINER_FORMAT
         || meta.search_version != mcts::SEARCH_VERSION
         || meta.card_fingerprint != trainer.net.card_fingerprint.to_string()
         || meta.net != trainer.net.cfg
@@ -1151,7 +1142,7 @@ pub fn load_training_state(
     *train_rng = meta.train_rng.clone();
     *replay_rng = meta.replay_rng.clone();
     if let Some(window) = replay {
-        window.restore_version(&npz, meta.replay_rounds_stored, meta.format == 6)?;
+        window.restore(&npz, meta.replay_rounds_stored)?;
     }
     Ok(meta)
 }

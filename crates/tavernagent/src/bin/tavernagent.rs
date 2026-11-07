@@ -48,8 +48,6 @@ struct ProbeCli {
     games: usize,
     #[arg(long, default_value_t = 8)]
     sims: usize,
-    #[arg(long, default_value = "turn", value_parser = tavernagent::mcts::Horizon::parse)]
-    horizon: tavernagent::mcts::Horizon,
     #[arg(long, default_value_t = tavernagent::mcts::DEFAULT_C_PUCT)]
     c_puct: f32,
     #[arg(long, default_value_t = 9000)]
@@ -92,7 +90,6 @@ fn run() -> Result<(), String> {
             let opts = tavernagent::probe::ProbeOptions {
                 games: p.games,
                 sims: p.sims,
-                horizon: p.horizon,
                 c_puct: p.c_puct,
                 budgets: p.budgets,
                 seed: p.seed,

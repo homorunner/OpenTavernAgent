@@ -101,7 +101,7 @@ stored in the checkpoint; `--resume` refuses conflicting options.
 
 ## Search
 
-The default `--horizon turn` stays inside the seat's own recruit phase and never simulates
+Search stays inside the seat's own recruit phase and never simulates
 opponents or combat. End Turn is an ordinary edge: the simulation copy calls
 `Game::end_turn_effects`, so end-of-turn triggers and their random choices happen and the
 seat is marked ended without starting the fight; the resulting position is a leaf with no
@@ -109,8 +109,7 @@ legal actions, evaluated by the same value head. The search therefore compares "
 position after more actions" with "the position actually handed to combat", instead of
 reusing a mid-turn value as the stopping value.
 
-Each simulation starts from the same game state with a fresh random stream. Turn-horizon
-search reuses a working copy and rewinds recruit-state changes between simulations,
+Each simulation starts from the same game state with a fresh random stream. Search reuses a working copy and rewinds recruit-state changes between simulations,
 falling back to a full clone when necessary. Distinct observable outcomes of one action
 (a Refresh, a Discover) become separate child nodes, and the action edge aggregates their
 visits. The real game and its random stream are never touched.
@@ -156,8 +155,6 @@ Move is not a rule but an absence: it is outside the agent's action space altoge
 - Per-turn host budgets (100 actions, 10 Moves, 5 Freeze presses) are enforced by the
   engine and reset every turn; `--action-cap/--move-cap/--freeze-cap` must be positive.
   The network does not see them.
-- `--horizon game` advances the other seats with the scripted bot using hidden state; it is
-  an experimental full-information mode only.
 - Use `bench` to measure inference and search latency on the target machine; costs depend
   on the checkpoint, search budget, CPU instruction set and position.
 

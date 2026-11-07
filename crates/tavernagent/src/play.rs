@@ -8,7 +8,7 @@ use clap::Args;
 use taverngym::Game;
 
 use crate::heroes::select_heroes;
-use crate::mcts::{self, Horizon, SearchOptions, advance};
+use crate::mcts::{self, SearchOptions};
 use crate::net::PolicyValueNet;
 use crate::probe::family;
 use crate::rules::Budgets;
@@ -26,8 +26,6 @@ pub struct PlayArgs {
     pub seed: u64,
     #[command(flatten)]
     pub budgets: Budgets,
-    #[arg(long, default_value = "turn", value_parser = Horizon::parse)]
-    pub horizon: Horizon,
     #[arg(long, default_value_t = crate::mcts::DEFAULT_C_PUCT)]
     pub c_puct: f32,
     #[arg(long, default_value_t = 0.0)]
@@ -40,7 +38,6 @@ pub fn run(args: PlayArgs) -> Result<(), String> {
     let search = SearchOptions {
         sims: args.sims,
         c_puct: args.c_puct,
-        horizon: args.horizon,
         ..SearchOptions::default()
     };
     search.validate()?;
@@ -74,7 +71,7 @@ pub fn run(args: PlayArgs) -> Result<(), String> {
                 result.best_action()
             };
             *hist.entry(family(action)).or_insert(0) += 1;
-            advance(&mut game, 0, action)?;
+            crate::actions::apply(&mut game, 0, action).map_err(str::to_string)?;
         }
         let placement = game.players[0].placement;
         places.push(placement);

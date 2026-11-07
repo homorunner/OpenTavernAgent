@@ -454,11 +454,11 @@ fn full_trainer_snapshot_restores_optimizer_rng_and_replay_exactly() {
         .unwrap_err()
         .contains("incomplete replay window")
     );
-    let mut legacy = Npz::load(&path).unwrap();
+    let mut missing_weights = Npz::load(&path).unwrap();
     for i in 0..2 {
-        legacy.arrays.remove(&format!("replay/{i}/weight"));
+        missing_weights.arrays.remove(&format!("replay/{i}/weight"));
     }
-    legacy.save(&wrong_path).unwrap();
+    missing_weights.save(&wrong_path).unwrap();
     assert!(
         load_training_state(
             &wrong_path,
@@ -470,24 +470,21 @@ fn full_trainer_snapshot_restores_optimizer_rng_and_replay_exactly() {
         .unwrap_err()
         .contains("incomplete replay window")
     );
-    // Preserve the RNG's u128 integers verbatim (Value would round them via f64).
+    // An old format is rejected even with all current arrays present.
+    let mut old_format = Npz::load(&path).unwrap();
     let meta = meta_text.replace("\"format\":7", "\"format\":6");
-    legacy.insert("metadata", tavernagent::npz::NpyArray::text(&meta));
-    legacy.save(&wrong_path).unwrap();
-    load_training_state(
-        &wrong_path,
-        &mut restored,
-        &mut rng2,
-        &mut replay_rng2,
-        Some(&mut restored_replay),
-    )
-    .unwrap();
+    old_format.insert("metadata", tavernagent::npz::NpyArray::text(&meta));
+    old_format.save(&wrong_path).unwrap();
     assert!(
-        restored_replay
-            .rounds
-            .iter()
-            .flatten()
-            .all(|s| s.weight == 1.0)
+        load_training_state(
+            &wrong_path,
+            &mut restored,
+            &mut rng2,
+            &mut replay_rng2,
+            Some(&mut restored_replay),
+        )
+        .unwrap_err()
+        .contains("schema")
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -582,7 +579,7 @@ fn split_training_resumes_with_saved_schedule_and_weights() {
 }
 
 #[test]
-fn split_turn_cli_and_old_options() {
+fn split_turn_cli_and_required_saved_options() {
     use clap::Parser;
     use tavernagent::selfplay::validate_split_turns;
     #[derive(Parser)]
@@ -615,12 +612,7 @@ fn split_turn_cli_and_old_options() {
     }
     let mut saved = serde_json::to_value(SelfplayArgs::default()).unwrap();
     saved.as_object_mut().unwrap().remove("split_turn");
-    assert!(
-        serde_json::from_value::<SelfplayArgs>(saved)
-            .unwrap()
-            .split_turn
-            .is_empty()
-    );
+    assert!(serde_json::from_value::<SelfplayArgs>(saved).is_err());
 }
 
 #[test]

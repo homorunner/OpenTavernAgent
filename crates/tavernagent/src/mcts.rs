@@ -1,11 +1,10 @@
 //! PUCT with sampled chance outcomes and an independent random stream per simulation.
 //!
-//! The default `Turn` horizon ends at the position a seat hands to combat. End Turn is
+//! Search ends at the position a seat hands to combat. End Turn is
 //! an ordinary transition: `Game::end_turn_effects` runs the end-of-turn triggers and
 //! marks the seat as ended without simulating opponents or the fight, and the resulting
 //! state is a leaf (no legal actions) evaluated by the value network like any other
-//! state. `Game` is an explicit full-state experimental mode; it advances other seats
-//! with the scripted bot and is not information-limited.
+//! state.
 //!
 //! Action edges aggregate visits across distinct observable chance outcomes. Exact
 //! `Game::clone` remains available for replay; search always supplies a new seed.
@@ -21,7 +20,6 @@ use taverngym::{Game, bot, rng::Rng};
 use crate::net::{N_ACTIONS, PolicyValueNet};
 
 pub const SEARCH_VERSION: &str = "ended-state-v9-compact-play";
-pub const MAX_PLIES: usize = 2000;
 pub const MAX_DEPTH: usize = 100;
 pub const A_END_TURN: usize = A_END;
 /// Training rule, not a game rule: a seat holding this much Gold may not end its turn
@@ -50,34 +48,10 @@ pub const DEFAULT_FPU_REDUCTION: f32 = 1.5;
 /// Range of the value head's output; the variance prior at low visit counts.
 const VALUE_RANGE_RADIUS: f32 = 1.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Horizon {
-    Turn,
-    Game,
-}
-
-impl Horizon {
-    pub fn parse(s: &str) -> Result<Horizon, String> {
-        match s {
-            "turn" => Ok(Horizon::Turn),
-            "game" => Ok(Horizon::Game),
-            other => Err(format!("unknown horizon {other:?}")),
-        }
-    }
-    pub fn name(self) -> &'static str {
-        match self {
-            Horizon::Turn => "turn",
-            Horizon::Game => "game",
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct SearchOptions {
     pub sims: usize,
     pub c_puct: f32,
-    pub horizon: Horizon,
     pub max_depth: usize,
     pub root_noise: f32,
     pub noise_alpha: f32,
@@ -97,7 +71,6 @@ impl Default for SearchOptions {
         SearchOptions {
             sims: 64,
             c_puct: DEFAULT_C_PUCT,
-            horizon: Horizon::Turn,
             max_depth: MAX_DEPTH,
             root_noise: 0.0,
             noise_alpha: 0.3,
@@ -263,28 +236,6 @@ pub fn terminal_value(game: &Game, seat: usize) -> Option<f32> {
 
 pub fn is_hero_selection(game: &Game) -> bool {
     game.phase == taverngym::engine::Phase::HeroSelect
-}
-
-/// Full-game mode only: apply an action and drive the bots until `seat` can act again.
-pub fn advance(game: &mut Game, seat: usize, action: usize) -> Result<(), String> {
-    crate::actions::apply(game, seat, action).map_err(|e| e.to_string())?;
-    for _ in 0..MAX_PLIES {
-        if terminal_value(game, seat).is_some() || game.needs_action(seat) {
-            return Ok(());
-        }
-        let mut moved = false;
-        for p in 0..game.players.len() {
-            if p != seat && game.needs_action(p) {
-                let action = bot_action(game, p);
-                game.apply(p, action).map_err(|e| e.to_string())?;
-                moved = true;
-            }
-        }
-        if !moved {
-            return Ok(());
-        }
-    }
-    Err("search bot rollout exceeded its action guard".into())
 }
 
 /// The scripted bot's choice for `p` without moving the game's random stream.
@@ -521,16 +472,11 @@ pub fn search_with_seeds<E: Evaluator + ?Sized>(
     apply_root_temperature(&mut root, opts.root_temperature);
     add_root_noise(&mut root, opts.root_noise, opts.noise_alpha, rng);
 
-    // One working copy for the whole search. A turn-horizon simulation only ever changes
-    // the searched seat, the pool and a few counters, so `rewind_turn` restores those and
-    // leaves the other seats alone; a game-horizon simulation moves every seat and fights,
-    // so it gets a fresh copy.
+    // Reuse one working copy. `rewind_turn` restores the searched seat, the pool and
+    // counters touched by recruiting, leaving the other seats alone when possible.
     let mut simulation = game.clone();
     for _ in 0..opts.sims {
-        match opts.horizon {
-            Horizon::Turn => rewind_turn(&mut simulation, game, seat, next_seed(rng)),
-            Horizon::Game => simulation = reseeded(game, next_seed(rng)),
-        }
+        rewind_turn(&mut simulation, game, seat, next_seed(rng));
         // Path of (node pointer, action index); nodes are owned by the tree, so walk by
         // re-descending with indices instead of holding references.
         let mut path: Vec<(usize, u64)> = Vec::new(); // (action index, outcome key) per level
@@ -545,22 +491,17 @@ pub fn search_with_seeds<E: Evaluator + ?Sized>(
                 }
                 depth += 1;
                 if node.actions.is_empty() {
-                    // An ended seat (or a full-game dead end): reuse the leaf's evaluation.
+                    // An ended seat: reuse the leaf's evaluation.
                     value = node.value;
                     break;
                 }
                 let index = select(node, opts.c_puct, opts.fpu_reduction);
                 let action = node.actions[index];
-                match opts.horizon {
-                    Horizon::Game => advance(&mut simulation, seat, action)?,
-                    Horizon::Turn if action == A_END_TURN => {
-                        // Triggers and random end-of-turn choices run; the fight never starts.
-                        simulation
-                            .end_turn_effects(seat)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    Horizon::Turn => crate::actions::apply(&mut simulation, seat, action)
-                        .map_err(|e| e.to_string())?,
+                if action == A_END_TURN {
+                    // Resolve end effects and choices; combat never starts in search.
+                    simulation.end_turn_effects(seat).map_err(str::to_string)?;
+                } else {
+                    crate::actions::apply(&mut simulation, seat, action).map_err(str::to_string)?;
                 }
                 if let Some(v) = terminal_value(&simulation, seat) {
                     path.push((index, 0));
@@ -627,7 +568,7 @@ pub fn reseeded(game: &Game, seed: u64) -> Game {
     copy
 }
 
-/// Make `sim` equal to `reseeded(root, seed)` again after a turn-horizon simulation of
+/// Make `sim` equal to `reseeded(root, seed)` again after a recruit-phase simulation of
 /// `seat`, restoring only what such a simulation can change. Recruit actions and
 /// end-of-turn effects act on their owner alone (the cross-seat scripts fire at turn start
 /// or on elimination), so the other seats, the phase, the pairings and the lobby tables in
