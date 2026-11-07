@@ -102,7 +102,7 @@ def tar_member(stream, name, data):
     stream.write(b'\0' * ((-len(data)) % 512))
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=2)
 def binary_prefix(binary):
     buf = io.BytesIO()
     with gzip.GzipFile(fileobj=buf, mode='wb', compresslevel=1) as stream:
@@ -142,6 +142,10 @@ def run_remote(job, host, binary, directory, ttl=2400):
     with gzip.GzipFile(fileobj=buf, mode='wb', compresslevel=1) as stream:
         tar_member(stream, 'worker.py', WORKER.encode())
         tar_member(stream, 'job.json', json.dumps(dict(args=job['args'], workers=host['cpus'])).encode())
+        for name,data in job.get('payload',{}).items():
+            if '/' in name or name in ('.','..'):
+                raise ValueError('Payload names must be flat')
+            tar_member(stream,name,json.dumps(data).encode())
         for name, path in job['inputs'].items():
             if '/' in name or name in ('.', '..'):
                 raise ValueError('Inputs must have flat names')

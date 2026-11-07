@@ -41,7 +41,8 @@ class PlanningTests(unittest.TestCase):
             args=job['args']
             models=[args[i+1] for i,x in enumerate(args) if x=='--model']
             self.assertEqual(len(set(models)),8)
-            self.assertEqual(args[args.index('--rounds')+1],'64')
+            self.assertEqual(args[args.index('--tables')+1],'tables.json')
+            self.assertEqual(len(job['tables']),128)
             seeds.append(args[args.index('--seed')+1])
         self.assertEqual(len(set(seeds)),3)
 

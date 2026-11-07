@@ -2,6 +2,7 @@
 //! (padding the last table from the start of the shuffled list), so every model plays the
 //! same number of games up to the padding, and seats are random. Writes one JSON line
 //! per game; `tools/league_elo.py` fits ratings from the placements.
+//! Explicit --tables allow an external scheduler to balance cumulative appearances.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -29,6 +30,9 @@ pub struct LeagueArgs {
     /// Rounds; each round seats every model once (plus padding), i.e. ceil(N/8) games.
     #[arg(long, default_value_t = 100)]
     pub rounds: usize,
+    /// Explicit eight-player tables as JSON arrays of model names; overrides --rounds.
+    #[arg(long)]
+    pub tables: Option<PathBuf>,
     #[arg(long, default_value_t = 41_000_000)]
     pub seed: u64,
     #[arg(long, default_value_t = 64)]
@@ -72,6 +76,38 @@ fn play(
     Ok(game.players.iter().map(|p| p.placement).collect())
 }
 
+fn resolve_tables(
+    names: &[String],
+    requested: Vec<Vec<String>>,
+) -> Result<Vec<Vec<usize>>, String> {
+    if requested.is_empty() {
+        return Err("league tables must not be empty".into());
+    }
+    requested
+        .into_iter()
+        .map(|table| {
+            if table.len() != 8
+                || table
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != 8
+            {
+                return Err("each table must contain eight distinct models".into());
+            }
+            table
+                .iter()
+                .map(|name| {
+                    names
+                        .iter()
+                        .position(|n| n == name)
+                        .ok_or_else(|| format!("unknown league model: {name}"))
+                })
+                .collect()
+        })
+        .collect()
+}
+
 pub fn run(args: LeagueArgs) -> Result<(), String> {
     if args.models.len() < 8 {
         return Err("a league needs at least 8 models".into());
@@ -89,24 +125,39 @@ pub fn run(args: LeagueArgs) -> Result<(), String> {
         names.push(name.to_string());
         nets.push(PolicyValueNet::load(&PathBuf::from(path))?);
     }
+    if names
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != names.len()
+    {
+        return Err("league model names must be unique".into());
+    }
     let n = nets.len();
     let mut rng = Pcg64Mcg::seed_from_u64(args.seed ^ 0x4C45_4147);
     let mut tables: Vec<Vec<usize>> = Vec::new();
-    for _ in 0..args.rounds {
-        let mut order: Vec<usize> = (0..n).collect();
-        order.shuffle(&mut rng);
-        let pad = (8 - n % 8) % 8;
-        // Pad the last table with models from the start of the shuffle (never a duplicate
-        // within a table, since n >= 8).
-        let padded: Vec<usize> = order
-            .iter()
-            .chain(order.iter().take(pad))
-            .copied()
-            .collect();
-        for table in padded.chunks(8) {
-            let mut seats = table.to_vec();
-            seats.shuffle(&mut rng);
-            tables.push(seats);
+    if let Some(path) = &args.tables {
+        let requested: Vec<Vec<String>> =
+            serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        tables = resolve_tables(&names, requested)?;
+    } else {
+        for _ in 0..args.rounds {
+            let mut order: Vec<usize> = (0..n).collect();
+            order.shuffle(&mut rng);
+            let pad = (8 - n % 8) % 8;
+            // Pad the last table with models from the start of the shuffle (never a duplicate
+            // within a table, since n >= 8).
+            let padded: Vec<usize> = order
+                .iter()
+                .chain(order.iter().take(pad))
+                .copied()
+                .collect();
+            for table in padded.chunks(8) {
+                let mut seats = table.to_vec();
+                seats.shuffle(&mut rng);
+                tables.push(seats);
+            }
         }
     }
     crate::npz::ensure_parent(&args.out)?;
@@ -153,4 +204,26 @@ pub fn run(args: LeagueArgs) -> Result<(), String> {
         args.out.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn explicit_tables_preserve_seats_and_reject_invalid_lineups() {
+        let names: Vec<String> = (0..9).map(|i| format!("m{i}")).collect();
+        let table: Vec<String> = names[1..].iter().rev().cloned().collect();
+        assert_eq!(
+            resolve_tables(&names, vec![table.clone()]).unwrap(),
+            vec![(1..9).rev().collect::<Vec<_>>()]
+        );
+        assert!(resolve_tables(&names, vec![]).is_err());
+        assert!(resolve_tables(&names, vec![names[..7].to_vec()]).is_err());
+        let mut repeated = table.clone();
+        repeated[0] = repeated[1].clone();
+        assert!(resolve_tables(&names, vec![repeated]).is_err());
+        let mut unknown = table;
+        unknown[0] = "missing".into();
+        assert!(resolve_tables(&names, vec![unknown]).is_err());
+    }
 }

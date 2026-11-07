@@ -14,6 +14,7 @@ import zipfile
 from agent_depth_experiment import DEPTHS, STAGES, atomic_json
 from agent_remote_job import SSH, cleanup, run_remote
 from agent_eval_precision import merge, extras
+from agent_league_sampling import weighted_tables, BATCH_GAMES, UNIFORM_SHARE, COUNT_PRIOR
 
 
 def ssh(host, args, **kw):
@@ -103,10 +104,22 @@ def league_jobs(index, root, active, count):
                 if name in counts: counts[name]+=1
     if counts and min(counts.values())>=16384:
         return []
-    return [dict(id=f'league_batch{i:06d}',kind='league',step=0,inputs=inputs,
-                 relative=f'league_batch{i:06d}.json',args=['league',*specs,'--rounds','64',
-                 '--sims','64','--seed',str(81000000+i*1000000),'--out','result.json'])
-            for i in range(first,first+count)]
+    # Reserve actual lineups already dispatched, including models from older pools.
+    for job,_ in active.values():
+        for table in job.get('tables',[]):
+            for name in table:
+                if name in counts: counts[name]+=1
+    jobs=[]
+    for i in range(first,first+count):
+        seed=81000000+i*1000000
+        before=dict(counts)
+        tables=weighted_tables(counts,BATCH_GAMES,seed)
+        jobs.append(dict(id=f'league_batch{i:06d}',kind='league',step=0,inputs=inputs,
+            relative=f'league_batch{i:06d}.json',tables=tables,payload={'tables.json':tables},
+            sampling=dict(uniform_share=UNIFORM_SHARE,count_prior=COUNT_PRIOR,counts_before=before),
+            args=['league',*specs,'--tables','tables.json','--sims','64','--seed',str(seed),'--out','result.json']))
+    return jobs
+
 
 
 def main():
@@ -117,6 +130,7 @@ def main():
     p.add_argument('--hosts', type=Path, required=True)
     p.add_argument('--poll-seconds', type=float, default=30)
     p.add_argument('--once', action='store_true')
+    p.add_argument('--league-binary', type=Path, required=True)
     a = p.parse_args()
     a.root = a.root.resolve()
     a.root.mkdir(parents=True, exist_ok=True)
@@ -132,8 +146,10 @@ def main():
     if hashlib.sha256(binary.read_bytes()).hexdigest() != digest:
         raise ValueError('Evaluation binary differs from training binary')
     binary.chmod(0o700)
+    league_binary=a.league_binary.resolve()
+    league_digest=hashlib.sha256(league_binary.read_bytes()).hexdigest()
     atomic_json(a.root/'manifest.json', dict(source=a.source, archive=a.archive,
-        training_binary_sha256=digest, hosts=hosts, stages=STAGES, total_jobs=total))
+        training_binary_sha256=digest, league_binary_sha256=league_digest, hosts=hosts, stages=STAGES, total_jobs=total))
     quarantined, failures, retry_at = {}, {}, {}
 
     def recover(skip=()):
@@ -165,8 +181,13 @@ def main():
                 try:
                     response = future.result()
                     result = response['result']
+                    if job['kind']=='league':
+                        rows=result['matches']
+                        if len(rows)!=len(job['tables']) or {r['game'] for r in rows}!=set(range(len(rows))) or any(r['models']!=job['tables'][r['game']] for r in rows):
+                            raise ValueError('League results do not match reserved tables')
                     result['_execution'] = dict(host=host['host'], workers=host['cpus'],
-                        binary_sha256=digest, seconds=response['seconds'], cleanup_verified=True,
+                        binary_sha256=league_digest if job['kind']=='league' else digest,
+                        sampling=job.get('sampling'), seconds=response['seconds'], cleanup_verified=True,
                         checkpoints=job['checkpoints'], completed=time.time())
                     output = a.root/'results'/job['relative']
                     output.parent.mkdir(parents=True, exist_ok=True)
@@ -224,7 +245,7 @@ def main():
                     resolved[alias] = str(local)
                 job = dict(job, checkpoints=job['inputs'], inputs=resolved,
                            args=job['args']+['--workers', str(host['cpus'])])
-                future = pool.submit(run_remote, job, host, binary, a.root/'jobs'/job['id'])
+                future = pool.submit(run_remote, job, host, league_binary if job['kind']=='league' else binary, a.root/'jobs'/job['id'])
                 active[future] = (job, host)
             # Publishing is retried independently; failed transfers never repeat a completed match.
             published = 0

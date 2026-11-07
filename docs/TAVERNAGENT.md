@@ -448,7 +448,7 @@ Training nodes do no eval, Arena or behaviour probes. `tools/agent_remote_eval.p
 queues raw/EMA eval every 100 rounds and an ongoing eight-player league on six borrowed
 64-core BF16-capable hosts. Each host runs one job at a time. Eval uses 512 games at
 round 100 and 2048 thereafter. The league puts all raw/EMA checkpoints into one pool,
-shuffles them into eight-distinct-model tables and records full placements (64 simulations).
+samples eight distinct models per table, with 80% inverse-count weight and a 20% uniform floor and records full placements (64 simulations).
 `tools/league_elo.py` fits Plackett–Luce Elo-scale ratings, with whole-game bootstrap uncertainty.
 Paired Arena results are historical only and are excluded from league ratings.
 Training never waits for the evaluation queue.
@@ -481,7 +481,13 @@ weights, while current replay/optimizer/RNG state is retained for exact resume.
   pooling away warband order would discard strategically relevant information.
 
 Idle evaluation slots add independent 512-game seed batches to the latest checkpoints,
-up to 16,384 eval games per checkpoint. Spare slots run 64-round league batches until
+up to 16,384 eval games per checkpoint. Spare slots run 128-game league batches until
 each model has at least 16,384 seat appearances. New checkpoint evaluations take priority
 at job boundaries. Reports pool all games; league uncertainty resamples whole games. Repeated monitoring uses descriptive 95% intervals,
 not a sequential significance test. Cards show only progress, placement intervals and plots.
+
+League selection uses `0.2/N + 0.8 * (count+256)^-1 / sum((count+256)^-1)`
+for each model, sampling without replacement and shuffling seats. Counts include completed
+games and exact reserved lineups of running/queued batches, and increase after each planned
+table. Failed jobs release their reservations. The league executable accepts these explicit
+tables; the training/eval executable and inference code remain unchanged.
