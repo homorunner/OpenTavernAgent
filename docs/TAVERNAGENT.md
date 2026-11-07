@@ -442,9 +442,9 @@ Restarted from scratch with max-samples 80,000 (+22% per epoch) and the schedule
 it does not by itself increase average row reuse. The brief initial lr=1e-4 runs were discarded.
 Each gets 128 physical cores on one NUMA node. This is a one-seed screening experiment.
 
-`tools/agent_depth_experiment.py` runs to 1,500 rounds, evaluates raw/EMA against bots
-at 100/500/1000/1500 (512 games initially, then 2048), and runs all six paired EMA
-arenas at 500/1000/1500 (512 games, 64 simulations). Final arenas also compare checkpoints
+`tools/agent_depth_experiment.py` runs to 3,000 rounds, matching the previous overnight campaign. It evaluates
+raw/EMA against bots at 100 and every 500 rounds through 3000 (512 games initially,
+then 2048), and runs all six paired EMA arenas every 500 rounds (512 games, 64 simulations). Final arenas also compare checkpoints
 matched by cumulative sampling+training seconds; this excludes checkpoint I/O and
 pauses for evaluation. Weight checkpoints every 100 rounds support that comparison.
 Training and evaluation run in separate phases to avoid CPU contention.

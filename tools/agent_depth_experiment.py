@@ -19,7 +19,7 @@ import time
 import zipfile
 
 DEPTHS = (6, 8, 10, 12)
-STAGES = (100, 500, 1000, 1500)
+STAGES = (100, 500, 1000, 1500, 2000, 2500, 3000)
 
 
 def atomic_json(path, value):
@@ -121,7 +121,7 @@ def main():
                     lr=3e-5, epochs=2, batch=512, max_samples=80000,
                     replay_schedule='min(6, 3 + step // 200)',
                     work=str(a.work), archive=str(a.archive),
-                    evaluation='EMA+raw vs bots at each stage; six paired EMA arenas at 500/1000/1500; final matched-compute arenas',
+                    evaluation='EMA+raw vs bots at each stage; six paired EMA arenas every 500 rounds through 3000; final matched-compute arenas',
                     matched_compute='sum of collect_seconds+train_seconds; excludes pauses, evaluation and checkpoint I/O',
                     limitation='One training seed: screening only; replicate winners before concluding depth is better.')
     manifest = json.loads(json.dumps(manifest))
