@@ -442,20 +442,27 @@ Restarted from scratch with max-samples 80,000 (+22% per epoch) and the schedule
 it does not by itself increase average row reuse. The brief initial lr=1e-4 runs were discarded.
 Each gets 128 physical cores on one NUMA node. This is a one-seed screening experiment.
 
-`tools/agent_depth_experiment.py` runs to 3,000 rounds, matching the previous overnight campaign. It evaluates
-raw/EMA against bots at 100 and every 500 rounds through 3000 (512 games initially,
-then 2048), and runs all six paired EMA arenas every 500 rounds (512 games, 64 simulations). Final arenas also compare checkpoints
-matched by cumulative sampling+training seconds; this excludes checkpoint I/O and
-pauses for evaluation. Weight checkpoints every 100 rounds support that comparison.
-Each depth advances independently on its own NUMA node: train to a stage, archive,
-evaluate raw/EMA, then continue. Ready Arena pairs run between stages or on nodes whose
-training has finished; a node runs only one job at a time. There is no cross-depth training
-barrier. Final matched-compute arenas run after all training finishes.
+`tools/agent_depth_experiment.py` trains each depth independently to **3,000 rounds**,
+matching the previous overnight campaign, and archives checkpoints every **100 rounds**.
+Training nodes do no eval, Arena or behaviour probes. `tools/agent_remote_eval.py`
+queues raw/EMA eval and all six paired EMA arenas every 100 rounds on six borrowed
+64-core BF16-capable hosts. Each host runs one job at a time. Eval uses 512 games at
+round 100 and 2048 thereafter; Arena uses 512 seat-swapped games. Both use 64 simulations
+and fixed seeds. The final six arenas match cumulative sampling+training seconds.
+Training never waits for the evaluation queue.
+
+Queue state, results and PNG figures are mirrored locally in `runs/depth_remote_eval_20261107/`.
+Completed results are also published back to the training archive. Borrowed hosts receive
+only per-job `/tmp/tavernagent-depth-eval-*` directories; finally cleanup, an independent
+watchdog and post-job verification cover normal completion, failures and abandoned jobs.
+The 20-minute notification card includes placement curves and Arena score plots/matrices.
+Arena scores measure cross-team placement comparisons, not game win rates.
 
 Scratch/replay: `/tmp/tavernagent-depth-replay-20261107/`; durable results and latest resumable
 states: `<workspace>/runs/depth_replay_20261107/` on experiment.
 The manifest records the source revision, binary hash and settings; `status.json`
-records the overall phase, while `d*/status.json` records each lane's training/evaluation/Arena state.
+records the training phase, while `d*/status.json` records each lane's training/archive state.
+`remote_eval_status.json` records the external queue and failures.
 Per-depth stage markers and completed result files make restarts idempotent.
 Older immutable replay snapshots are removed after archiving
 weights, while current replay/optimizer/RNG state is retained for exact resume.

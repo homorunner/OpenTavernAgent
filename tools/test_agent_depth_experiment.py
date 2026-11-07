@@ -68,22 +68,14 @@ class IndependentSchedulingTests(unittest.TestCase):
         self.barrier_test = threading.Event()
         self.run_scheduler((100, 500, 1000))
         self.assertTrue(self.barrier_test.is_set())
-        arenas = [cmd for _, cmd in self.calls if cmd[1] == 'arena']
-        self.assertEqual(len(arenas), 12)
-        self.assertEqual(len({cmd[cmd.index('--out')+1] for cmd in arenas}), 12)
-        self.assertEqual(len([cmd for _, cmd in self.calls if cmd[1] == 'eval']), 24)
+        self.assertEqual(len(self.calls), 12)
+        self.assertTrue(all(cmd[1] == 'selfplay' for _, cmd in self.calls))
         for d in runner.DEPTHS:
             state = json.loads((self.args.archive/f'd{d}/status.json').read_text())
             self.assertEqual(state['phase'], 'complete')
         self.calls.clear()
         self.run_scheduler((100, 500, 1000))
         self.assertEqual(self.calls, [], 'Completed jobs must not run again')
-        interrupted = next(self.args.archive.glob('arena_*.json'))
-        interrupted.write_text('{')
-        self.run_scheduler((100, 500, 1000))
-        self.assertEqual(len(self.calls), 1, 'Only the interrupted arena should rerun')
-        self.assertEqual(self.calls[0][1][1], 'arena')
-        self.assertTrue(runner.result_complete(interrupted))
 
     def test_resumes_inflight_stage_from_old_global_scheduler_without_retraining(self):
         for d in runner.DEPTHS:
