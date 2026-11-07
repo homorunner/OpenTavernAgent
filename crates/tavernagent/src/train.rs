@@ -42,7 +42,7 @@ pub struct SelfplayArgs {
     /// Training passes per round; each draws `max_samples` from the replay window.
     #[arg(long, default_value_t = 2)]
     pub epochs: usize,
-    #[arg(long, default_value_t = 1e-4)]
+    #[arg(long, default_value_t = 3e-5)]
     pub lr: f64,
     /// Final learning rate when --lr-decay-steps is positive; otherwise ignored.
     #[arg(long, default_value_t = 3e-5)]
@@ -55,7 +55,7 @@ pub struct SelfplayArgs {
     #[arg(long, default_value_t = 10)]
     pub workers: usize,
     /// Size of the uniform draw from the replay window that each epoch trains on.
-    #[arg(long, default_value_t = 65_536)]
+    #[arg(long, default_value_t = 80_000)]
     pub max_samples: usize,
     #[command(flatten)]
     #[serde(flatten)]
@@ -131,9 +131,9 @@ pub struct SelfplayArgs {
     /// Start from these weights (optimizer and step count start over).
     #[arg(long)]
     pub resume: Option<PathBuf>,
-    /// Self-play rounds kept in the replay window that training draws from.
-    #[arg(long, default_value_t = 5)]
-    pub replay_rounds: usize,
+    /// Fixed replay window override; otherwise min(6, 3 + step / 200) rounds.
+    #[arg(long)]
+    pub replay_rounds: Option<usize>,
     /// Length of the cosine schedule in rounds (0 = constant learning rate).
     #[arg(long, default_value_t = 0)]
     pub lr_decay_steps: usize,
@@ -161,6 +161,11 @@ impl Default for SelfplayArgs {
 }
 
 impl SelfplayArgs {
+    /// Capacity at the cumulative training round (integer division).
+    pub fn replay_capacity(&self, step: usize) -> usize {
+        self.replay_rounds.unwrap_or(3 + (step / 200).min(3))
+    }
+
     pub fn net_config(&self) -> NetConfig {
         NetConfig {
             hidden: self.hidden,
@@ -224,7 +229,7 @@ impl SelfplayArgs {
                 "lr-min must be finite and nonnegative, and <= lr when decay is enabled".into(),
             );
         }
-        if self.replay_rounds < 1 {
+        if self.replay_rounds == Some(0) {
             return Err("replay-rounds must be positive".into());
         }
         if !(self.ema_rounds.is_finite() && self.ema_rounds > 0.0) {
@@ -318,7 +323,8 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
         None => PolicyValueNet::new(args.seed, args.net_config())?,
     };
     let mut trainer = Trainer::new(net, args.hparams());
-    let mut replay = ReplayWindow::new(args.replay_rounds)?;
+    // Restore the whole window at the saved round, before advancing the schedule.
+    let mut replay = ReplayWindow::new(args.replay_capacity(first_step - 1))?;
     let mut train_rng = Pcg64Mcg::seed_from_u64(args.seed ^ 0x5452_4149);
     let mut replay_rng = Pcg64Mcg::seed_from_u64(args.seed ^ 0x5245_504C);
     let mut history: Vec<Value> = Vec::new();
@@ -440,6 +446,7 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
             rollout_decisions += decisions;
         }
         let fresh_count = fresh.len();
+        replay.set_capacity(args.replay_capacity(step))?;
         replay.add(fresh);
         let collect_seconds = t0.elapsed().as_secs_f64();
 
@@ -507,6 +514,7 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
             "lr": lr,
             "fresh_samples": fresh_count,
             "replay_rounds": replay.rounds.len(),
+            "replay_capacity": replay.capacity,
             "replay_size": replay.len(),
             "collect_seconds": collect_seconds,
             "rollout_decisions": rollout_decisions,
@@ -576,6 +584,35 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_schedule_uses_cumulative_rounds_and_allows_a_fixed_override() {
+        let mut args = SelfplayArgs::default();
+        assert_eq!(args.max_samples, 80_000);
+        assert_eq!(args.lr, 3e-5);
+        assert_eq!(args.updates_per_round(), 314);
+        for (step, capacity) in [
+            (1, 3),
+            (199, 3),
+            (200, 4),
+            (399, 4),
+            (400, 5),
+            (599, 5),
+            (600, 6),
+            (usize::MAX, 6),
+        ] {
+            assert_eq!(args.replay_capacity(step), capacity);
+        }
+        args.replay_rounds = Some(2);
+        assert_eq!(args.replay_capacity(600), 2);
+        let saved = serde_json::to_value(&args).unwrap();
+        let inherited = SelfplayArgs::default()
+            .inherit(&saved, &HashSet::new())
+            .unwrap();
+        assert_eq!(inherited.replay_capacity(600), 2);
+        args.replay_rounds = Some(0);
+        assert!(args.validate().is_err());
+    }
 
     #[test]
     fn constant_lr_allows_rates_below_the_unused_cosine_minimum() {

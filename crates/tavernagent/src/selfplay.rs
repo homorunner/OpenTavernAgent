@@ -895,6 +895,17 @@ impl ReplayWindow {
         })
     }
 
+    pub fn set_capacity(&mut self, capacity: usize) -> Result<(), String> {
+        if capacity < 1 {
+            return Err("replay window must be positive".into());
+        }
+        self.capacity = capacity;
+        while self.rounds.len() > capacity {
+            self.rounds.pop_front();
+        }
+        Ok(())
+    }
+
     pub fn add(&mut self, samples: Vec<Sample>) {
         if self.rounds.len() == self.capacity {
             self.rounds.pop_front();
@@ -1050,7 +1061,7 @@ pub struct TrainingState<'a> {
 /// Atomic optimizer/RNG/replay snapshot for exact continued training.
 ///
 /// The replay window is stored in full (float32 observations): every decision of the last
-/// `replay_rounds` rounds, about 9 KB each, so roughly 6 GB at the defaults.
+/// stored rounds, about 9 KB per row. Size grows with the scheduled window and splits.
 pub fn save_training_state(path: &Path, state: &TrainingState) -> Result<(), String> {
     let trainer = state.trainer;
     let meta = TrainerMeta {

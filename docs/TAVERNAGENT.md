@@ -15,7 +15,7 @@ cargo build --release -p tavernagent
 A=target/release/tavernagent
 
 # Train 100 rounds (128 roots per round, binary split before turn-4 combat;
-# a third of decisions searched at 256 simulations; 2 epochs, constant lr 1e-4).
+# a third of decisions searched at 256 simulations; 2 epochs, constant lr 3e-5).
 $A selfplay --steps 100 --workers 32 --save-trainer-state --save-every 50 --out runs/agent/model.npz
 
 # Continue exactly from the saved trainer state to round 200; saved options apply unless
@@ -225,7 +225,7 @@ distribution, normalized by the sum of weights of rows with legal actions; `--va
 (0.5) times value MSE normalized by the sum of all row weights. Optional `--pg-weight` adds
 a REINFORCE term with the same policy row weights and the value as baseline. AdamW (decay on
 weight matrices only), global gradient-norm clipping, and a constant learning rate by
-default (`--lr 1e-4 --lr-decay-steps 0`). Set a positive `--lr-decay-steps` and a lower
+default (`--lr 3e-5 --lr-decay-steps 0`). Set a positive `--lr-decay-steps` and a lower
 `--lr-min` to enable cosine decay; `--lr-min` is unused when decay is disabled.
 
 **Parallel step.** A minibatch is processed in fixed chunks of `STEP_CHUNK_ROWS` (32) rows,
@@ -236,8 +236,10 @@ of threads (`tests/training.rs` checks one against seven threads bit for bit). C
 `train_seconds` and optimizer updates alongside placement when changing batch size.
 
 **Data.** Every recorded search decision and ended position enters a replay window of
-`--replay-rounds` (5) rounds. Each epoch (`--epochs 2`) trains on a uniform draw of
-`--max-samples` (65,536) from the window. Tree rollouts add rows without increasing this
+`min(6, 3 + step / 200)` rounds (integer division using the cumulative training round):
+3 initially, 4 at round 200, 5 at 400, and 6 from 600. `--replay-rounds N` overrides
+this with a fixed window. Each epoch (`--epochs 2`) trains on a uniform draw of
+`--max-samples` (80,000) from the window. Tree rollouts add rows without increasing this
 training cap, so they also change the average reuse of a row at the same epoch count.
 
 **EMA.** An EMA copy of the weights is updated every minibatch with a decay derived from
@@ -248,8 +250,8 @@ training cap, so they also change the average reuse of a row at the same epoch c
 | --- | --- |
 | `--steps` / `--games` | 200 / 128 |
 | `--sims` / `--c-puct` | 256 / 1.9 |
-| `--replay-rounds` / `--epochs` / `--max-samples` / `--batch` | 5 / 2 / 65,536 / 512 |
-| `--lr` / `--lr-min` / `--lr-decay-steps` | 1e-4 / 3e-5 (unused without decay) / 0 (constant) |
+| `--replay-rounds` / `--epochs` / `--max-samples` / `--batch` | scheduled 3→6 / 2 / 80,000 / 512 |
+| `--lr` / `--lr-min` / `--lr-decay-steps` | 3e-5 / 3e-5 (unused without decay) / 0 (constant) |
 | `--noise` / `--noise-alpha` / `--end-explore` | 0.20 / 0.3 / 0.02 |
 | `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 0.5 / 0.5 |
 | `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 0 / 0.15 |
@@ -264,7 +266,8 @@ and the **whole replay window** to `<out>.trainer.npz` after every round. Snapsh
 depends on the number of stored rows, including tree continuations; `--save-every N` keeps
 immutable `<out>.stepN.npz` / `.ema.npz` / `.trainer.npz`.
 `--resume-state` restores all of it bit-exactly (a smaller `--replay-rounds` keeps the newest
-rounds); `--resume` loads weights only. `<out>.history.json` records per-round losses,
+rounds); the default window schedule continues from the saved round.
+`--resume` loads weights only. `<out>.history.json` records per-round losses,
 gradient norms, entropies, target KL, the ended sample counts and timings. Losses and
 per-epoch metrics currently describe the last training epoch, not an independent
 validation set; `samples` counts that epoch's draw, not the total across all epochs.
@@ -310,8 +313,8 @@ evaluation; the last evaluated checkpoints were rounds 2500 and 3000 respectivel
   from 0.226 to 0.206 while MSE on fresh self-play rose from 0.246 to 0.268. Increasing
   batch size should be tested alongside training intensity, not treated as a proven fix.
 
-Older pre-FPU results are omitted; raw results and checkpoints are archived on `experiment` at
-`<workspace>/runs/archive/20261106/`.
+Older pre-FPU results are omitted. Pre-v10 code, binaries and experiment artifacts on
+`experiment` were deleted on 2026-11-07; historical results below are retained as summaries.
 
 ### Tree rollout / batch / epochs comparison (2026-11-06–07)
 
@@ -319,8 +322,8 @@ Four runs on `experiment`, from commit `3eb0302` and identical initial weights:
 A = batch 512 / epochs 1, B = 1024 / 1, C = 512 / 2, D = 1024 / 2.
 All completed 3,000 rounds with 128 roots/round, split-turn=4 (child weight 0.55),
 256 simulations, 128 workers, replay 5, max-samples 65,536, constant lr=3e-5,
-temperature=1, FPU=1.5, LCB=0 and seed 444444444. Records live at
-`<workspace>/runs/tree4_batch_epochs_20261106/`.
+temperature=1, FPU=1.5, LCB=0 and seed 444444444. Remote raw artifacts were
+removed in the 2026-11-07 cleanup.
 
 **Data utilization decreased.** Early collection produces roughly 140k rows/round
 versus 78k without splitting, but each epoch still draws only 65,536 rows from replay.
@@ -426,14 +429,17 @@ only **17.7%** against the control across three seeds. These models had finite w
 lower training loss alone does not establish stronger play. Split changes data quantity,
 weights and reuse as well as target variance. Further temperature reduction (.25/.1)
 and other loss/prior changes remain candidates, not confirmed defaults. These remain candidates for later training-intensity experiments; the next campaign
-instead isolates network depth under the current E2/lr=1e-4 recipe.
+instead isolates network depth with E2 and the more conservative constant lr=3e-5.
 
 ### Pre-norm FFN depth comparison (2026-11-07)
 
 Four fresh v10 runs on TavernGym 37.0.2: **6/8/10/12 blocks**, respectively
 **2.378M / 2.774M / 3.169M / 3.565M** parameters. All use width 256, embedding 32,
 FFN width 384, seed 444444444 and the same default training/search recipe
-(128 roots, sims 256, search probability .33, split T4, E2, lr 1e-4, batch 512).
+(128 roots, sims 256, search probability .33, split T4, E2, lr 3e-5, batch 512).
+Restarted from scratch with max-samples 80,000 (+22% per epoch) and the scheduled
+3→6-round replay window. A larger window broadens data coverage; at a fixed draw size
+it does not by itself increase average row reuse. The brief initial lr=1e-4 runs were discarded.
 Each gets 128 physical cores on one NUMA node. This is a one-seed screening experiment.
 
 `tools/agent_depth_experiment.py` runs to 1,500 rounds, evaluates raw/EMA against bots
@@ -443,8 +449,8 @@ matched by cumulative sampling+training seconds; this excludes checkpoint I/O an
 pauses for evaluation. Weight checkpoints every 100 rounds support that comparison.
 Training and evaluation run in separate phases to avoid CPU contention.
 
-Scratch/replay: `/tmp/tavernagent-depth-20261107/`; durable results and latest resumable
-states: `<workspace>/runs/depth_prenorm_20261107/` on experiment.
+Scratch/replay: `/tmp/tavernagent-depth-replay-20261107/`; durable results and latest resumable
+states: `<workspace>/runs/depth_replay_20261107/` on experiment.
 The manifest records the source revision, binary hash and settings; `status.json`
 records the current phase. Older immutable replay snapshots are removed after archiving
 weights, while current replay/optimizer/RNG state is retained for exact resume.

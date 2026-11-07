@@ -503,10 +503,74 @@ fn selfplay_args(out: PathBuf, steps: usize) -> SelfplayArgs {
         embedding_dim: 4,
         probe_every: 0,
         save_trainer_state: true,
-        replay_rounds: 2,
+        replay_rounds: Some(2),
         out,
         ..SelfplayArgs::default()
     }
+}
+
+#[test]
+fn scheduled_replay_resumes_exactly_across_a_growth_boundary() {
+    let dir = tmp("scheduled-resume");
+    let (_, decision) = batch();
+    let mut replay = ReplayWindow::new(4).unwrap();
+    for _ in 0..4 {
+        replay.add(vec![decision.clone()]);
+    }
+    let args = |name: &str, steps| SelfplayArgs {
+        hidden: 16,
+        blocks: 1,
+        replay_rounds: None,
+        ..selfplay_args(dir.join(format!("{name}.npz")), steps)
+    };
+    let trainer = Trainer::new(
+        PolicyValueNet::new(12, args("full", 401).net_config()).unwrap(),
+        args("full", 401).hparams(),
+    );
+    let rng = Pcg64Mcg::seed_from_u64(10);
+    let replay_rng = Pcg64Mcg::seed_from_u64(11);
+    for name in ["full", "split"] {
+        save_training_state(
+            &dir.join(format!("{name}.trainer.npz")),
+            &TrainingState {
+                trainer: &trainer,
+                step: 398,
+                train_rng: &rng,
+                replay_rng: &replay_rng,
+                history: &[],
+                stats: &Stats::default(),
+                options: serde_json::to_value(args(name, 401)).unwrap(),
+                replay: Some(&replay),
+            },
+        )
+        .unwrap();
+    }
+    for (name, steps) in [("full", 401), ("split", 399), ("split", 401)] {
+        let mut run = args(name, steps);
+        run.resume_state = Some(dir.join(format!("{name}.trainer.npz")));
+        train::run(run, &HashSet::from(["steps".into(), "resume_state".into()])).unwrap();
+    }
+    assert_eq!(
+        PolicyValueNet::load(&dir.join("full.npz")).unwrap().p,
+        PolicyValueNet::load(&dir.join("split.npz")).unwrap().p
+    );
+    for name in ["full", "split"] {
+        let history: Vec<serde_json::Value> = serde_json::from_slice(
+            &std::fs::read(dir.join(format!("{name}.history.json"))).unwrap(),
+        )
+        .unwrap();
+        for (row, expected) in history.iter().zip([4, 5, 5]) {
+            assert_eq!(row["replay_capacity"], expected);
+            assert_eq!(row["replay_rounds"], expected);
+        }
+        assert_eq!(history.len(), 3);
+    }
+    // A fixed smaller override drops oldest rounds; an invalid resize changes nothing.
+    replay.set_capacity(2).unwrap();
+    assert_eq!(replay.rounds.len(), 2);
+    assert!(replay.set_capacity(0).is_err());
+    assert_eq!(replay.capacity, 2);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
