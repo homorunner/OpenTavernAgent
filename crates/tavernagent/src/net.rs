@@ -1,7 +1,7 @@
 //! A small pre-norm residual policy/value network with a shared card embedding.
 //!
 //! ```text
-//! numeric features + flattened card embeddings + legal action mask -> 192 -> residual blocks
+//! numeric features + flattened card embeddings + legal action mask -> 256 -> pre-norm FFN residual blocks
 //!     -> {116 policy logits, 1 tanh value}
 //! ```
 //!
@@ -9,6 +9,7 @@
 //! many search threads at once. Backward is written by hand and checked numerically
 //! in the crate tests.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -20,16 +21,17 @@ use taverngym::actions as a;
 use taverngym::cards::{CardKind, db};
 use taverngym::obs as o;
 
-use crate::linalg::{Bf16Mat, Mat};
+use crate::linalg::{Bf16DotMat, Bf16Mat, Mat, native_bf16_available};
 use crate::npz::{NpyArray, Npz};
 
 /// Compact policy layout; resolved to engine actions using the current state.
 pub const N_ACTIONS: usize = crate::actions::N_ACTIONS;
 pub const N_FEATURES: usize = o::OBS_FLOATS;
 pub const N_CARD_SLOTS: usize = o::OBS_CARDS;
-pub const DEFAULT_HIDDEN: usize = 192;
+pub const DEFAULT_HIDDEN: usize = 256;
+pub const DEFAULT_EMBEDDING_DIM: usize = 32;
 pub const DEFAULT_BLOCKS: usize = 6;
-pub const MODEL_VERSION: i64 = 9;
+pub const MODEL_VERSION: i64 = 10;
 pub const N_OPP_BOARD_SLOTS: usize = o::N_OPP * a::N_BOARD;
 pub const OPP_BOARD_FEATURE_START: usize = N_FEATURES - N_OPP_BOARD_SLOTS * o::MINION_F;
 /// The ended-turn flag: the seat has finished recruiting and has no legal action.
@@ -172,6 +174,25 @@ fn fast_tanh(x: f32) -> f32 {
 /// `Activation::apply` over a slice with `fast_tanh`; one loop per activation so that the
 /// compiler vectorises it.
 fn apply_fast(act: Activation, h: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f") {
+        // SAFETY: the feature is checked; the kernel only iterates the slice.
+        unsafe {
+            apply_fast_avx512(act, h);
+        }
+        return;
+    }
+    apply_fast_impl(act, h);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn apply_fast_avx512(act: Activation, h: &mut [f32]) {
+    apply_fast_impl(act, h);
+}
+
+#[inline(always)]
+fn apply_fast_impl(act: Activation, h: &mut [f32]) {
     match act {
         Activation::Gelu => {
             for v in h.iter_mut() {
@@ -194,14 +215,6 @@ fn apply_fast(act: Activation, h: &mut [f32]) {
     }
 }
 
-/// `h += scale * act(z)` with `fast_tanh`.
-fn add_residual_fast(act: Activation, h: &mut [f32], z: &mut [f32], scale: f32) {
-    apply_fast(act, z);
-    for (hv, nv) in h.iter_mut().zip(z.iter()) {
-        *hv += scale * nv;
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NetConfig {
     /// Width of the trunk.
@@ -219,7 +232,7 @@ impl Default for NetConfig {
         NetConfig {
             hidden: DEFAULT_HIDDEN,
             blocks: DEFAULT_BLOCKS,
-            embedding_dim: 16,
+            embedding_dim: DEFAULT_EMBEDDING_DIM,
             activation: Activation::Gelu,
             residual_scale: 1.0,
             head_norm: false,
@@ -227,7 +240,14 @@ impl Default for NetConfig {
     }
 }
 
-/// Named tensors in a fixed order: E, W0, b0, g0, k0, (Wi, bi, gi, ki) per block, Wp, bp,
+impl NetConfig {
+    /// Fixed 3/2 expansion; rounded up for odd widths used in small tests.
+    pub fn ff_hidden(&self) -> usize {
+        self.hidden + self.hidden.div_ceil(2)
+    }
+}
+
+/// Named tensors in a fixed order: E, W0, b0, g0, k0, (W_up, b_up, W_down, b_down, g, k) per block, Wp, bp,
 /// Wv, bv.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Params {
@@ -241,20 +261,25 @@ pub const B0: usize = 2;
 pub const G0: usize = 3;
 pub const K0: usize = 4;
 const fn block(i: usize) -> usize {
-    5 + 4 * i
+    5 + 6 * i
 }
-/// Weight of residual block `i`.
-pub const fn w(i: usize) -> usize {
+pub const fn w_up(i: usize) -> usize {
     block(i)
 }
-pub const fn b(i: usize) -> usize {
+pub const fn b_up(i: usize) -> usize {
     block(i) + 1
 }
-pub const fn g(i: usize) -> usize {
+pub const fn w_down(i: usize) -> usize {
     block(i) + 2
 }
-pub const fn k(i: usize) -> usize {
+pub const fn b_down(i: usize) -> usize {
     block(i) + 3
+}
+pub const fn g(i: usize) -> usize {
+    block(i) + 4
+}
+pub const fn k(i: usize) -> usize {
+    block(i) + 5
 }
 
 pub fn tensor_names(blocks: usize) -> Vec<String> {
@@ -266,9 +291,14 @@ pub fn tensor_names(blocks: usize) -> Vec<String> {
         "k0".into(),
     ];
     for i in 1..=blocks {
-        for prefix in ["W", "b", "g", "k"] {
-            names.push(format!("{prefix}{i}"));
-        }
+        names.extend([
+            format!("W{i}_up"),
+            format!("b{i}_up"),
+            format!("W{i}_down"),
+            format!("b{i}_down"),
+            format!("g{i}"),
+            format!("k{i}"),
+        ]);
     }
     names.extend(["Wp".into(), "bp".into(), "Wv".into(), "bv".into()]);
     names
@@ -311,7 +341,7 @@ impl Params {
         index == W0
             || index == self.wp()
             || index == self.wv()
-            || (0..self.blocks).any(|i| index == w(i))
+            || (0..self.blocks).any(|i| index == w_up(i) || index == w_down(i))
     }
 }
 
@@ -346,6 +376,17 @@ fn layer_norm_row(x: &mut [f32], gamma: &[f32], beta: &[f32]) {
     let s = 1.0 / (var + eps).sqrt();
     for j in 0..x.len() {
         x[j] = (x[j] - mean) * s * gamma[j] + beta[j];
+    }
+}
+
+/// Parameter-free head normalization, without allocating gamma/beta vectors.
+fn layer_norm_unit_row(x: &mut [f32]) {
+    let n = x.len() as f32;
+    let mean = x.iter().sum::<f32>() / n;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
+    let inv = 1.0 / (var + 1e-5).sqrt();
+    for v in x {
+        *v = (*v - mean) * inv;
     }
 }
 
@@ -400,9 +441,15 @@ fn layer_norm_backward(grad: &Mat, cache: &LnCache, gamma: &[f32]) -> (Mat, Vec<
     (dx, dgamma, dbeta)
 }
 
-struct Layer {
-    h_in: Mat,
+struct StemCache {
     n: Mat,
+    ln: LnCache,
+}
+
+struct BlockCache {
+    normed: Mat,
+    pre_activation: Mat,
+    activated: Mat,
     ln: LnCache,
 }
 
@@ -410,7 +457,8 @@ struct Layer {
 pub struct Cache {
     x_in: Mat,
     cards: Vec<i32>, // batch x used slots, after the allowed-kind filter
-    layers: Vec<Layer>,
+    stem: StemCache,
+    blocks: Vec<BlockCache>,
     h_final: Mat,
     head_ln: Option<LnCache>,
     value: Vec<f32>,
@@ -429,25 +477,75 @@ pub struct PolicyValueNet {
     fast: OnceLock<FastWeights>,
 }
 
-/// The weight matrices in bfloat16 (biases and LayerNorm parameters stay f32 in `p`).
+/// Search kernels can be compared without changing checkpoint semantics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum InferenceBackend {
+    #[default]
+    Auto,
+    /// BF16 weights, FP32 activations and FMA accumulation.
+    Fma,
+    /// Native BF16 dot product for dense FFN layers; inputs/heads still use FMA.
+    Dot,
+}
+
+/// Per-thread scratch, resized only when switching to a larger/different architecture.
+/// No model-specific values survive a call. Explicit ownership also supports benchmarks.
+#[derive(Default)]
+pub struct InferenceWorkspace {
+    input: Vec<f32>,
+    hidden: Vec<f32>,
+    normed: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
+    heads: Vec<f32>,
+    pairs: Vec<u32>,
+}
+
+thread_local! {
+    static INFERENCE_WORKSPACE: RefCell<InferenceWorkspace> = RefCell::default();
+}
+
+/// BF16 search weights; normalization, biases, activations and accumulation are FP32.
 #[derive(Clone, Debug)]
 struct FastWeights {
     w0: Bf16Mat,
-    blocks: Vec<Bf16Mat>,
-    wp: Bf16Mat,
-    wv: Bf16Mat,
+    blocks: Vec<(Bf16Mat, Bf16Mat)>,
+    // Policy/value share one product to avoid a mostly-empty SIMD value-head pass.
+    heads: Bf16Mat,
+    dot_blocks: OnceLock<Vec<(Bf16DotMat, Bf16DotMat)>>,
 }
 
 impl FastWeights {
     fn new(p: &Params) -> FastWeights {
+        let wp = &p.tensors[p.wp()];
+        let wv = &p.tensors[p.wv()];
+        let mut heads = Mat::zeros(wp.rows, N_ACTIONS + 1);
+        for r in 0..wp.rows {
+            heads.row_mut(r)[..N_ACTIONS].copy_from_slice(wp.row(r));
+            heads.row_mut(r)[N_ACTIONS] = wv.data[r];
+        }
         FastWeights {
             w0: Bf16Mat::from_mat(&p.tensors[W0]),
             blocks: (0..p.blocks)
-                .map(|i| Bf16Mat::from_mat(&p.tensors[w(i)]))
+                .map(|i| {
+                    (
+                        Bf16Mat::from_mat(&p.tensors[w_up(i)]),
+                        Bf16Mat::from_mat(&p.tensors[w_down(i)]),
+                    )
+                })
                 .collect(),
-            wp: Bf16Mat::from_mat(&p.tensors[p.wp()]),
-            wv: Bf16Mat::from_mat(&p.tensors[p.wv()]),
+            heads: Bf16Mat::from_mat(&heads),
+            dot_blocks: OnceLock::new(),
         }
+    }
+
+    fn dot_blocks(&self) -> &[(Bf16DotMat, Bf16DotMat)] {
+        self.dot_blocks.get_or_init(|| {
+            self.blocks
+                .iter()
+                .map(|(up, down)| (Bf16DotMat::from_bf16(up), Bf16DotMat::from_bf16(down)))
+                .collect()
+        })
     }
 }
 
@@ -467,6 +565,7 @@ impl PolicyValueNet {
         let n_cards = db().len() + 1;
         let d = cfg.embedding_dim;
         let h = cfg.hidden;
+        let m = cfg.ff_hidden();
         let mut rng = StdRng::seed_from_u64(seed);
         let mut randn = |rows: usize, cols: usize, scale: f32| {
             let data = (0..rows * cols)
@@ -479,7 +578,7 @@ impl PolicyValueNet {
         };
         let he = |fan_in: usize| (2.0 / fan_in as f32).sqrt();
         let in_dim = input_features.len() + card_slots.len() * d + N_ACTIONS;
-        let mut tensors = Vec::with_capacity(9 + 4 * cfg.blocks);
+        let mut tensors = Vec::with_capacity(9 + 6 * cfg.blocks);
         let mut e = randn(n_cards, d, 0.1);
         for v in e.row_mut(0) {
             *v = 0.0;
@@ -490,7 +589,10 @@ impl PolicyValueNet {
         tensors.push(Mat::filled(1, h, 1.0));
         tensors.push(Mat::zeros(1, h));
         for _ in 0..cfg.blocks {
-            tensors.push(randn(h, h, he(h) * 0.6));
+            tensors.push(randn(h, m, he(h)));
+            tensors.push(Mat::zeros(1, m));
+            // Keep the initial residual variance bounded as depth increases.
+            tensors.push(randn(m, h, he(m) / (2.0 * cfg.blocks as f32).sqrt()));
             tensors.push(Mat::zeros(1, h));
             tensors.push(Mat::filled(1, h, 1.0));
             tensors.push(Mat::zeros(1, h));
@@ -550,6 +652,45 @@ impl PolicyValueNet {
 
     // ---- forward -----------------------------------------------------------
 
+    fn write_input(
+        &self,
+        x: &[f32],
+        cards: &[i32],
+        mask: &[bool],
+        row: &mut [f32],
+        mut used: Option<&mut Vec<i32>>,
+    ) -> Result<(), String> {
+        if x.len() != N_FEATURES || cards.len() != N_CARD_SLOTS || mask.len() != N_ACTIONS {
+            return Err("observation does not match the schema".into());
+        }
+        let d = self.cfg.embedding_dim;
+        let n = self.input_features.len();
+        let e = &self.p.tensors[E];
+        for (dst, &i) in row[..n].iter_mut().zip(&self.input_features) {
+            *dst = x[i];
+        }
+        for (s, &slot) in self.card_slots.iter().enumerate() {
+            let idx = cards[slot];
+            if idx < 0 || idx as usize >= e.rows {
+                return Err("card index outside the current card table".into());
+            }
+            let idx = if self.allowed[idx as usize] { idx } else { 0 };
+            if let Some(v) = &mut used {
+                v.push(idx);
+            }
+            let dst = &mut row[n + s * d..n + (s + 1) * d];
+            if idx == 0 {
+                dst.fill(0.0);
+            } else {
+                dst.copy_from_slice(e.row(idx as usize));
+            }
+        }
+        for (dst, &legal) in row[n + self.card_slots.len() * d..].iter_mut().zip(mask) {
+            *dst = u8::from(legal) as f32;
+        }
+        Ok(())
+    }
+
     /// Gather the network input for a batch of raw observations.
     fn assemble(
         &self,
@@ -561,34 +702,10 @@ impl PolicyValueNet {
         if cards.len() != bsz || masks.len() != bsz {
             return Err("feature, card and mask batches differ in length".into());
         }
-        let d = self.cfg.embedding_dim;
-        let n_in = self.input_features.len();
-        let n_slots = self.card_slots.len();
-        let mut x_in = Mat::zeros(bsz, n_in + n_slots * d + N_ACTIONS);
-        let mut used = Vec::with_capacity(bsz * n_slots);
-        let e = &self.p.tensors[E];
-        for (r, (x, c)) in xs.iter().zip(cards).enumerate() {
-            if x.len() != N_FEATURES || c.len() != N_CARD_SLOTS || masks[r].len() != N_ACTIONS {
-                return Err("observation does not match the schema".into());
-            }
-            let row = x_in.row_mut(r);
-            for (dst, &legal) in row[n_in + n_slots * d..].iter_mut().zip(masks[r]) {
-                *dst = u8::from(legal) as f32;
-            }
-            for (j, &i) in self.input_features.iter().enumerate() {
-                row[j] = x[i];
-            }
-            for (s, &slot) in self.card_slots.iter().enumerate() {
-                let idx = c[slot];
-                if idx < 0 || idx as usize >= e.rows {
-                    return Err("card index outside the current card table".into());
-                }
-                let idx = if self.allowed[idx as usize] { idx } else { 0 };
-                used.push(idx);
-                if idx != 0 {
-                    row[n_in + s * d..n_in + (s + 1) * d].copy_from_slice(e.row(idx as usize));
-                }
-            }
+        let mut x_in = Mat::zeros(bsz, self.p.tensors[W0].rows);
+        let mut used = Vec::with_capacity(bsz * self.card_slots.len());
+        for r in 0..bsz {
+            self.write_input(xs[r], cards[r], masks[r], x_in.row_mut(r), Some(&mut used))?;
         }
         Ok((x_in, used))
     }
@@ -610,20 +727,27 @@ impl PolicyValueNet {
         for v in &mut h.data {
             *v = act.apply(*v);
         }
-        let mut layers = vec![Layer {
-            h_in: x_in.clone(),
-            n: n0,
-            ln: ln0,
-        }];
+        let stem = StemCache { n: n0, ln: ln0 };
+        let mut blocks = Vec::with_capacity(self.cfg.blocks);
         for i in 0..self.cfg.blocks {
-            let h_in = h.clone();
-            let mut z = linear(&h_in, &p[w(i)]);
-            z.add_row(&p[b(i)].data);
-            let (n, ln) = layer_norm(&z, &p[g(i)].data, &p[k(i)].data);
-            for (hv, nv) in h.data.iter_mut().zip(&n.data) {
-                *hv += self.cfg.residual_scale * act.apply(*nv);
+            let (normed, ln) = layer_norm(&h, &p[g(i)].data, &p[k(i)].data);
+            let mut pre_activation = linear(&normed, &p[w_up(i)]);
+            pre_activation.add_row(&p[b_up(i)].data);
+            let mut activated = pre_activation.clone();
+            for v in &mut activated.data {
+                *v = act.apply(*v);
             }
-            layers.push(Layer { h_in, n, ln });
+            let mut residual = linear(&activated, &p[w_down(i)]);
+            residual.add_row(&p[b_down(i)].data);
+            for (hv, rv) in h.data.iter_mut().zip(&residual.data) {
+                *hv += self.cfg.residual_scale * rv;
+            }
+            blocks.push(BlockCache {
+                normed,
+                pre_activation,
+                activated,
+                ln,
+            });
         }
         let mut head_ln = None;
         if self.cfg.head_norm {
@@ -645,7 +769,8 @@ impl PolicyValueNet {
             Cache {
                 x_in,
                 cards: used,
-                layers,
+                stem,
+                blocks,
                 h_final: h,
                 head_ln,
                 value,
@@ -653,50 +778,98 @@ impl PolicyValueNet {
         ))
     }
 
-    /// Masked policy over legal actions and the value of one observation.
+    /// Masked policy over legal actions and the value of one observation. Scratch is
+    /// thread-local; only the returned policy is allocated after workspace warmup.
     pub fn predict(
         &self,
         x: &[f32],
         cards: &[i32],
         mask: &[bool],
     ) -> Result<(Vec<f32>, f32), String> {
-        let (logits, value) = self.infer(x, cards, mask)?;
-        Ok((masked_softmax(&logits, mask), value))
+        INFERENCE_WORKSPACE.with(|cell| {
+            let mut ws = cell.borrow_mut();
+            let (logits, value) =
+                self.infer_with_workspace(x, cards, mask, InferenceBackend::Auto, &mut ws)?;
+            Ok((masked_softmax(logits, mask), value))
+        })
     }
 
-    /// Logits and value of one observation for search: bfloat16 weight matrices with f32
-    /// accumulation, a polynomial tanh in the activations, no training cache. The weights
-    /// are converted once per parameter update (`params_changed`); training itself stays
-    /// in f32 with the exact functions (`forward`/`backward`).
+    /// Logits and value using shared immutable weights and thread-local scratch.
     pub fn infer(
         &self,
         x: &[f32],
         cards: &[i32],
         mask: &[bool],
     ) -> Result<(Vec<f32>, f32), String> {
-        let (x_in, _) = self.assemble(&[x], &[cards], &[mask])?;
+        INFERENCE_WORKSPACE.with(|cell| {
+            let mut ws = cell.borrow_mut();
+            let (logits, value) =
+                self.infer_with_workspace(x, cards, mask, InferenceBackend::Auto, &mut ws)?;
+            Ok((logits.to_vec(), value))
+        })
+    }
+
+    /// Allocation-free after warmup, with an explicit kernel choice for precision and
+    /// latency checks. The returned logits borrow the workspace until its next use.
+    pub fn infer_with_workspace<'a>(
+        &self,
+        x: &[f32],
+        cards: &[i32],
+        mask: &[bool],
+        backend: InferenceBackend,
+        ws: &'a mut InferenceWorkspace,
+    ) -> Result<(&'a [f32], f32), String> {
+        let dot = match backend {
+            InferenceBackend::Auto => native_bf16_available(),
+            InferenceBackend::Fma => false,
+            InferenceBackend::Dot => {
+                if !native_bf16_available() {
+                    return Err("AVX-512 BF16 is unavailable".into());
+                }
+                true
+            }
+        };
         let p = &self.p.tensors;
         let fast = self.fast();
-        let act = self.cfg.activation;
-        let mut h = fast.w0.vecmat(x_in.row(0));
-        add_bias(&mut h, &p[B0].data);
-        layer_norm_row(&mut h, &p[G0].data, &p[K0].data);
-        apply_fast(act, &mut h);
+        ws.input.resize(p[W0].rows, 0.0);
+        ws.hidden.resize(self.cfg.hidden, 0.0);
+        ws.normed.resize(self.cfg.hidden, 0.0);
+        ws.up.resize(self.cfg.ff_hidden(), 0.0);
+        ws.down.resize(self.cfg.hidden, 0.0);
+        ws.heads.resize(N_ACTIONS + 1, 0.0);
+        self.write_input(x, cards, mask, &mut ws.input, None)?;
+        fast.w0.vecmat_into(&ws.input, &mut ws.hidden);
+        add_bias(&mut ws.hidden, &p[B0].data);
+        layer_norm_row(&mut ws.hidden, &p[G0].data, &p[K0].data);
+        apply_fast(self.cfg.activation, &mut ws.hidden);
+        let dots = if dot { Some(fast.dot_blocks()) } else { None };
         for i in 0..self.cfg.blocks {
-            let mut z = fast.blocks[i].vecmat(&h);
-            add_bias(&mut z, &p[b(i)].data);
-            layer_norm_row(&mut z, &p[g(i)].data, &p[k(i)].data);
-            add_residual_fast(act, &mut h, &mut z, self.cfg.residual_scale);
+            ws.normed.copy_from_slice(&ws.hidden);
+            layer_norm_row(&mut ws.normed, &p[g(i)].data, &p[k(i)].data);
+            if let Some(d) = dots {
+                d[i].0.vecmat_into(&ws.normed, &mut ws.up, &mut ws.pairs)?;
+            } else {
+                fast.blocks[i].0.vecmat_into(&ws.normed, &mut ws.up);
+            }
+            add_bias(&mut ws.up, &p[b_up(i)].data);
+            apply_fast(self.cfg.activation, &mut ws.up);
+            if let Some(d) = dots {
+                d[i].1.vecmat_into(&ws.up, &mut ws.down, &mut ws.pairs)?;
+            } else {
+                fast.blocks[i].1.vecmat_into(&ws.up, &mut ws.down);
+            }
+            // Fuse output bias, scaling and the residual addition.
+            for ((h, &v), &b) in ws.hidden.iter_mut().zip(&ws.down).zip(&p[b_down(i)].data) {
+                *h += self.cfg.residual_scale * (v + b);
+            }
         }
         if self.cfg.head_norm {
-            let ones = vec![1.0f32; self.cfg.hidden];
-            let zeros = vec![0.0f32; self.cfg.hidden];
-            layer_norm_row(&mut h, &ones, &zeros);
+            layer_norm_unit_row(&mut ws.hidden);
         }
-        let mut logits = fast.wp.vecmat(&h);
-        add_bias(&mut logits, &p[self.p.bp()].data);
-        let value = (fast.wv.vecmat(&h)[0] + p[self.p.bv()].data[0]).tanh();
-        Ok((logits, value))
+        fast.heads.vecmat_into(&ws.hidden, &mut ws.heads);
+        add_bias(&mut ws.heads[..N_ACTIONS], &p[self.p.bp()].data);
+        let value = (ws.heads[N_ACTIONS] + p[self.p.bv()].data[0]).tanh();
+        Ok((&ws.heads[..N_ACTIONS], value))
     }
 
     /// `infer` in f32: the same operations in the same order as `forward`, so the results
@@ -717,11 +890,17 @@ impl PolicyValueNet {
             *v = act.apply(*v);
         }
         for i in 0..self.cfg.blocks {
-            let mut z = p[w(i)].vecmat(&h);
-            add_bias(&mut z, &p[b(i)].data);
-            layer_norm_row(&mut z, &p[g(i)].data, &p[k(i)].data);
-            for (hv, nv) in h.iter_mut().zip(&z) {
-                *hv += self.cfg.residual_scale * act.apply(*nv);
+            let mut n = h.clone();
+            layer_norm_row(&mut n, &p[g(i)].data, &p[k(i)].data);
+            let mut up = p[w_up(i)].vecmat(&n);
+            add_bias(&mut up, &p[b_up(i)].data);
+            for v in &mut up {
+                *v = act.apply(*v);
+            }
+            let mut down = p[w_down(i)].vecmat(&up);
+            add_bias(&mut down, &p[b_down(i)].data);
+            for (hv, rv) in h.iter_mut().zip(&down) {
+                *hv += self.cfg.residual_scale * rv;
             }
         }
         if self.cfg.head_norm {
@@ -758,19 +937,24 @@ impl PolicyValueNet {
             dh = layer_norm_backward(&dh, head, &ones).0;
         }
         for i in (0..self.cfg.blocks).rev() {
-            let layer = &cache.layers[i + 1];
-            let mut dn = dh.clone();
-            for (d, nv) in dn.data.iter_mut().zip(&layer.n.data) {
-                *d *= self.cfg.residual_scale * act.grad(*nv);
+            let layer = &cache.blocks[i];
+            let mut dr = dh.clone();
+            dr.scale(self.cfg.residual_scale);
+            grads.tensors[w_down(i)] = layer.activated.t_matmul(&dr);
+            grads.tensors[b_down(i)] = Mat::from_vec(1, hidden, dr.sum_rows());
+            let mut du = dr.matmul_t(&p[w_down(i)]);
+            for (d, v) in du.data.iter_mut().zip(&layer.pre_activation.data) {
+                *d *= act.grad(*v);
             }
-            let (dz, dg, dk) = layer_norm_backward(&dn, &layer.ln, &p[g(i)].data);
+            grads.tensors[w_up(i)] = layer.normed.t_matmul(&du);
+            grads.tensors[b_up(i)] = Mat::from_vec(1, self.cfg.ff_hidden(), du.sum_rows());
+            let dn = du.matmul_t(&p[w_up(i)]);
+            let (dx, dg, dk) = layer_norm_backward(&dn, &layer.ln, &p[g(i)].data);
             grads.tensors[g(i)] = Mat::from_vec(1, hidden, dg);
             grads.tensors[k(i)] = Mat::from_vec(1, hidden, dk);
-            grads.tensors[w(i)] = layer.h_in.t_matmul(&dz);
-            grads.tensors[b(i)] = Mat::from_vec(1, hidden, dz.sum_rows());
-            dh.add_assign(&dz.matmul_t(&p[w(i)]));
+            dh.add_assign(&dx);
         }
-        let first = &cache.layers[0];
+        let first = &cache.stem;
         let mut dn0 = dh;
         for (d, nv) in dn0.data.iter_mut().zip(&first.n.data) {
             *d *= act.grad(*nv);

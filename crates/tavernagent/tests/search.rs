@@ -257,11 +257,11 @@ fn the_agent_has_no_move_actions() {
     let mask = agent_mask(&game, 0);
     assert_eq!(mask.len(), N_ACTIONS);
     // End Turn is hidden at 30 Gold; other entries match their translated engine action.
-    for a in 1..N_ACTIONS {
+    for (a, &masked) in mask.iter().enumerate().skip(1) {
         let engine = tavernagent::actions::engine_action(&game, 0, a)
             .unwrap()
             .encode();
-        assert_eq!(mask[a], legal[engine]);
+        assert_eq!(masked, legal[engine]);
     }
 }
 

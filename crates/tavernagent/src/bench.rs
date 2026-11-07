@@ -146,7 +146,7 @@ pub fn run(args: BenchArgs) -> Result<(), String> {
     );
     for (turn, game) in &positions {
         let mut rng = Pcg64Mcg::seed_from_u64(args.seed);
-        let legal = crate::mcts::agent_mask(&game, 0)
+        let legal = crate::mcts::agent_mask(game, 0)
             .iter()
             .filter(|m| **m)
             .count();

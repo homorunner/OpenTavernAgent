@@ -5,8 +5,8 @@ self-play. It is the Rust crate `crates/tavernagent` and the `tavernagent` binar
 on the `taverngym` crate directly and needs no Python. Checkpoints are numpy-readable `.npz`
 files, so weights stay inspectable from Python.
 
-The current model has **874,677 parameters**: a policy head and a value head. Weights are
-model format v9; the search protocol is `ended-state-v9-compact-play`.
+The current model has **2,378,357 parameters**: a policy head and a value head. Weights are
+model format v10; the search protocol is `ended-state-v9-compact-play`.
 
 ## Commands
 
@@ -48,8 +48,11 @@ Results do not depend on the thread count.
 ## Network and inputs
 
 ```
-1713 numeric features + 69 card slots x 16-dim shared card embedding + 116 mask bits
-  -> 192 -> 6 residual blocks  h <- h + GELU(LN(W h))
+1713 numeric features + 69 card slots x 32-dim shared card embedding + 116 mask bits
+  -> Linear(4037, 256) -> LayerNorm -> GELU
+  -> 6 pre-norm residual blocks:
+       h <- h + scale * (W_down GELU(W_up LayerNorm(h) + b_up) + b_down)
+       256 -> 384 -> 256
   -> 116 policy logits (masked softmax) / tanh value
 ```
 
@@ -60,8 +63,11 @@ Results do not depend on the thread count.
   separately. Spells still use position 0. Move is absent.
   `actions::engine_action` translates against the current state, and the mask uses the
   same translation. TavernGym's 245-action API is unchanged.
-- Old v7/v8 checkpoints are incompatible with this input/policy layout; v9
-  rejects them rather than interpreting old indices as new actions.
+- Model format v10 requires the two-layer pre-norm FFN tensors; earlier models,
+  including v9's single-layer blocks, are rejected. The FFN width is fixed to
+  `hidden + ceil(hidden / 2)`. `W_up` uses He initialization; `W_down` uses He divided
+  by `sqrt(2 * blocks)` to bound the initial residual variance as depth increases.
+  The residual scale remains 1, head norm remains off, and both output heads remain linear.
 - The 116-bit `agent_mask` enters the shared trunk as 0/1 features, so both policy and
   value can use legality. Training and inference use the same mask; ended states use
   an all-zero mask. The ended-turn flag remains in the original numeric input.
@@ -86,14 +92,36 @@ Results do not depend on the thread count.
 - The backward pass is written by hand (`net.rs`); batched products use `matrixmultiply`
   (its AVX-512 kernels, one thread per call). `tests/net.rs` checks every gradient against
   central differences.
-- **Search-time inference** (`PolicyValueNet::infer`) is separate from the training
-  forward: the weight matrices are kept as a bfloat16 copy (`linalg::Bf16Mat`, half the
-  bytes, so the whole network stays in a core's L2 cache), products accumulate in f32 in a
-  hand-written AVX-512 kernel that skips zero inputs (runtime-dispatched, with a portable
-  fallback), and GELU/SiLU use a clamped rational tanh. Precision error depends on the
-  trained weights and should be checked on trained checkpoints. Training
-  (`forward`/`backward`) stays f32; `infer_f32` is the reference inference path. The bfloat16 copy is
-  rebuilt lazily after `params_changed`, which `Trainer::step` calls.
+- **Search-time inference** uses a thread-local reusable workspace. After warmup,
+  internal inference allocates nothing and `predict` allocates only its returned policy.
+  Policy/value share one matrix product; output bias, scaling and residual addition are
+  fused. GELU/SiLU use a vectorized rational tanh with AVX-512 runtime dispatch.
+- The input projection skips zero inputs and uses BF16 weights with FP32 activations
+  and FMA accumulation. Dense FFN layers use native AVX-512 BF16 dot products where
+  available, rounding activations to BF16 and accumulating in FP32. Unsupported CPUs
+  retain the BF16-weight/FMA path (AVX-512, AVX2, or portable). The heads stay on FMA.
+  Packed dot weights are built lazily and invalidated by `params_changed` along with
+  the other inference weights. Training stays FP32; `infer_f32` is the exact reference.
+- BF16 reduces weight traffic, but does **not** guarantee L2 residency. The experiment
+  CPU has 1 MiB L2 per physical core; the default model's BF16 matrix weights alone
+  exceed it. Active input rows, shared L3, model depth and concurrency all affect speed.
+  Native BF16 also introduces activation rounding; verify value error, policy KL and
+  action margins on trained checkpoints, not just initialized weights.
+- Reproduce the FMA/native-BF16 and fresh/reused-workspace comparison with
+  `cargo run --release -p tavernagent --example inference -- --blocks 6,8,10,12`.
+  Add `--workers 128 --iters 5000` for throughput, or `--model PATH` for trained weights.
+  It reports JSON lines on bot-driven T1/T4/T8/T12 observations and valid ended previews;
+  it measures network inference, not complete search or self-play throughput.
+
+
+On experiment (EPYC 9976), a 128-thread, 71-observation preflight measured **2.42M →
+2.62M predictions/s** for six blocks and **1.16M → 1.40M/s** for twelve blocks when
+switching the reusable-workspace FFN kernel from FMA to native BF16. These are short
+network-only benchmarks. The allocation test proves zero intermediate allocations;
+fresh/reused timing differences were small or noisy, so no allocator speedup is claimed.
+On a 12-block checkpoint after eight small training rounds, native BF16's maximum
+value error versus FP32 was **0.00244**, mean policy KL **2.09e-7**, with no policy argmax
+flips across those observations. Long-trained checkpoint precision still needs monitoring.
 
 `--hidden`, `--blocks`, `--embedding-dim`, `--activation gelu|silu|relu`,
 `--residual-scale` and the parameter-free `--head-norm` define the architecture and are
@@ -227,7 +255,7 @@ training cap, so they also change the average reuse of a row at the same epoch c
 | `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 0 / 0.15 |
 | `--search-prob` / `--fpu-reduction` | 0.33 / 1.5 |
 | `--split-turn` | 4 (one binary split) |
-| `--hidden` / `--blocks` / `--embedding-dim` | 192 / 6 / 16 |
+| `--hidden` / `--blocks` / `--embedding-dim` | 256 / 6 / 32 |
 | `--value-weight` | 0.5 |
 | `--weight-decay` / `--clip` / `--ema-rounds` | 0.01 / 5.0 / 2 |
 
@@ -240,9 +268,9 @@ rounds); `--resume` loads weights only. `<out>.history.json` records per-round l
 gradient norms, entropies, target KL, the ended sample counts and timings. Losses and
 per-epoch metrics currently describe the last training epoch, not an independent
 validation set; `samples` counts that epoch's draw, not the total across all epochs.
-Trainer format 7 also stores each replay row's weight; format 6 snapshots load with unit
-weights. Saved split turns are inherited on resume unless explicitly overridden; old
-snapshots without this option keep ordinary rollouts. The multiplier is recorded as
+Trainer format 8 requires the new FFN network, replay row weights and saved options;
+older formats and incomplete snapshots are rejected. Saved split turns are inherited
+on resume unless explicitly overridden. The multiplier is recorded as
 `split_sample_weight` in `<out>.config.json`; history includes
 `sample_weight_sum` and `policy_sample_weight_sum` alongside the raw sample counts.
 
@@ -397,10 +425,29 @@ E1/E2/E4 remained healthy. At full search/E8, raising value-weight from .5 to 1 
 only **17.7%** against the control across three seeds. These models had finite weights;
 lower training loss alone does not establish stronger play. Split changes data quantity,
 weights and reuse as well as target variance. Further temperature reduction (.25/.1)
-and other loss/prior changes remain candidates, not confirmed defaults. The next four
-training slots should compare balanced E2/lr=1e-4 against E8/lr=3e-5 on two shared seeds,
-both at temperature .5 and 256 simulations, through at least 3,000 rounds. Track direct
-arenas and a fixed reference checkpoint alongside bot placement and elapsed time.
+and other loss/prior changes remain candidates, not confirmed defaults. These remain candidates for later training-intensity experiments; the next campaign
+instead isolates network depth under the current E2/lr=1e-4 recipe.
+
+### Pre-norm FFN depth comparison (2026-11-07)
+
+Four fresh v10 runs on TavernGym 37.0.2: **6/8/10/12 blocks**, respectively
+**2.378M / 2.774M / 3.169M / 3.565M** parameters. All use width 256, embedding 32,
+FFN width 384, seed 444444444 and the same default training/search recipe
+(128 roots, sims 256, search probability .33, split T4, E2, lr 1e-4, batch 512).
+Each gets 128 physical cores on one NUMA node. This is a one-seed screening experiment.
+
+`tools/agent_depth_experiment.py` runs to 1,500 rounds, evaluates raw/EMA against bots
+at 100/500/1000/1500 (512 games initially, then 2048), and runs all six paired EMA
+arenas at 500/1000/1500 (512 games, 64 simulations). Final arenas also compare checkpoints
+matched by cumulative sampling+training seconds; this excludes checkpoint I/O and
+pauses for evaluation. Weight checkpoints every 100 rounds support that comparison.
+Training and evaluation run in separate phases to avoid CPU contention.
+
+Scratch/replay: `/tmp/tavernagent-depth-20261107/`; durable results and latest resumable
+states: `<workspace>/runs/depth_prenorm_20261107/` on experiment.
+The manifest records the source revision, binary hash and settings; `status.json`
+records the current phase. Older immutable replay snapshots are removed after archiving
+weights, while current replay/optimizer/RNG state is retained for exact resume.
 
 ## Open problems
 
@@ -408,5 +455,8 @@ arenas and a fixed reference checkpoint alongside bot placement and elapsed time
   hypothetical earlier stops remains extrapolation; fresh value validation is needed.
 - Search improvement under visit-count selection and the fixed FPU reduction needs
   controlled comparisons. Tree splits also change sample counts, weights and data reuse.
-- The input projection is per slot: the same card in two Tavern slots uses different
-  weights. A shared per-entity encoder is an architecture experiment, not a validated fix.
+- **TODO: value head.** Test a small nonlinear value head and, separately, short-term
+  combat/damage auxiliary targets. Keep final expected placement as search utility.
+- **TODO: input representation.** Test a shared per-card/entity encoder that retains
+  zone and position information. Current input projection remains per slot; simply
+  pooling away warband order would discard strategically relevant information.

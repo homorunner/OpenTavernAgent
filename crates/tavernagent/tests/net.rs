@@ -33,8 +33,8 @@ fn parameter_count_and_input_layout() {
     let net = PolicyValueNet::new(0, NetConfig::default()).unwrap();
     assert_eq!(net.n_input_features(), 1713);
     assert_eq!(net.n_card_slots(), 69);
-    assert_eq!(net.n_params(), 874_677);
-    assert_eq!(net.p.tensors.len(), 9 + 4 * net.cfg.blocks);
+    assert_eq!(net.n_params(), 2_378_357);
+    assert_eq!(net.p.tensors.len(), 9 + 6 * net.cfg.blocks);
     assert_eq!(net.p.names().last().unwrap(), "bv");
     let wide = PolicyValueNet::new(
         0,
@@ -45,9 +45,10 @@ fn parameter_count_and_input_layout() {
         },
     )
     .unwrap();
-    assert_eq!(wide.p.tensors.len(), 9 + 4 * 2);
+    assert_eq!(wide.p.tensors.len(), 9 + 6 * 2);
     assert_eq!(wide.p.tensors[wide.p.wp()].rows, 256);
     assert!(wide.p.is_weight(wide.p.wv()));
+    assert!(wide.p.is_weight(net::w_up(0)) && wide.p.is_weight(net::w_down(0)));
     assert!(!wide.p.is_weight(wide.p.bp()) && !wide.p.is_weight(wide.p.bv()));
     assert!(net::input_feature_indices().contains(&net::ENDED_TURN_FEATURE));
     assert!(!net::input_feature_indices().contains(&1));
@@ -315,20 +316,26 @@ fn checkpoints_round_trip_and_reject_other_schemas() {
         net.predict(&obs.x, &obs.cards, &obs.mask).unwrap(),
         restored.predict(&obs.x, &obs.cards, &obs.mask).unwrap()
     );
-    // Numpy-compatible layout: the arrays carry the Python-era names and 1-D vectors.
+    // Numpy-compatible layout: matrices are row-major and bias/norm vectors are 1-D.
     let npz = Npz::load(&path).unwrap();
     assert_eq!(
         npz.get("W0").unwrap().shape,
-        vec![1713 + 69 * 4 + N_ACTIONS, 192]
+        vec![1713 + 69 * 4 + N_ACTIONS, net.cfg.hidden]
     );
     assert_eq!(npz.get("bp").unwrap().shape, vec![N_ACTIONS]);
-    let mut wrong = npz.clone();
-    let meta = wrong.get("meta").unwrap().as_text().unwrap().replace(
-        &format!("\"version\":{}", net::MODEL_VERSION),
-        "\"version\":2",
-    );
-    wrong.insert("meta", tavernagent::npz::NpyArray::text(&meta));
-    assert!(PolicyValueNet::from_npz(&wrong).unwrap_err().contains("v2"));
+    for version in [2, 9] {
+        let mut wrong = npz.clone();
+        let meta = wrong.get("meta").unwrap().as_text().unwrap().replace(
+            &format!("\"version\":{}", net::MODEL_VERSION),
+            &format!("\"version\":{version}"),
+        );
+        wrong.insert("meta", tavernagent::npz::NpyArray::text(&meta));
+        assert!(
+            PolicyValueNet::from_npz(&wrong)
+                .unwrap_err()
+                .contains(&format!("v{version}"))
+        );
+    }
     let mut other_cards = npz.clone();
     let meta = other_cards.get("meta").unwrap().as_text().unwrap();
     let meta = meta.replace(
@@ -342,7 +349,7 @@ fn checkpoints_round_trip_and_reject_other_schemas() {
             .contains("schema")
     );
     let mut missing = npz.clone();
-    missing.arrays.remove("W2");
+    missing.arrays.remove("W2_down");
     assert!(PolicyValueNet::from_npz(&missing).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -371,4 +378,118 @@ fn mask_is_a_shared_input_and_invalid_mask_shapes_are_rejected() {
         net.forward(&[&obs.x], &[&obs.cards], &[&zeros[..N_ACTIONS - 1]])
             .is_err()
     );
+}
+
+#[test]
+fn reusable_workspaces_match_reference_across_depths_models_and_threads() {
+    use rayon::prelude::*;
+    use tavernagent::net::{InferenceBackend, InferenceWorkspace};
+    let mut positions = Vec::new();
+    for seed in 0..3 {
+        let mut game = position(seed);
+        positions.push(observe_seat(&game, 0));
+        if game.end_turn_effects(0).is_ok() {
+            positions.push(observe_seat(&game, 0));
+        }
+    }
+    let mut ws = InferenceWorkspace::default();
+    for blocks in [6, 8, 10, 12] {
+        let net = PolicyValueNet::new(
+            90 + blocks as u64,
+            NetConfig {
+                blocks,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for obs in &positions {
+            let (exact, ev) = net.infer_f32(&obs.x, &obs.cards, &obs.mask).unwrap();
+            for backend in [InferenceBackend::Fma, InferenceBackend::Dot] {
+                if backend == InferenceBackend::Dot && !tavernagent::linalg::native_bf16_available()
+                {
+                    continue;
+                }
+                let (logits, value) = net
+                    .infer_with_workspace(&obs.x, &obs.cards, &obs.mask, backend, &mut ws)
+                    .unwrap();
+                assert!(
+                    (value - ev).abs() < 0.01,
+                    "depth={blocks} {backend:?}: {value} vs {ev}"
+                );
+                for (a, b) in exact.iter().zip(logits) {
+                    assert!(
+                        (a - b).abs() < 0.01,
+                        "depth={blocks} {backend:?}: {a} vs {b}"
+                    );
+                }
+            }
+        }
+        let sequential: Vec<_> = positions
+            .iter()
+            .map(|o| net.predict(&o.x, &o.cards, &o.mask).unwrap())
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let parallel: Vec<_> = pool.install(|| {
+            positions
+                .par_iter()
+                .map(|o| net.predict(&o.x, &o.cards, &o.mask).unwrap())
+                .collect()
+        });
+        assert_eq!(sequential, parallel);
+        // A failed call must not contaminate the next call on the same workspace.
+        let obs = &positions[0];
+        assert!(
+            net.infer_with_workspace(
+                &obs.x[..1],
+                &obs.cards,
+                &obs.mask,
+                InferenceBackend::Fma,
+                &mut ws
+            )
+            .is_err()
+        );
+        let mut clean = InferenceWorkspace::default();
+        let (a, va) = net
+            .infer_with_workspace(
+                &obs.x,
+                &obs.cards,
+                &obs.mask,
+                InferenceBackend::Fma,
+                &mut ws,
+            )
+            .unwrap();
+        let (b, vb) = net
+            .infer_with_workspace(
+                &obs.x,
+                &obs.cards,
+                &obs.mask,
+                InferenceBackend::Fma,
+                &mut clean,
+            )
+            .unwrap();
+        assert_eq!((a, va), (b, vb));
+    }
+    // Shrink all scratch dimensions and exercise SIMD tails after the large models.
+    let small = PolicyValueNet::new(
+        1,
+        NetConfig {
+            hidden: 17,
+            embedding_dim: 3,
+            blocks: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let o = &positions[0];
+    let mut fresh = InferenceWorkspace::default();
+    let (a, va) = small
+        .infer_with_workspace(&o.x, &o.cards, &o.mask, InferenceBackend::Auto, &mut ws)
+        .unwrap();
+    let (b, vb) = small
+        .infer_with_workspace(&o.x, &o.cards, &o.mask, InferenceBackend::Auto, &mut fresh)
+        .unwrap();
+    assert_eq!((a, va), (b, vb));
 }

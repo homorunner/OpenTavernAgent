@@ -103,7 +103,7 @@ pub struct SelfplayArgs {
     /// Fixed LayerNorm before the policy/value heads.
     #[arg(long, default_value_t = false)]
     pub head_norm: bool,
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = net::DEFAULT_EMBEDDING_DIM)]
     pub embedding_dim: usize,
     /// Trunk width.
     #[arg(long, default_value_t = net::DEFAULT_HIDDEN)]

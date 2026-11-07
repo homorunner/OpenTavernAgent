@@ -472,7 +472,10 @@ fn full_trainer_snapshot_restores_optimizer_rng_and_replay_exactly() {
     );
     // An old format is rejected even with all current arrays present.
     let mut old_format = Npz::load(&path).unwrap();
-    let meta = meta_text.replace("\"format\":7", "\"format\":6");
+    let meta = meta_text.replace(
+        &format!("\"format\":{}", tavernagent::selfplay::TRAINER_FORMAT),
+        "\"format\":7",
+    );
     old_format.insert("metadata", tavernagent::npz::NpyArray::text(&meta));
     old_format.save(&wrong_path).unwrap();
     assert!(

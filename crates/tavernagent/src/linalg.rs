@@ -159,8 +159,8 @@ pub fn bf16_to_f32(b: u16) -> f32 {
 }
 
 /// Row-major bfloat16 copy of a weight matrix for search-time products: half the bytes
-/// of `Mat`, so the weights of a 192-wide network stay in a core's L2 cache; products
-/// accumulate in f32. Training never uses it.
+/// of `Mat`. Cache residency depends on the model, input sparsity and CPU; products
+/// accumulate in f32 without quantizing activations. Training never uses it.
 #[derive(Clone, Debug)]
 pub struct Bf16Mat {
     pub rows: usize,
@@ -179,28 +179,156 @@ impl Bf16Mat {
 
     /// `x (1 x k) * self (k x n)` for a single row, skipping zero inputs.
     pub fn vecmat(&self, x: &[f32]) -> Vec<f32> {
-        assert_eq!(x.len(), self.rows, "vecmat shape mismatch");
         let mut out = vec![0.0f32; self.cols];
+        self.vecmat_into(x, &mut out);
+        out
+    }
+
+    /// Overwrite a caller-owned output buffer; never allocate.
+    pub fn vecmat_into(&self, x: &[f32], out: &mut [f32]) {
+        assert_eq!(x.len(), self.rows, "vecmat shape mismatch");
+        assert_eq!(out.len(), self.cols, "vecmat output shape mismatch");
+        assert_eq!(
+            self.data.len(),
+            self.rows * self.cols,
+            "vecmat weight shape mismatch"
+        );
+        out.fill(0.0);
         #[cfg(target_arch = "x86_64")]
         {
             if std::arch::is_x86_feature_detected!("avx512f")
                 && std::arch::is_x86_feature_detected!("avx512bw")
                 && std::arch::is_x86_feature_detected!("avx512vl")
             {
-                // SAFETY: the features were detected at runtime.
-                unsafe { vecmat_bf16_avx512(&self.data, self.cols, x, &mut out) };
-                return out;
+                // SAFETY: features checked; shapes checked above.
+                unsafe { vecmat_bf16_avx512(&self.data, self.cols, x, out) };
+                return;
             }
             if std::arch::is_x86_feature_detected!("avx2")
                 && std::arch::is_x86_feature_detected!("fma")
             {
-                // SAFETY: the features were detected at runtime.
-                unsafe { vecmat_bf16_avx2(&self.data, self.cols, x, &mut out) };
-                return out;
+                // SAFETY: features checked; shapes checked above.
+                unsafe { vecmat_bf16_avx2(&self.data, self.cols, x, out) };
+                return;
             }
         }
-        vecmat_bf16_rows(&self.data, self.cols, x, &mut out);
-        out
+        vecmat_bf16_rows(&self.data, self.cols, x, out);
+    }
+}
+
+/// Native BF16 dot products also quantize activations. Kept separate from the
+/// sparse-input FMA path so speed and precision can be compared explicitly.
+pub fn native_bf16_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bf16")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Bf16DotMat {
+    rows: usize,
+    cols: usize,
+    // 64-output tiles, then input pairs, then 64 interleaved weight pairs.
+    data: Vec<u16>,
+}
+
+impl Bf16DotMat {
+    pub fn from_bf16(m: &Bf16Mat) -> Self {
+        let pairs = m.rows.div_ceil(2);
+        let mut data = vec![0; m.cols.div_ceil(64) * pairs * 128];
+        for c in 0..m.cols {
+            for r in 0..m.rows {
+                data[(c / 64 * pairs + r / 2) * 128 + (c % 64) * 2 + r % 2] =
+                    m.data[r * m.cols + c];
+            }
+        }
+        Self {
+            rows: m.rows,
+            cols: m.cols,
+            data,
+        }
+    }
+
+    /// Overwrite `out`, using reusable storage for round-to-nearest-even input pairs.
+    pub fn vecmat_into(
+        &self,
+        x: &[f32],
+        out: &mut [f32],
+        pairs: &mut Vec<u32>,
+    ) -> Result<(), String> {
+        assert_eq!(x.len(), self.rows, "dot input shape mismatch");
+        assert_eq!(out.len(), self.cols, "dot output shape mismatch");
+        if !native_bf16_available() {
+            return Err("AVX-512 BF16 is unavailable".into());
+        }
+        pairs.resize(self.rows.div_ceil(2), 0);
+        for (dst, src) in pairs.iter_mut().zip(x.chunks(2)) {
+            let hi = src.get(1).copied().unwrap_or(0.0);
+            *dst = f32_to_bf16(src[0]) as u32 | ((f32_to_bf16(hi) as u32) << 16);
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: runtime features and shapes checked; weight/input tails padded above.
+        unsafe {
+            vecmat_native_bf16(&self.data, pairs, out);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bf16")]
+unsafe fn vecmat_native_bf16(data: &[u16], pairs: &[u32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    // SAFETY: caller validates dimensions/features. Each packed tile contains
+    // pairs.len()*128 u16s. Tail stores use a local 64-element buffer.
+    unsafe {
+        for (tile, dst) in out.chunks_mut(64).enumerate() {
+            let mut a0 = _mm512_setzero_ps();
+            let mut a1 = a0;
+            let mut a2 = a0;
+            let mut a3 = a0;
+            let base = data.as_ptr().add(tile * pairs.len() * 128);
+            for (i, &pair) in pairs.iter().enumerate() {
+                let x: __m512bh =
+                    std::mem::transmute::<__m512i, __m512bh>(_mm512_set1_epi32(pair as i32));
+                let w = base.add(i * 128);
+                let w0 = std::mem::transmute::<__m512i, __m512bh>(_mm512_loadu_si512(
+                    w as *const __m512i,
+                ));
+                let w1 = std::mem::transmute::<__m512i, __m512bh>(_mm512_loadu_si512(
+                    w.add(32) as *const __m512i
+                ));
+                let w2 = std::mem::transmute::<__m512i, __m512bh>(_mm512_loadu_si512(
+                    w.add(64) as *const __m512i
+                ));
+                let w3 = std::mem::transmute::<__m512i, __m512bh>(_mm512_loadu_si512(
+                    w.add(96) as *const __m512i
+                ));
+                a0 = _mm512_dpbf16_ps(a0, x, w0);
+                a1 = _mm512_dpbf16_ps(a1, x, w1);
+                a2 = _mm512_dpbf16_ps(a2, x, w2);
+                a3 = _mm512_dpbf16_ps(a3, x, w3);
+            }
+            if dst.len() == 64 {
+                _mm512_storeu_ps(dst.as_mut_ptr(), a0);
+                _mm512_storeu_ps(dst.as_mut_ptr().add(16), a1);
+                _mm512_storeu_ps(dst.as_mut_ptr().add(32), a2);
+                _mm512_storeu_ps(dst.as_mut_ptr().add(48), a3);
+            } else {
+                let mut tail = [0.0f32; 64];
+                _mm512_storeu_ps(tail.as_mut_ptr(), a0);
+                _mm512_storeu_ps(tail.as_mut_ptr().add(16), a1);
+                _mm512_storeu_ps(tail.as_mut_ptr().add(32), a2);
+                _mm512_storeu_ps(tail.as_mut_ptr().add(48), a3);
+                dst.copy_from_slice(&tail[..dst.len()]);
+            }
+        }
     }
 }
 
@@ -405,6 +533,61 @@ mod tests {
         let w = Mat::from_vec(5, 3, (0..15).map(|i| i as f32 * 0.3 - 1.0).collect());
         let x = Mat::from_vec(1, 5, vec![1.0, 0.0, -2.0, 0.0, 0.5]);
         assert_eq!(w.vecmat(x.row(0)), x.matmul(&w).data);
+    }
+
+    #[test]
+    fn bf16_kernels_overwrite_buffers_and_handle_odd_shapes() {
+        let mut rng = Pcg64Mcg::seed_from_u64(73);
+        for (rows, cols) in [
+            (1, 1),
+            (3, 15),
+            (17, 16),
+            (31, 17),
+            (19, 63),
+            (33, 64),
+            (7, 65),
+            (256, 384),
+            (384, 256),
+        ] {
+            let m = Mat::from_vec(
+                rows,
+                cols,
+                (0..rows * cols)
+                    .map(|_| rng.random_range(-0.2..0.2))
+                    .collect(),
+            );
+            let bf = Bf16Mat::from_mat(&m);
+            let dot = Bf16DotMat::from_bf16(&bf);
+            let mut pairs = Vec::new();
+            for zero in [false, true] {
+                let x: Vec<f32> = (0..rows)
+                    .map(|i| {
+                        if zero || i % 3 == 0 {
+                            0.0
+                        } else {
+                            rng.random_range(-2.0..2.0)
+                        }
+                    })
+                    .collect();
+                let mut out = vec![f32::NAN; cols];
+                bf.vecmat_into(&x, &mut out);
+                let mut expected = vec![0.0; cols];
+                vecmat_bf16_rows(&bf.data, cols, &x, &mut expected);
+                for (a, b) in out.iter().zip(&expected) {
+                    assert!((a - b).abs() < 2e-5);
+                }
+                if native_bf16_available() {
+                    out.fill(f32::NAN);
+                    dot.vecmat_into(&x, &mut out, &mut pairs).unwrap();
+                    expected.fill(0.0);
+                    let rounded: Vec<_> = x.iter().map(|&v| bf16_to_f32(f32_to_bf16(v))).collect();
+                    vecmat_bf16_rows(&bf.data, cols, &rounded, &mut expected);
+                    for (a, b) in out.iter().zip(&expected) {
+                        assert!((a - b).abs() < 2e-5, "{rows}x{cols}: {a} vs {b}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
