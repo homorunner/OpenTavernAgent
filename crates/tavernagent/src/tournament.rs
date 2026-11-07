@@ -59,7 +59,7 @@ fn play(
                 acted = true;
                 let net = &nets[seating[seat]];
                 let action = mcts::search(&game, seat, net, search, &mut rng)?.best_action();
-                game.apply_index(seat, action).map_err(|e| e.to_string())?;
+                crate::actions::apply(&mut game, seat, action).map_err(|e| e.to_string())?;
             }
         }
         if !acted {

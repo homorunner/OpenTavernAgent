@@ -220,7 +220,15 @@ fn trace_game(
                 let _ = turn;
                 Step {
                     action,
-                    family: family(action),
+                    family: if net.is_some() {
+                        family(action)
+                    } else {
+                        format!("{:?}", taverngym::Action::decode(action).unwrap())
+                            .split([' ', '(', '{'])
+                            .next()
+                            .unwrap()
+                            .into()
+                    },
                     gold_before: game.players[0].gold,
                     board_before: game.players[0].board.len(),
                     tier_before: game.players[0].tier,
@@ -232,7 +240,12 @@ fn trace_game(
                 }
             });
             let turn_number = game.turn;
-            game.apply_index(seat, action).map_err(|e| e.to_string())?;
+            if net.is_some() {
+                crate::actions::apply(&mut game, seat, action)
+            } else {
+                game.apply_index(seat, action)
+            }
+            .map_err(|e| e.to_string())?;
             if let Some(mut step) = record {
                 step.after_key = material_key(&game);
                 step.remaining_after = budgets_of(&game, 0);

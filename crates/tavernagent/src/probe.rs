@@ -25,8 +25,11 @@ pub struct ProbeOptions {
     pub seed: u64,
 }
 
-/// The action family of a decoded action (`Buy`, `Refresh`, ...).
+/// The compact agent action family (`Buy`, `Refresh`, `Play`, ...).
 pub fn family(action: usize) -> String {
+    if (taverngym::actions::A_PLAY..crate::actions::N_ACTIONS).contains(&action) {
+        return "Play".into();
+    }
     let name = Action::decode(action)
         .map(|a| format!("{a:?}"))
         .unwrap_or_else(|| "?".into());
@@ -69,7 +72,7 @@ pub fn behaviour(net: &PolicyValueNet, opts: &ProbeOptions) -> Result<Behaviour,
                         seen.push(turn);
                         rows.push((turn, family(action), game.players[0].gold));
                     }
-                    game.apply_index(0, action).map_err(|e| e.to_string())?;
+                    crate::actions::apply(&mut game, 0, action).map_err(|e| e.to_string())?;
                     continue;
                 }
                 let mut moved = false;

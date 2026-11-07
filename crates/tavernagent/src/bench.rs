@@ -113,7 +113,7 @@ pub fn run(args: BenchArgs) -> Result<(), String> {
     report(
         "forward_only",
         timed(
-            || drop(net.forward(&[&obs.x], &[&obs.cards]).unwrap()),
+            || drop(net.forward(&[&obs.x], &[&obs.cards], &[&obs.mask]).unwrap()),
             args.iters,
         ),
     );
@@ -146,7 +146,10 @@ pub fn run(args: BenchArgs) -> Result<(), String> {
     );
     for (turn, game) in &positions {
         let mut rng = Pcg64Mcg::seed_from_u64(args.seed);
-        let legal = game.legal_mask(0).iter().filter(|m| **m).count();
+        let legal = crate::mcts::agent_mask(&game, 0)
+            .iter()
+            .filter(|m| **m)
+            .count();
         report(
             &format!("turn {turn} ({legal} legal)"),
             timed(

@@ -65,7 +65,7 @@ fn play_match(
                 acted = true;
                 let net = if team_a(seat) { nets.0 } else { nets.1 };
                 let action = mcts::search(&game, seat, net, search, &mut rng)?.best_action();
-                game.apply_index(seat, action).map_err(|e| e.to_string())?;
+                crate::actions::apply(&mut game, seat, action).map_err(|e| e.to_string())?;
             }
         }
         if !acted {

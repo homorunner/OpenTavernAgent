@@ -37,7 +37,7 @@ fn play(net: &PolicyValueNet, seed: u64, search: &SearchOptions) -> (Vec<f32>, V
             if obs.mask[A_END_TURN] && rng.random::<f32>() < 0.02 {
                 action = A_END_TURN;
             }
-            game.apply_index(seat, action).unwrap();
+            tavernagent::actions::apply(&mut game, seat, action).unwrap();
         }
     }
     let places = (0..game.players.len())
