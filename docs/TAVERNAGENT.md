@@ -478,3 +478,9 @@ weights, while current replay/optimizer/RNG state is retained for exact resume.
 - **TODO: input representation.** Test a shared per-card/entity encoder that retains
   zone and position information. Current input projection remains per slot; simply
   pooling away warband order would discard strategically relevant information.
+
+Idle evaluation slots add independent 512-game seed batches to the latest checkpoints,
+up to 16,384 games per comparison. New checkpoint evaluations take priority at job
+boundaries. Reports pool all games; Arena uncertainty remains clustered by the two
+seat-swapped games per seed. Repeated monitoring uses descriptive 95% intervals,
+not a sequential significance test. Cards show only progress, placement intervals and plots.

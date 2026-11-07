@@ -13,6 +13,7 @@ import zipfile
 
 from agent_depth_experiment import DEPTHS, STAGES, atomic_json
 from agent_remote_job import SSH, cleanup, run_remote
+from agent_eval_precision import merge, extras
 
 
 def ssh(host, args, **kw):
@@ -139,6 +140,7 @@ def main():
 
     recover()
     active = {}
+    published_hashes = {}
     last_scan = 0
     last_recovery = time.time()
     index = first
@@ -158,6 +160,9 @@ def main():
                     output = a.root/'results'/job['relative']
                     output.parent.mkdir(parents=True, exist_ok=True)
                     atomic_json(output, result)
+                    if job.get('aggregate'):
+                        target=a.root/'results'/job['aggregate']
+                        atomic_json(target,merge(json.loads(target.read_text()),result,job['id']))
                     failures.pop(job['id'], None)
                     print(json.dumps(dict(job=job['id'], host=host['host'], state='complete',
                                           seconds=response['seconds'])), flush=True)
@@ -185,6 +190,9 @@ def main():
                 last_recovery = now
             ready = [j for j in planned if j['id'] not in busy_jobs
                      and not complete(a.root/'results'/j['relative']) and retry_at.get(j['id'], 0) <= now]
+            if not ready and not a.once:
+                ready=extras(planned,a.root,busy_jobs,complete)
+                ready=[j for j in ready if retry_at.get(j['id'],0)<=now]
             for host in hosts:
                 if not ready or host['host'] in busy_hosts or host['host'] in quarantined:
                     continue
@@ -209,9 +217,11 @@ def main():
                 local = a.root/'results'/job['relative']
                 if not complete(local):
                     continue
-                if job['relative'] not in index['results']:
+                checksum=hashlib.sha256(local.read_bytes()).hexdigest()
+                if published_hashes.get(job['relative'])!=checksum:
                     publish(a.source, a.archive, job['relative'], local)
                     index['results'][job['relative']] = str(Path(a.archive)/job['relative'])
+                    published_hashes[job['relative']]=checksum
                 published += 1
             finished = published == total and not active
             state = dict(state='complete' if finished else 'running', updated=time.time(),

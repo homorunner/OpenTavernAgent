@@ -100,7 +100,7 @@ def render(root, out):
     else:
         heat.axis('off')
         heat.text(.5,.5,'Awaiting paired Arena results',ha='center',transform=heat.transAxes)
-    fig.suptitle('Arena: cross-team placement score, not game win rate | 512 games with seat swaps | 95% CI',fontsize=10)
+    fig.suptitle('Arena: cross-team placement score, not game win rate | Pooled independent seeds with seat swaps | 95% CI',fontsize=10)
     arena_path=out/'arena.png'
     fig.savefig(arena_path,dpi=160)
     plt.close(fig)
