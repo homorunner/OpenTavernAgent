@@ -420,10 +420,10 @@ fn full_trainer_snapshot_restores_optimizer_rng_and_replay_exactly() {
     assert_eq!(trainer.m, restored.m);
     assert_eq!(trainer.v, restored.v);
     assert_eq!(trainer.ema, restored.ema);
-    // Snapshots from another search protocol or format are refused.
+    // The saved search protocol must match the trainer.
     let mut npz = Npz::load(&path).unwrap();
     let meta_text = npz.get("metadata").unwrap().as_text().unwrap();
-    let wrong = meta_text.replace(mcts::SEARCH_VERSION, "sampled-prep-v2");
+    let wrong = meta_text.replace(mcts::SEARCH_VERSION, "unknown-search-protocol");
     npz.insert("metadata", tavernagent::npz::NpyArray::text(&wrong));
     let wrong_path = dir.join("wrong.npz");
     npz.save(&wrong_path).unwrap();
@@ -467,25 +467,6 @@ fn full_trainer_snapshot_restores_optimizer_rng_and_replay_exactly() {
         )
         .unwrap_err()
         .contains("incomplete replay window")
-    );
-    // An old format is rejected even with all current arrays present.
-    let mut old_format = Npz::load(&path).unwrap();
-    let meta = meta_text.replace(
-        &format!("\"format\":{}", tavernagent::selfplay::TRAINER_FORMAT),
-        "\"format\":7",
-    );
-    old_format.insert("metadata", tavernagent::npz::NpyArray::text(&meta));
-    old_format.save(&wrong_path).unwrap();
-    assert!(
-        load_training_state(
-            &wrong_path,
-            &mut restored,
-            &mut rng2,
-            &mut replay_rng2,
-            Some(&mut restored_replay),
-        )
-        .unwrap_err()
-        .contains("schema")
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }

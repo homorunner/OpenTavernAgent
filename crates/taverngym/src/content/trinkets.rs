@@ -266,7 +266,10 @@ pub fn scripts() -> Vec<(&'static str, Script)> {
                             .collect()
                     });
                     if let Some(&t) = c.g.rng.pick(&cands) {
-                        grant_trinket(c, me.side, t);
+                        let source = c
+                            .player_ref(me.side)
+                            .and_then(|p| p.trinket_source(me.card));
+                        grant_trinket_from(c, me.side, t, source);
                     }
                 }),
                 ..E

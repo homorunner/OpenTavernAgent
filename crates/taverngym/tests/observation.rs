@@ -95,6 +95,7 @@ fn an_unaffordable_paid_trinket_offer_can_be_declined() {
         options: greater.clone(),
         free: false,
         replace: Some(cid("BG30_MagicItem_891")),
+        source: None,
     });
     assert!(g.needs_action(0));
     let mask = g.legal_mask(0);
@@ -110,6 +111,7 @@ fn an_unaffordable_paid_trinket_offer_can_be_declined() {
         options: greater,
         free: false,
         replace: Some(cid("BG30_MagicItem_891")),
+        source: None,
     });
     assert!(!g.legal_mask(0)[A_CANCEL]);
     assert!(g.apply(0, Action::Cancel).is_err());

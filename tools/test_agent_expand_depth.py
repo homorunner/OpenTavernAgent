@@ -11,11 +11,13 @@ class ExpansionTests(unittest.TestCase):
     def test_preserves_existing_tensors_and_adds_trainable_identity_branches(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); source=root/'source.npz'
-            weights={'meta':np.frombuffer(json.dumps({'version':10,'blocks':1}).encode(),dtype=np.uint8),
+            weights={'meta':np.frombuffer(json.dumps({'version':11,'blocks':1}).encode(),dtype=np.uint8),
                      'W1_up':np.ones((4,6),np.float32),'b1_up':np.zeros(6,np.float32),
                      'W1_down':np.ones((6,4),np.float32),'b1_down':np.zeros(4,np.float32),
                      'g1':np.ones(4,np.float32),'k1':np.zeros(4,np.float32),
-                     'Wp':np.arange(12,dtype=np.float32).reshape(4,3)}
+                     'Wp':np.arange(12,dtype=np.float32).reshape(4,3),
+                     'Wv_hidden':np.ones((4,128),np.float32),'bv_hidden':np.zeros(128,np.float32),
+                     'Wv':np.ones((128,1),np.float32),'bv':np.zeros(1,np.float32)}
             np.savez(source,**weights)
             for depth in (1,2,4): expand(source,root/f'd{depth}.npz',depth)
             self.assertEqual(source.read_bytes(),(root/'d1.npz').read_bytes())

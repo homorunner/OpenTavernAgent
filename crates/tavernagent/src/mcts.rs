@@ -254,11 +254,68 @@ pub struct Observation {
 }
 
 pub fn observe_seat(game: &Game, seat: usize) -> Observation {
-    let o = observe(game, seat);
+    let mut o = observe(game, seat);
+    map_owned_trinkets(&game.players[seat], &mut o.cards);
     Observation {
         x: o.floats,
         cards: o.cards,
         mask: agent_mask(game, seat),
+    }
+}
+
+/// Compact acquisition sources without moving the engine's actual effects. Orb shells
+/// have already fired; only their resulting trinkets occupy a slot. Pending choices are
+/// deliberately untouched, including Orb options that have not been bought yet.
+fn map_owned_trinkets(player: &taverngym::state::Player, cards: &mut [i32]) {
+    use crate::net::{OWNED_TRINKET_SLOTS, TRINKET_SLOT_START};
+    use taverngym::state::TrinketSource;
+
+    let is_orb = |card: taverngym::cards::CardId| {
+        card.base() == taverngym::cardid!("BG35_MagicItem_816")
+            || card.base() == taverngym::cardid!("BG35_MagicItem_816t")
+    };
+    cards[TRINKET_SLOT_START..TRINKET_SLOT_START + 8].fill(0);
+    for (slot, power) in player
+        .powers
+        .iter()
+        .take(taverngym::actions::N_POWERS)
+        .enumerate()
+    {
+        if is_orb(power.card) {
+            cards[1 + slot] = 0;
+        }
+    }
+    let mut ordinary = 0;
+    for &trinket in &player.trinkets {
+        if is_orb(trinket) {
+            continue;
+        }
+        let source = player.trinket_source(trinket);
+        let slot = match source {
+            Some(TrinketSource::HeroPower(slot)) => {
+                (usize::from(slot) < taverngym::actions::N_POWERS).then_some(1 + usize::from(slot))
+            }
+            Some(TrinketSource::QuestReward(reward)) => {
+                // Only the first owned reward is observed. Hidden rewards must not
+                // spill their trinkets into the ordinary owned-trinket slots.
+                if player.rewards.first() != Some(&reward) {
+                    continue;
+                }
+                Some(1 + taverngym::actions::N_POWERS + 2 + 2)
+            }
+            None => None,
+        };
+        let slot = slot.or_else(|| {
+            if ordinary == OWNED_TRINKET_SLOTS {
+                return None;
+            }
+            let slot = TRINKET_SLOT_START + ordinary;
+            ordinary += 1;
+            Some(slot)
+        });
+        if let Some(slot) = slot {
+            cards[slot] = trinket.idx() as i32 + 1;
+        }
     }
 }
 

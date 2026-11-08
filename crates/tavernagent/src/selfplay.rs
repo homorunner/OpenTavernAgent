@@ -37,7 +37,7 @@ use crate::net::{
 use crate::npz::{NpyArray, Npz};
 use crate::rules::Budgets;
 
-pub const TRAINER_FORMAT: i64 = 8;
+pub const TRAINER_FORMAT: i64 = 9;
 /// Per-child sample weight multiplier. Label expectations always use 1/2 instead.
 pub const SPLIT_SAMPLE_WEIGHT: f32 = 0.55;
 
@@ -725,7 +725,12 @@ impl Trainer {
         );
         metrics.insert(
             "value_head_grad_norm".into(),
-            head_norm(&[self.net.p.wv(), self.net.p.bv()]),
+            head_norm(&[
+                self.net.p.wv_hidden(),
+                self.net.p.bv_hidden(),
+                self.net.p.wv(),
+                self.net.p.bv(),
+            ]),
         );
         metrics.insert("policy_training_samples".into(), n_policy as f64);
         metrics.insert("ended_samples".into(), (bsz - n_policy) as f64);

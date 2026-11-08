@@ -61,7 +61,7 @@ def training_args(binary, work, depth, stage, seed, workers, initial=None):
     state = work / 'model.trainer.npz'
     if state.exists():
         m = metadata(state)
-        if m['format'] != 8 or m['net']['hidden'] != 256 or m['net']['embedding_dim'] != 32 or m['net']['blocks'] != depth:
+        if m['format'] != 9 or m['net']['hidden'] != 256 or m['net']['embedding_dim'] != 32 or m['net']['blocks'] != depth:
             raise ValueError(f'Unexpected trainer schema: {state}')
         args += ['--resume-state', str(state)]
     elif initial is not None or (work / 'initial.npz').exists():

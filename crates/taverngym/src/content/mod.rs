@@ -69,8 +69,8 @@ pub use trinkets_p2::aurum_gold_check;
 pub use trinkets_p3::{player_refresh, price_rule_used, sargeras_ready, tapestry_armed};
 pub(crate) use trinkets_p6::initialize_instance;
 pub use trinkets_p6::{
-    cube_turn_start, grant_trinket, held_tavern_bonus, is_eclipse, replace_trinket,
-    resolve_eclipse, sync_held_trinket_auras,
+    cube_turn_start, grant_trinket, grant_trinket_from, held_tavern_bonus, is_eclipse,
+    replace_trinket, resolve_eclipse, sync_held_trinket_auras,
 };
 pub use trinkets_p8::writhing_tentacles;
 pub use yogg::wheel_of_yogg;

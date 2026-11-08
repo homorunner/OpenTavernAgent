@@ -647,6 +647,13 @@ pub struct Scheduled {
     pub if_won: bool,
 }
 
+/// Acquisition provenance used only to map trinkets into observation slots.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TrinketSource {
+    HeroPower(u8),
+    QuestReward(CardId),
+}
+
 /// A decision the player must make before doing anything else.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum Pending {
@@ -683,6 +690,8 @@ pub enum Pending {
         free: bool,
         #[serde(default)]
         replace: Option<CardId>,
+        #[serde(default)]
+        source: Option<TrinketSource>,
     },
     /// Choose a Quest (with its paired Reward). `types` holds, per option, the minion types
     /// drawn for it when it was offered (`content::draw_quest_types`): of the Quest and of
@@ -891,6 +900,9 @@ pub struct Player {
     pub shop: Vec<ShopSlot>,
     pub free_refreshes: i32,
     pub trinkets: Vec<CardId>,
+    /// Observation provenance, keyed by the owned trinket instance (not its base card).
+    #[serde(default)]
+    pub trinket_sources: Vec<(CardId, TrinketSource)>,
     pub dark_gift_uses: u32,
     pub dark_gift_used_turn: bool,
     pub deity: Option<DeityState>,
@@ -1096,6 +1108,7 @@ impl Player {
             shop: Vec::new(),
             free_refreshes: 0,
             trinkets: Vec::new(),
+            trinket_sources: Vec::new(),
             dark_gift_uses: 0,
             dark_gift_used_turn: false,
             deity: None,
@@ -1200,6 +1213,19 @@ impl Player {
     }
     pub fn has_trinket(&self, id: &str) -> bool {
         self.trinket_effects().any(|t| db().get(t).id == id)
+    }
+    /// Observation source of an instance, including trinkets physically held as a power.
+    pub fn trinket_source(&self, card: CardId) -> Option<TrinketSource> {
+        self.trinket_sources
+            .iter()
+            .find(|entry| entry.0 == card)
+            .map(|entry| entry.1)
+            .or_else(|| {
+                self.powers
+                    .iter()
+                    .position(|power| power.card == card)
+                    .map(|slot| TrinketSource::HeroPower(slot as u8))
+            })
     }
     /// Effects in the Hero Power slots (Kiri's Eclipse) are still Trinkets. Pure
     /// display and hook-order code keeps the two physical locations separate.

@@ -2357,6 +2357,7 @@ impl Game {
                 options,
                 free: false,
                 replace,
+                ..
             }) = pl.pending.last()
             else {
                 return;
@@ -2374,7 +2375,14 @@ impl Game {
         }
     }
 
-    fn take_trinket(&mut self, p: PlayerId, t: CardId, free: bool, replace: Option<CardId>) {
+    fn take_trinket(
+        &mut self,
+        p: PlayerId,
+        t: CardId,
+        free: bool,
+        replace: Option<CardId>,
+        source: Option<crate::state::TrinketSource>,
+    ) {
         let cost = if free {
             0
         } else if replace.is_some() {
@@ -2397,7 +2405,7 @@ impl Game {
                     crate::content::resolve_eclipse(ctx, 0, old, t)
                 }
                 Some(old) => crate::content::replace_trinket(ctx, 0, old, t),
-                None => crate::content::grant_trinket(ctx, 0, t),
+                None => crate::content::grant_trinket_from(ctx, 0, t, source),
             }
             // Souvenir Stand: when you buy a Greater Trinket, it becomes a copy of it -- a
             // second trinket with its own counters, whose "when you get it" effect happens
@@ -2448,8 +2456,9 @@ impl Game {
                 options,
                 free,
                 replace,
+                source,
             } => {
-                self.take_trinket(p, options[i], free, replace);
+                self.take_trinket(p, options[i], free, replace, source);
                 self.drop_unaffordable_trinket_offers(p);
             }
             Pending::Quest { options, types } => {

@@ -539,6 +539,15 @@ impl Game {
     /// Offer trinkets of a size as a blocking choice (pick one of 4 and pay; eligibility weights
     /// unknown).
     pub fn offer_trinkets(&mut self, p: PlayerId, kind: CardKind) {
+        self.offer_trinkets_from(p, kind, None);
+    }
+
+    pub fn offer_trinkets_from(
+        &mut self,
+        p: PlayerId,
+        kind: CardKind,
+        source: Option<crate::state::TrinketSource>,
+    ) {
         // Mysterious Orb: your next Trinket is a Lesser Trinket.
         let kind = if std::mem::take(&mut self.players[p].next_trinket_lesser) {
             CardKind::TrinketLesser
@@ -571,6 +580,7 @@ impl Game {
             options: offer,
             free: false,
             replace: None,
+            source,
         });
     }
 

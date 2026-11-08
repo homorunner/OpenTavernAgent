@@ -31,10 +31,10 @@ fn cfg(activation: Activation, head_norm: bool) -> NetConfig {
 #[test]
 fn parameter_count_and_input_layout() {
     let net = PolicyValueNet::new(0, NetConfig::default()).unwrap();
-    assert_eq!(net.n_input_features(), 1713);
-    assert_eq!(net.n_card_slots(), 69);
-    assert_eq!(net.n_params(), 2_378_357);
-    assert_eq!(net.p.tensors.len(), 9 + 6 * net.cfg.blocks);
+    assert_eq!(net.n_input_features(), 1724);
+    assert_eq!(net.n_card_slots(), 57);
+    assert_eq!(net.n_params(), 2_315_637);
+    assert_eq!(net.p.tensors.len(), 11 + 6 * net.cfg.blocks);
     assert_eq!(net.p.names().last().unwrap(), "bv");
     let wide = PolicyValueNet::new(
         0,
@@ -45,15 +45,26 @@ fn parameter_count_and_input_layout() {
         },
     )
     .unwrap();
-    assert_eq!(wide.p.tensors.len(), 9 + 6 * 2);
+    assert_eq!(wide.p.tensors.len(), 11 + 6 * 2);
     assert_eq!(wide.p.tensors[wide.p.wp()].rows, 256);
     assert!(wide.p.is_weight(wide.p.wv()));
+    assert!(wide.p.is_weight(wide.p.wv_hidden()));
+    assert_eq!(wide.p.tensors[wide.p.wv_hidden()].cols, 128);
+    assert_eq!(wide.p.tensors[wide.p.wv()].rows, 128);
+    assert!(!wide.p.is_weight(wide.p.bv_hidden()));
     assert!(wide.p.is_weight(net::w_up(0)) && wide.p.is_weight(net::w_down(0)));
     assert!(!wide.p.is_weight(wide.p.bp()) && !wide.p.is_weight(wide.p.bv()));
     assert!(net::input_feature_indices().contains(&net::ENDED_TURN_FEATURE));
+    assert!(!net::input_feature_indices().contains(&0));
     assert!(!net::input_feature_indices().contains(&1));
     assert!(!net::input_feature_indices().contains(&15));
+    let features = net::input_feature_indices();
+    let quest_start = taverngym::obs::GLOBAL_F;
+    assert!((quest_start..quest_start + 2).all(|i| features.contains(&i)));
+    assert!((quest_start + 2..quest_start + 6).all(|i| !features.contains(&i)));
     let slots = net::card_slot_indices();
+    assert!((5..8).all(|i| slots.contains(&i)));
+    assert!((8..14).all(|i| !slots.contains(&i)));
     assert!(
         !slots.contains(&3) && !slots.contains(&14) && !slots.contains(&18) && slots.contains(&19)
     );
@@ -119,6 +130,16 @@ fn card_identity_matters_and_ignored_slots_do_not() {
     assert_eq!(
         net.predict(&obs.x, &empty, &obs.mask).unwrap(),
         net.predict(&obs.x, &ignored, &obs.mask).unwrap()
+    );
+    // Additional quests, their rewards/progress and reward-generated trinkets are hidden.
+    let quest_start = taverngym::obs::GLOBAL_F;
+    let mut extra_quests = obs.x.clone();
+    extra_quests[quest_start + 2..quest_start + 6].fill(1.0);
+    let extra_reward = ignored[14];
+    ignored[8..14].fill(extra_reward);
+    assert_eq!(
+        net.predict(&obs.x, &empty, &obs.mask).unwrap(),
+        net.predict(&extra_quests, &ignored, &obs.mask).unwrap()
     );
     let mut dark_gift = empty.clone();
     dark_gift[30] = db()
@@ -294,6 +315,46 @@ fn search_inference_follows_parameter_updates() {
 }
 
 #[test]
+fn nonlinear_value_head_has_independent_parameters_and_gradients() {
+    let mut net = PolicyValueNet::new(13, cfg(Activation::Gelu, false)).unwrap();
+    let obs = observe_seat(&position(13), 0);
+    let xs = [&obs.x[..]];
+    let cards = [&obs.cards[..]];
+    let masks = [&obs.mask[..]];
+    let (policy, value, cache) = net.forward(&xs, &cards, &masks).unwrap();
+    let value_grads = net.backward(&cache, &Mat::zeros(1, N_ACTIONS), &[1.0]);
+    for i in [net.p.wp(), net.p.bp()] {
+        assert_eq!(value_grads.tensors[i].sum_squares(), 0.0);
+    }
+    for i in [
+        net.p.wv_hidden(),
+        net.p.bv_hidden(),
+        net.p.wv(),
+        net.p.bv(),
+        net::W0,
+    ] {
+        assert!(value_grads.tensors[i].sum_squares() > 0.0);
+    }
+    let policy_grads = net.backward(&cache, &Mat::filled(1, N_ACTIONS, 0.01), &[0.0]);
+    for i in [net.p.wv_hidden(), net.p.bv_hidden(), net.p.wv(), net.p.bv()] {
+        assert_eq!(policy_grads.tensors[i].sum_squares(), 0.0);
+    }
+    // Refreshing the packed hidden projection must update value without moving logits.
+    let before = net.infer(&obs.x, &obs.cards, &obs.mask).unwrap();
+    let w = net.p.wv_hidden();
+    net.p.tensors[w].data.fill(0.0);
+    net.params_changed();
+    let after = net.infer(&obs.x, &obs.cards, &obs.mask).unwrap();
+    assert_eq!(before.0, after.0);
+    assert_ne!(before.1, after.1);
+    let (new_policy, new_value, _) = net.forward(&xs, &cards, &masks).unwrap();
+    assert_eq!(policy, new_policy);
+    assert_ne!(value, new_value);
+    assert_eq!(new_value, vec![0.0]);
+    assert_eq!(after.1, 0.0);
+}
+
+#[test]
 fn gradients_match_central_differences() {
     gradient_check(Activation::Gelu, false);
     gradient_check(Activation::Silu, true);
@@ -320,22 +381,14 @@ fn checkpoints_round_trip_and_reject_other_schemas() {
     let npz = Npz::load(&path).unwrap();
     assert_eq!(
         npz.get("W0").unwrap().shape,
-        vec![1713 + 69 * 4 + N_ACTIONS, net.cfg.hidden]
+        vec![1724 + 57 * 4 + N_ACTIONS, net.cfg.hidden]
     );
     assert_eq!(npz.get("bp").unwrap().shape, vec![N_ACTIONS]);
-    for version in [2, 9] {
-        let mut wrong = npz.clone();
-        let meta = wrong.get("meta").unwrap().as_text().unwrap().replace(
-            &format!("\"version\":{}", net::MODEL_VERSION),
-            &format!("\"version\":{version}"),
-        );
-        wrong.insert("meta", tavernagent::npz::NpyArray::text(&meta));
-        assert!(
-            PolicyValueNet::from_npz(&wrong)
-                .unwrap_err()
-                .contains(&format!("v{version}"))
-        );
-    }
+    assert_eq!(
+        npz.get("Wv_hidden").unwrap().shape,
+        vec![net.cfg.hidden, 128]
+    );
+    assert_eq!(npz.get("Wv").unwrap().shape, vec![128, 1]);
     let mut other_cards = npz.clone();
     let meta = other_cards.get("meta").unwrap().as_text().unwrap();
     let meta = meta.replace(

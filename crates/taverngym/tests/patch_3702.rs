@@ -61,6 +61,7 @@ fn buy_trinket(g: &mut Game, id: &str) {
         options: vec![cid(id)],
         free: false,
         replace: None,
+        source: None,
     });
     g.apply(0, Action::Choose(0)).unwrap();
 }
@@ -405,6 +406,7 @@ fn replacement_menu_closes_if_an_earlier_purchase_spends_its_budget() {
             options: vec![target],
             free: false,
             replace: Some(old),
+            source: None,
         });
     }
     g.apply(0, Action::Choose(0)).unwrap();

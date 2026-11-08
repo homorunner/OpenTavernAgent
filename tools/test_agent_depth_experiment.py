@@ -38,7 +38,7 @@ class IndependentSchedulingTests(unittest.TestCase):
                         self.assertTrue(self.barrier_test.wait(5), 'Fast lane waited for slow lane')
                     if depth == 6 and stage == 1000:
                         self.barrier_test.set()
-                state = dict(step=stage, format=8, net=dict(hidden=256, embedding_dim=32, blocks=depth))
+                state = dict(step=stage, format=9, net=dict(hidden=256, embedding_dim=32, blocks=depth))
                 (out.parent/'model.trainer.npz').write_text(json.dumps(state))
                 (out.parent/'model.history.json').write_text(json.dumps([
                     dict(step=i, collect_seconds=1, train_seconds=2) for i in range(1, stage+1)]))
@@ -77,18 +77,17 @@ class IndependentSchedulingTests(unittest.TestCase):
         self.run_scheduler((100, 500, 1000))
         self.assertEqual(self.calls, [], 'Completed jobs must not run again')
 
-    def test_resumes_inflight_stage_from_old_global_scheduler_without_retraining(self):
+    def test_resumes_inflight_stage_without_retraining_archived_checkpoints(self):
         for d in runner.DEPTHS:
             work, dst = self.args.work/f'd{d}', self.args.archive/f'd{d}'
             work.mkdir(parents=True)
             dst.mkdir()
             (work/'model.trainer.npz').write_text(json.dumps(
-                dict(step=150, format=8, net=dict(hidden=256, embedding_dim=32, blocks=d))))
+                dict(step=150, format=9, net=dict(hidden=256, embedding_dim=32, blocks=d))))
             for suffix in ['.npz', '.ema.npz']:
                 (dst/f'model.step100{suffix}').write_text('original checkpoint')
             for variant in ['ema', 'raw']:
                 (dst/f'eval_step100_{variant}.json').write_text('{}')
-        (self.args.archive/'stage100.complete.json').write_text('{}')
         self.run_scheduler((100, 500))
         train = [cmd for _, cmd in self.calls if cmd[1] == 'selfplay']
         self.assertEqual(len(train), 4)

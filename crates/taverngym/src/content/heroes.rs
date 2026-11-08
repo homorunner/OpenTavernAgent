@@ -421,7 +421,12 @@ fn trinket_turn(c: &mut Ctx, me: Me, turn: u32, kind: crate::cards::CardKind) {
     if c.g.turn == turn
         && let Some(p) = c.owner[me.side]
     {
-        c.board_home(me.side, |c| c.g.offer_trinkets(p, kind));
+        let source = c.g.players[p]
+            .powers
+            .iter()
+            .position(|power| power.card == me.card)
+            .map(|slot| crate::state::TrinketSource::HeroPower(slot as u8));
+        c.board_home(me.side, |c| c.g.offer_trinkets_from(p, kind, source));
     }
 }
 

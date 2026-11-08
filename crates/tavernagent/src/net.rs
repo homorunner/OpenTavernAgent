@@ -1,8 +1,10 @@
 //! A small pre-norm residual policy/value network with a shared card embedding.
 //!
 //! ```text
-//! numeric features + flattened card embeddings + legal action mask -> 256 -> pre-norm FFN residual blocks
-//!     -> {116 policy logits, 1 tanh value}
+//! numeric features + turn one-hot + card embeddings + legal mask
+//!     -> 256 -> pre-norm FFN residual blocks
+//!     -> policy: Linear(256, 116)
+//!     -> value: Linear(256, 128) -> GELU -> Linear(128, 1) -> tanh
 //! ```
 //!
 //! Forward passes return their cache instead of storing it, so one network can serve
@@ -31,7 +33,9 @@ pub const N_CARD_SLOTS: usize = o::OBS_CARDS;
 pub const DEFAULT_HIDDEN: usize = 256;
 pub const DEFAULT_EMBEDDING_DIM: usize = 32;
 pub const DEFAULT_BLOCKS: usize = 6;
-pub const MODEL_VERSION: i64 = 10;
+pub const MODEL_VERSION: i64 = 11;
+pub const TURN_BINS: usize = 16;
+pub const VALUE_HIDDEN: usize = 128;
 pub const N_OPP_BOARD_SLOTS: usize = o::N_OPP * a::N_BOARD;
 pub const OPP_BOARD_FEATURE_START: usize = N_FEATURES - N_OPP_BOARD_SLOTS * o::MINION_F;
 /// The ended-turn flag: the seat has finished recruiting and has no legal action.
@@ -40,22 +44,30 @@ pub const ENDED_TURN_FEATURE: usize = o::ENDED_TURN_F;
 /// Tavern-wide freeze flag (15, encoded per shop item instead).
 const EXCLUDED_GLOBALS: [usize; 3] = [1, 2, 15];
 
-/// Observation features that enter the network: everything but the historical opponent
-/// warbands and three redundant global flags.
+/// Raw numeric features retained after the turn is replaced by TURN_BINS one-hot bits.
+/// Historical opponent warbands, extra quests and three redundant global flags are omitted.
 pub fn input_feature_indices() -> Vec<usize> {
-    (0..OPP_BOARD_FEATURE_START)
+    (1..OPP_BOARD_FEATURE_START)
         .filter(|i| !EXCLUDED_GLOBALS.contains(i))
+        .filter(|i| !(o::GLOBAL_F + o::QUEST_F..o::GLOBAL_F + o::N_QUESTS * o::QUEST_F).contains(i))
         .collect()
 }
 
-/// Card slots that enter the network: not the Deity, the secrets or the historical boards.
+/// Raw observation offsets; only two ordinary owned trinkets enter the network.
+pub const TRINKET_SLOT_START: usize = N_CARD_SLOTS - N_OPP_BOARD_SLOTS - o::N_OPP - 8;
+pub const OWNED_TRINKET_SLOTS: usize = 2;
+
+/// Keep the first quest, its target reward and the first owned reward (three slots).
+/// Also omit Deity, secrets, surplus trinket slots and historical warbands.
 pub fn card_slot_indices() -> Vec<usize> {
     let quest_start = 1 + a::N_POWERS + 2;
     let secret_start = quest_start + 3 * o::N_QUESTS;
     (0..N_CARD_SLOTS)
         .filter(|&i| {
             i != 3
+                && !(quest_start + 3..secret_start).contains(&i)
                 && !(secret_start..secret_start + o::N_SECRETS).contains(&i)
+                && !(TRINKET_SLOT_START + OWNED_TRINKET_SLOTS..TRINKET_SLOT_START + 8).contains(&i)
                 && i < N_CARD_SLOTS - N_OPP_BOARD_SLOTS
         })
         .collect()
@@ -300,23 +312,36 @@ pub fn tensor_names(blocks: usize) -> Vec<String> {
             format!("k{i}"),
         ]);
     }
-    names.extend(["Wp".into(), "bp".into(), "Wv".into(), "bv".into()]);
+    names.extend([
+        "Wp".into(),
+        "bp".into(),
+        "Wv_hidden".into(),
+        "bv_hidden".into(),
+        "Wv".into(),
+        "bv".into(),
+    ]);
     names
 }
 
 impl Params {
-    /// Policy head weight / bias and value head weight / bias indices.
+    /// Policy projection and the two value-head layers.
     pub fn wp(&self) -> usize {
         block(self.blocks)
     }
     pub fn bp(&self) -> usize {
         block(self.blocks) + 1
     }
-    pub fn wv(&self) -> usize {
+    pub fn wv_hidden(&self) -> usize {
         block(self.blocks) + 2
     }
-    pub fn bv(&self) -> usize {
+    pub fn bv_hidden(&self) -> usize {
         block(self.blocks) + 3
+    }
+    pub fn wv(&self) -> usize {
+        block(self.blocks) + 4
+    }
+    pub fn bv(&self) -> usize {
+        block(self.blocks) + 5
     }
     pub fn names(&self) -> Vec<String> {
         tensor_names(self.blocks)
@@ -340,6 +365,7 @@ impl Params {
     pub fn is_weight(&self, index: usize) -> bool {
         index == W0
             || index == self.wp()
+            || index == self.wv_hidden()
             || index == self.wv()
             || (0..self.blocks).any(|i| index == w_up(i) || index == w_down(i))
     }
@@ -460,6 +486,8 @@ pub struct Cache {
     stem: StemCache,
     blocks: Vec<BlockCache>,
     h_final: Mat,
+    value_pre: Mat,
+    value_hidden: Mat,
     head_ln: Option<LnCache>,
     value: Vec<f32>,
 }
@@ -510,7 +538,7 @@ thread_local! {
 struct FastWeights {
     w0: Bf16Mat,
     blocks: Vec<(Bf16Mat, Bf16Mat)>,
-    // Policy/value share one product to avoid a mostly-empty SIMD value-head pass.
+    // Fuse policy logits and value hidden projection; both read the same trunk.
     heads: Bf16Mat,
     dot_blocks: OnceLock<Vec<(Bf16DotMat, Bf16DotMat)>>,
 }
@@ -518,11 +546,11 @@ struct FastWeights {
 impl FastWeights {
     fn new(p: &Params) -> FastWeights {
         let wp = &p.tensors[p.wp()];
-        let wv = &p.tensors[p.wv()];
-        let mut heads = Mat::zeros(wp.rows, N_ACTIONS + 1);
+        let wv = &p.tensors[p.wv_hidden()];
+        let mut heads = Mat::zeros(wp.rows, N_ACTIONS + VALUE_HIDDEN);
         for r in 0..wp.rows {
             heads.row_mut(r)[..N_ACTIONS].copy_from_slice(wp.row(r));
-            heads.row_mut(r)[N_ACTIONS] = wv.data[r];
+            heads.row_mut(r)[N_ACTIONS..].copy_from_slice(wv.row(r));
         }
         FastWeights {
             w0: Bf16Mat::from_mat(&p.tensors[W0]),
@@ -577,8 +605,8 @@ impl PolicyValueNet {
             Mat::from_vec(rows, cols, data)
         };
         let he = |fan_in: usize| (2.0 / fan_in as f32).sqrt();
-        let in_dim = input_features.len() + card_slots.len() * d + N_ACTIONS;
-        let mut tensors = Vec::with_capacity(9 + 6 * cfg.blocks);
+        let in_dim = TURN_BINS + input_features.len() + card_slots.len() * d + N_ACTIONS;
+        let mut tensors = Vec::with_capacity(11 + 6 * cfg.blocks);
         let mut e = randn(n_cards, d, 0.1);
         for v in e.row_mut(0) {
             *v = 0.0;
@@ -599,7 +627,9 @@ impl PolicyValueNet {
         }
         tensors.push(randn(h, N_ACTIONS, he(h) * 0.1));
         tensors.push(Mat::zeros(1, N_ACTIONS));
-        tensors.push(randn(h, 1, he(h) * 0.1));
+        tensors.push(randn(h, VALUE_HIDDEN, he(h)));
+        tensors.push(Mat::zeros(1, VALUE_HIDDEN));
+        tensors.push(randn(VALUE_HIDDEN, 1, he(VALUE_HIDDEN) * 0.1));
         tensors.push(Mat::zeros(1, 1));
         Ok(PolicyValueNet {
             p: Params {
@@ -630,7 +660,7 @@ impl PolicyValueNet {
     }
 
     pub fn n_input_features(&self) -> usize {
-        self.input_features.len()
+        TURN_BINS + self.input_features.len()
     }
 
     pub fn n_card_slots(&self) -> usize {
@@ -664,9 +694,14 @@ impl PolicyValueNet {
             return Err("observation does not match the schema".into());
         }
         let d = self.cfg.embedding_dim;
-        let n = self.input_features.len();
+        let n = self.n_input_features();
         let e = &self.p.tensors[E];
-        for (dst, &i) in row[..n].iter_mut().zip(&self.input_features) {
+        // The engine keeps turn / 20 in x[0]. Round before converting to avoid
+        // float truncation at integer boundaries; pre-game states use the T1 bin.
+        let turn = (x[0] * 20.0).round().clamp(1.0, TURN_BINS as f32) as usize;
+        row[..TURN_BINS].fill(0.0);
+        row[turn - 1] = 1.0;
+        for (dst, &i) in row[TURN_BINS..n].iter_mut().zip(&self.input_features) {
             *dst = x[i];
         }
         for (s, &slot) in self.card_slots.iter().enumerate() {
@@ -760,7 +795,13 @@ impl PolicyValueNet {
         let (wp, bp, wv, bv) = (self.p.wp(), self.p.bp(), self.p.wv(), self.p.bv());
         let mut logits = linear(&h, &p[wp]);
         logits.add_row(&p[bp].data);
-        let mut value_mat = linear(&h, &p[wv]);
+        let mut value_pre = linear(&h, &p[self.p.wv_hidden()]);
+        value_pre.add_row(&p[self.p.bv_hidden()].data);
+        let mut value_hidden = value_pre.clone();
+        for v in &mut value_hidden.data {
+            *v = gelu(*v);
+        }
+        let mut value_mat = linear(&value_hidden, &p[wv]);
         value_mat.add_row(&p[bv].data);
         let value: Vec<f32> = value_mat.data.iter().map(|v| v.tanh()).collect();
         Ok((
@@ -772,6 +813,8 @@ impl PolicyValueNet {
                 stem,
                 blocks,
                 h_final: h,
+                value_pre,
+                value_hidden,
                 head_ln,
                 value,
             },
@@ -836,7 +879,7 @@ impl PolicyValueNet {
         ws.normed.resize(self.cfg.hidden, 0.0);
         ws.up.resize(self.cfg.ff_hidden(), 0.0);
         ws.down.resize(self.cfg.hidden, 0.0);
-        ws.heads.resize(N_ACTIONS + 1, 0.0);
+        ws.heads.resize(N_ACTIONS + VALUE_HIDDEN, 0.0);
         self.write_input(x, cards, mask, &mut ws.input, None)?;
         fast.w0.vecmat_into(&ws.input, &mut ws.hidden);
         add_bias(&mut ws.hidden, &p[B0].data);
@@ -868,7 +911,17 @@ impl PolicyValueNet {
         }
         fast.heads.vecmat_into(&ws.hidden, &mut ws.heads);
         add_bias(&mut ws.heads[..N_ACTIONS], &p[self.p.bp()].data);
-        let value = (ws.heads[N_ACTIONS] + p[self.p.bv()].data[0]).tanh();
+        let vh = &mut ws.heads[N_ACTIONS..];
+        add_bias(vh, &p[self.p.bv_hidden()].data);
+        apply_fast(Activation::Gelu, vh);
+        // A single output: FP32 dot avoids a padded matrix-vector kernel.
+        let value = (vh
+            .iter()
+            .zip(&p[self.p.wv()].data)
+            .map(|(h, w)| h * w)
+            .sum::<f32>()
+            + p[self.p.bv()].data[0])
+            .tanh();
         Ok((&ws.heads[..N_ACTIONS], value))
     }
 
@@ -910,14 +963,19 @@ impl PolicyValueNet {
         }
         let mut logits = p[self.p.wp()].vecmat(&h);
         add_bias(&mut logits, &p[self.p.bp()].data);
-        let value = (p[self.p.wv()].vecmat(&h)[0] + p[self.p.bv()].data[0]).tanh();
+        let mut vh = p[self.p.wv_hidden()].vecmat(&h);
+        add_bias(&mut vh, &p[self.p.bv_hidden()].data);
+        for v in &mut vh {
+            *v = gelu(*v);
+        }
+        let value = (p[self.p.wv()].vecmat(&vh)[0] + p[self.p.bv()].data[0]).tanh();
         Ok((logits, value))
     }
 
     // ---- backward ----------------------------------------------------------
 
     /// Parameter gradients for upstream gradients of the logits (batch x actions) and of
-    /// the tanh value (batch).
+    /// the pre-tanh value (batch; caller includes the tanh derivative).
     pub fn backward(&self, cache: &Cache, dlogits: &Mat, dvalue: &[f32]) -> Params {
         let p = &self.p.tensors;
         let act = self.cfg.activation;
@@ -928,10 +986,16 @@ impl PolicyValueNet {
         let mut grads = self.p.zeros_like();
         grads.tensors[wp] = cache.h_final.t_matmul(dlogits);
         grads.tensors[bp] = Mat::from_vec(1, N_ACTIONS, dlogits.sum_rows());
-        grads.tensors[wv] = cache.h_final.t_matmul(&dvalue);
+        grads.tensors[wv] = cache.value_hidden.t_matmul(&dvalue);
         grads.tensors[bv] = Mat::from_vec(1, 1, dvalue.sum_rows());
         let mut dh = dlogits.matmul_t(&p[wp]);
-        dh.add_assign(&dvalue.matmul_t(&p[wv]));
+        let mut dvh = dvalue.matmul_t(&p[wv]);
+        for (d, v) in dvh.data.iter_mut().zip(&cache.value_pre.data) {
+            *d *= gelu_grad(*v);
+        }
+        grads.tensors[self.p.wv_hidden()] = cache.h_final.t_matmul(&dvh);
+        grads.tensors[self.p.bv_hidden()] = Mat::from_vec(1, VALUE_HIDDEN, dvh.sum_rows());
+        dh.add_assign(&dvh.matmul_t(&p[self.p.wv_hidden()]));
         if let Some(head) = &cache.head_ln {
             let ones = vec![1.0f32; hidden];
             dh = layer_norm_backward(&dh, head, &ones).0;
@@ -966,7 +1030,7 @@ impl PolicyValueNet {
         grads.tensors[B0] = Mat::from_vec(1, hidden, dz0.sum_rows());
         // Embedding gradient: the input gradient's embedding columns, scatter-added per card.
         let dx_in = dz0.matmul_t(&p[W0]);
-        let n_in = self.input_features.len();
+        let n_in = self.n_input_features();
         let d = self.cfg.embedding_dim;
         let n_slots = self.card_slots.len();
         let ge = &mut grads.tensors[E];
@@ -1012,7 +1076,7 @@ impl PolicyValueNet {
         let meta = CheckpointMeta {
             version: MODEL_VERSION,
             features: N_FEATURES,
-            input_features: self.input_features.len(),
+            input_features: self.n_input_features(),
             card_fingerprint: self.card_fingerprint.to_string(),
             cfg: self.cfg.clone(),
         };
@@ -1038,7 +1102,7 @@ impl PolicyValueNet {
         }
         let net = PolicyValueNet::new(0, meta.cfg.clone())?;
         if meta.features != N_FEATURES
-            || meta.input_features != net.input_features.len()
+            || meta.input_features != net.n_input_features()
             || meta.card_fingerprint != net.card_fingerprint.to_string()
         {
             return Err(
@@ -1110,4 +1174,39 @@ pub fn masked_softmax_rows(logits: &Mat, masks: &[&[bool]]) -> Mat {
             .copy_from_slice(&masked_softmax(logits.row(r), mask));
     }
     out
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    #[test]
+    fn turn_one_hot_replaces_scalar_and_caps_at_sixteen() {
+        let net = PolicyValueNet::new(1, NetConfig::default()).unwrap();
+        let mut x = vec![0.0; N_FEATURES];
+        x[7] = 0.8; // Other numeric features must keep their value and offset.
+        let cards = vec![0; N_CARD_SLOTS];
+        let mask = vec![false; N_ACTIONS];
+        let mut row = vec![99.0; net.p.tensors[W0].rows];
+        for turn in (0..=32).chain([100, 1000]) {
+            x[0] = turn as f32 / 20.0;
+            net.write_input(&x, &cards, &mask, &mut row, None).unwrap();
+            let expected = turn.clamp(1, 16) as usize - 1;
+            for (index, value) in row[..TURN_BINS].iter().enumerate() {
+                assert_eq!(*value, if index == expected { 1.0 } else { 0.0 });
+            }
+            assert_eq!(
+                row[TURN_BINS + net.input_features.iter().position(|&i| i == 7).unwrap()],
+                0.8
+            );
+        }
+        let infer = |turn| {
+            let mut x = x.clone();
+            x[0] = turn as f32 / 20.0;
+            net.infer_f32(&x, &cards, &mask).unwrap()
+        };
+        assert_ne!(infer(5), infer(6));
+        assert_eq!(infer(16), infer(17));
+        assert_eq!(infer(16), infer(100));
+    }
 }

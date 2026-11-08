@@ -3312,6 +3312,7 @@ fn buy_trinket(g: &mut Game, p: PlayerId, id: &str) {
         options: vec![cid(id)],
         free: false,
         replace: None,
+        source: None,
     });
     g.apply(p, Action::Choose(0)).unwrap();
     assert!(g.players[p].has_trinket(id));
@@ -3832,6 +3833,7 @@ fn trinkets_that_replace_or_move_trinkets() {
         options,
         free,
         replace,
+        ..
     }) = g.players[0].pending.last().cloned()
     else {
         panic!("swap offer")
@@ -9254,6 +9256,7 @@ fn mystery_cube_replaces_its_pick_every_turn() {
                 options,
                 free,
                 replace,
+                ..
             }) = g.players[0].pending.last().cloned()
             else {
                 panic!("seed {seed} turn {turn}: a free trinket choice is expected")
@@ -11932,6 +11935,7 @@ fn a_paid_trinket_offer_nobody_can_afford_is_declined() {
         options: vec![dear],
         free: false,
         replace: None,
+        source: None,
     });
     assert!(g.needs_action(0));
     assert_eq!(
@@ -12849,6 +12853,7 @@ fn trinket_two_cubes_turning_into_one_trinket_keep_their_own_state() {
             options: vec![typewriter],
             free: true,
             replace: Some(old),
+            source: None,
         });
         g.apply(0, Action::Choose(0)).unwrap();
     }

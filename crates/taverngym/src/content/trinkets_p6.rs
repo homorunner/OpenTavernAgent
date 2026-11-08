@@ -31,9 +31,21 @@ pub(crate) fn initialize_instance(c: &mut Ctx, side: Side, card: CardId) {
 
 /// Add trinket `t` to `side`'s player and run its immediate effect.
 pub fn grant_trinket(c: &mut Ctx, side: Side, t: CardId) {
+    grant_trinket_from(c, side, t, None);
+}
+
+pub fn grant_trinket_from(
+    c: &mut Ctx,
+    side: Side,
+    t: CardId,
+    source: Option<crate::state::TrinketSource>,
+) {
     let Some(p) = c.player(side) else { return };
     let t = instance_key(p, t, None);
     p.trinkets.push(t);
+    if let Some(source) = source {
+        p.trinket_sources.push((t, source));
+    }
     initialize_instance(c, side, t);
     attach(c, side, t);
     sync_held_trinket_auras(c, side);
@@ -60,6 +72,9 @@ pub fn replace_trinket(c: &mut Ctx, side: Side, old: CardId, t: CardId) {
     }
     let Some(p) = c.player(side) else { return };
     let t = instance_key(p, t, Some(old));
+    if let Some(entry) = p.trinket_sources.iter_mut().find(|entry| entry.0 == old) {
+        entry.0 = t;
+    }
     // Each acquired Cube keeps its own current replacement, including repeated Cubes.
     if let Some(source) = p.cube_sources.iter_mut().find(|source| **source == old) {
         *source = t;
@@ -174,6 +189,7 @@ fn eclipse_offer(c: &mut Ctx, me: Me, kind: CardKind) {
             options,
             free: false,
             replace: Some(source),
+            source: None,
         });
     }
 }
@@ -308,6 +324,7 @@ fn offer_swap(c: &mut Ctx, side: Side, old: CardId, kind: CardKind, n: usize, fr
             options,
             free,
             replace: Some(old),
+            source: None,
         });
     }
 }
@@ -444,7 +461,10 @@ pub fn scripts() -> Vec<(&'static str, Script)> {
                 on_attach: Some(|c, me| {
                     let cands = eligible(c, me.side, CardKind::TrinketLesser, |_| true);
                     if let Some(&t) = c.g.rng.pick(&cands) {
-                        grant_trinket(c, me.side, t);
+                        let source = c
+                            .player_ref(me.side)
+                            .and_then(|p| p.trinket_source(me.card));
+                        grant_trinket_from(c, me.side, t, source);
                     }
                 }),
                 ..E

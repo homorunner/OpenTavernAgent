@@ -1796,7 +1796,8 @@ fn boutique() -> Script {
                 crate::cards::CardKind::TrinketGreater
             };
             if let Some(p) = c.owner[me.side] {
-                c.board_home(me.side, |c| c.g.offer_trinkets(p, kind));
+                let source = Some(crate::state::TrinketSource::QuestReward(me.card));
+                c.board_home(me.side, |c| c.g.offer_trinkets_from(p, kind, source));
             }
         }),
         ..E

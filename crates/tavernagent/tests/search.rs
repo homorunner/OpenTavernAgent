@@ -224,6 +224,7 @@ fn cancel_stays_when_it_is_the_only_legal_action() {
         options: dear,
         free: false,
         replace: None,
+        source: None,
     });
     let legal = game.legal_mask(0);
     assert!(legal[A_CANCEL]);

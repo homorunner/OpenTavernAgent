@@ -5,8 +5,9 @@ self-play. It is the Rust crate `crates/tavernagent` and the `tavernagent` binar
 on the `taverngym` crate directly and needs no Python. Checkpoints are numpy-readable `.npz`
 files, so weights stay inspectable from Python.
 
-The current model has **2,378,357 parameters**: a policy head and a value head. Weights are
-model format v10; the search protocol is `ended-state-v9-compact-play`.
+The default model has **2,315,637 parameters**, with a linear policy head and a nonlinear
+value head. Model format is v11, trainer format is 9, and the search protocol is
+`ended-state-v9-compact-play`.
 
 ## Commands
 
@@ -51,12 +52,13 @@ Results do not depend on the thread count.
 ## Network and inputs
 
 ```
-1713 numeric features + 69 card slots x 32-dim shared card embedding + 116 mask bits
-  -> Linear(4037, 256) -> LayerNorm -> GELU
+1708 numeric features + 16 turn one-hot bits + 57 card slots x 32-dim card embedding + 116 mask bits
+  -> Linear(3664, 256) -> LayerNorm -> GELU
   -> 6 pre-norm residual blocks:
        h <- h + scale * (W_down GELU(W_up LayerNorm(h) + b_up) + b_down)
        256 -> 384 -> 256
-  -> 116 policy logits (masked softmax) / tanh value
+  -> policy: Linear(256, 116) -> masked softmax
+  -> value: Linear(256, 128) -> GELU -> Linear(128, 1) -> tanh
 ```
 
 - The policy head has **116 actions**: indices 0–45 match the engine; indices 46–115
@@ -66,11 +68,14 @@ Results do not depend on the thread count.
   separately. Spells still use position 0. Move is absent.
   `actions::engine_action` translates against the current state, and the mask uses the
   same translation. TavernGym's 245-action API is unchanged.
-- Model format v10 requires the two-layer pre-norm FFN tensors; earlier models,
-  including v9's single-layer blocks, are rejected. The FFN width is fixed to
-  `hidden + ceil(hidden / 2)`. `W_up` uses He initialization; `W_down` uses He divided
-  by `sqrt(2 * blocks)` to bound the initial residual variance as depth increases.
-  The residual scale remains 1, head norm remains off, and both output heads remain linear.
+- The FFN width is fixed to `hidden + ceil(hidden / 2)`. `W_up` uses He initialization;
+  `W_down` uses He divided by `sqrt(2 * blocks)` to bound the initial residual variance
+  as depth increases.
+  The residual scale remains 1, head norm remains off, and the policy head remains linear.
+  The value hidden width is fixed at 128 and uses GELU.
+- The raw turn scalar (`turn / 20`) is replaced inside TavernAgent by 16 one-hot bits:
+  T1 through T15 have separate bins; T16 and later share the last bin. The engine
+  observation schema is unchanged; pre-game turn 0 maps to T1.
 - The 116-bit `agent_mask` enters the shared trunk as 0/1 features, so both policy and
   value can use legality. Training and inference use the same mask; ended states use
   an all-zero mask. The ended-turn flag remains in the original numeric input.
@@ -82,9 +87,18 @@ Results do not depend on the thread count.
   recruiting and has no legal action. On such a position the value head estimates the
   warband that goes to combat.
 - Minions, spells, heroes, hero powers, trinkets, quests and rewards share one embedding
-  table indexed by `CardId + 1` (0 = empty; Dark Gifts are not embedded). The 69 slots are
+  table indexed by `CardId + 1` (0 = empty; Dark Gifts are not embedded). The 57 slots are
   the own warband, hand, Tavern, the pending choice's source and options, trinkets,
   quests/rewards and the opponents' heroes; the Deity and secret slots are not used.
+- Quest inputs retain only the first active quest, its target reward and the first owned
+  reward (three card slots), plus the first quest's presence and progress. Additional
+  quests/rewards, including their reward-generated trinkets, are omitted from network input.
+- Only two ordinary owned-trinket slots enter the network. Trinkets acquired through a
+  hero power or quest reward occupy that power's or owned reward's card slot instead.
+  Resolved Orb of the Unknown shells are skipped; their generated trinkets inherit the
+  acquisition source. Pending Orb options remain visible. Acquisition sources are recorded
+  per trinket instance; replacement and Orb generation preserve them. Engine effects
+  stay unchanged.
 - Stats use the engine's `log1p` scaling; other features keep their linear scales.
   Host-side per-turn budgets (actions, Moves, Freeze presses) are not inputs: the search
   mask already excludes what is unaffordable, and the cap is a host safety limit, not a
@@ -97,12 +111,14 @@ Results do not depend on the thread count.
   central differences.
 - **Search-time inference** uses a thread-local reusable workspace. After warmup,
   internal inference allocates nothing and `predict` allocates only its returned policy.
-  Policy/value share one matrix product; output bias, scaling and residual addition are
-  fused. GELU/SiLU use a vectorized rational tanh with AVX-512 runtime dispatch.
+  Policy logits and the value hidden projection share one matrix product; output bias,
+  scaling and residual addition are fused. GELU/SiLU use a vectorized rational tanh
+  with AVX-512 runtime dispatch.
 - The input projection skips zero inputs and uses BF16 weights with FP32 activations
   and FMA accumulation. Dense FFN layers use native AVX-512 BF16 dot products where
   available, rounding activations to BF16 and accumulating in FP32. Unsupported CPUs
-  retain the BF16-weight/FMA path (AVX-512, AVX2, or portable). The heads stay on FMA.
+  retain the BF16-weight/FMA path (AVX-512, AVX2, or portable). The head projection uses
+  BF16-weight/FMA; the final 128-to-1 value projection uses an FP32 dot product.
   Packed dot weights are built lazily and invalidated by `params_changed` along with
   the other inference weights. Training stays FP32; `infer_f32` is the exact reference.
 - BF16 reduces weight traffic, but does **not** guarantee L2 residency. The experiment
@@ -290,13 +306,17 @@ rounds); the default window schedule continues from the saved round.
 gradient norms, entropies, target KL, the ended sample counts and timings. Losses and
 per-epoch metrics currently describe the last training epoch, not an independent
 validation set; `samples` counts that epoch's draw, not the total across all epochs.
-Trainer format 8 requires the new FFN network, replay row weights and saved options;
-older formats and incomplete snapshots are rejected. Saved split turns are inherited
+Trainer snapshots include the network, replay row weights and saved options; loading
+validates the model/search schema and replay completeness. Saved split turns are inherited
 on resume unless explicitly overridden. The multiplier is recorded as
 `split_sample_weight` in `<out>.config.json`; history includes
 `sample_weight_sum` and `policy_sample_weight_sum` alongside the raw sample counts.
 
-## Recent results (2026-11-07)
+## Experiment results (2026-11-06–08)
+
+These runs used the model structures and frozen binaries described in each cohort.
+They predate the current turn one-hot encoding, nonlinear value head and compact
+quest/trinket inputs; their results do not evaluate the current architecture.
 
 After the FPU correction, both cohorts used 128 games/round, 256 search simulations,
 batch 512, max-samples 65,536, seed 444444444, constant learning rates and no rollout
@@ -331,9 +351,6 @@ evaluation; the last evaluated checkpoints were rounds 2500 and 3000 respectivel
 - **E2 training loss was misleading at 1e-4.** From round 500 to 1500, replay value MSE fell
   from 0.226 to 0.206 while MSE on fresh self-play rose from 0.246 to 0.268. Increasing
   batch size should be tested alongside training intensity, not treated as a proven fix.
-
-Older pre-FPU results are omitted. Pre-v10 code, binaries and experiment artifacts on
-`experiment` were deleted on 2026-11-07; historical results below are retained as summaries.
 
 ### Tree rollout / batch / epochs comparison (2026-11-06–07)
 
@@ -447,8 +464,8 @@ E1/E2/E4 remained healthy. At full search/E8, raising value-weight from .5 to 1 
 only **17.7%** against the control across three seeds. These models had finite weights;
 lower training loss alone does not establish stronger play. Split changes data quantity,
 weights and reuse as well as target variance. Further temperature reduction (.25/.1)
-and other loss/prior changes remain candidates, not confirmed defaults. These remain candidates for later training-intensity experiments; the next campaign
-instead isolates network depth with E2 and the more conservative constant lr=3e-5.
+and other loss/prior changes remain candidates, not confirmed defaults. The subsequent
+campaign compared network depth with E2 and constant lr=3e-5.
 
 ### Pre-norm FFN depth comparison (2026-11-07)
 
@@ -520,8 +537,8 @@ per-depth weights and numerical validation. The 20-minute card follows this camp
   within the first 32 actions (or the next legal end), so coverage remains limited.
 - Search improvement under visit-count selection and the fixed FPU reduction needs
   controlled comparisons. Tree splits also change sample counts, weights and data reuse.
-- **TODO: value head.** Test a small nonlinear value head and, separately, short-term
-  combat/damage auxiliary targets. Keep final expected placement as search utility.
+- **TODO: value auxiliary targets.** Test short-term combat/damage targets alongside the
+  nonlinear value head. Keep final expected placement as search utility.
 - **TODO: input representation.** Test a shared per-card/entity encoder that retains
   zone and position information. Current input projection remains per slot; simply
   pooling away warband order would discard strategically relevant information.

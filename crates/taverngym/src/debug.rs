@@ -668,6 +668,7 @@ fn view_for(g: &Game, p: PlayerId, public: bool, combats: bool) -> Value {
             options,
             free,
             replace,
+            ..
         } => json!({
             "kind": "trinket",
             "free": free,
