@@ -11,6 +11,27 @@ use std::path::Path;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+const ARRAY_WRITE_BYTES: usize = 64 * 1024;
+
+/// Encode bounded chunks before passing them to the ZIP writer. Buffering only the
+/// underlying file still makes ZIP/CRC process each scalar separately. Keep little-
+/// endian encoding explicit on every platform and avoid a second array-sized buffer.
+fn write_array_chunks<T, const N: usize>(
+    w: &mut impl Write,
+    values: &[T],
+    encode: impl Fn(&T) -> [u8; N],
+) -> std::io::Result<()> {
+    let mut bytes = [0u8; ARRAY_WRITE_BYTES];
+    for chunk in values.chunks(ARRAY_WRITE_BYTES / N) {
+        let used = &mut bytes[..chunk.len() * N];
+        for (value, dst) in chunk.iter().zip(used.as_chunks_mut::<N>().0) {
+            dst.copy_from_slice(&encode(value));
+        }
+        w.write_all(used)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum NpyData {
     F32(Vec<f32>),
@@ -136,26 +157,11 @@ impl NpyArray {
         w.write_all(&(header.len() as u16).to_le_bytes())?;
         w.write_all(header.as_bytes())?;
         match &self.data {
-            NpyData::F32(v) => {
-                for x in v {
-                    w.write_all(&x.to_le_bytes())?;
-                }
-            }
-            NpyData::I32(v) => {
-                for x in v {
-                    w.write_all(&x.to_le_bytes())?;
-                }
-            }
-            NpyData::I64(v) => {
-                for x in v {
-                    w.write_all(&x.to_le_bytes())?;
-                }
-            }
+            NpyData::F32(v) => write_array_chunks(w, v, |x| x.to_le_bytes())?,
+            NpyData::I32(v) => write_array_chunks(w, v, |x| x.to_le_bytes())?,
+            NpyData::I64(v) => write_array_chunks(w, v, |x| x.to_le_bytes())?,
             NpyData::U8(v) => w.write_all(v)?,
-            NpyData::Bool(v) => {
-                let bytes: Vec<u8> = v.iter().map(|b| *b as u8).collect();
-                w.write_all(&bytes)?;
-            }
+            NpyData::Bool(v) => write_array_chunks(w, v, |x| [u8::from(*x)])?,
         }
         Ok(())
     }
@@ -325,6 +331,97 @@ impl Npz {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_payloads_preserve_scalar_bytes_and_partial_writes() {
+        // Include a tail after a 64 KiB boundary for every dtype, plus empty/scalar arrays.
+        // Compare against scalar little-endian encoding, including noncanonical NaNs.
+        struct ShortWriter(Vec<u8>);
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let n = bytes.len().min(113);
+                self.0.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let float_bits = [
+            0,
+            0x8000_0000,
+            1,
+            0x7f80_0000,
+            0xff80_0000,
+            0x7fc0_1234,
+            0x7f80_1234,
+        ];
+        for n in [0, 1, ARRAY_WRITE_BYTES + 3] {
+            let shape = if n == 1 { vec![] } else { vec![n] };
+            let arrays = [
+                NpyArray::f32(
+                    shape.clone(),
+                    (0..n)
+                        .map(|i| f32::from_bits(float_bits[i % float_bits.len()]))
+                        .collect(),
+                ),
+                NpyArray::i32(
+                    shape.clone(),
+                    (0..n).map(|i| [i32::MIN, -1, 0, i32::MAX][i % 4]).collect(),
+                ),
+                NpyArray::i64(
+                    shape.clone(),
+                    (0..n).map(|i| [i64::MIN, -1, 0, i64::MAX][i % 4]).collect(),
+                ),
+                NpyArray::u8(shape.clone(), (0..n).map(|i| i as u8).collect()),
+                NpyArray::bool(shape, (0..n).map(|i| i % 3 == 0).collect()),
+            ];
+            for array in arrays {
+                let expected: Vec<u8> = match &array.data {
+                    NpyData::F32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+                    NpyData::I32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+                    NpyData::I64(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+                    NpyData::U8(v) => v.clone(),
+                    NpyData::Bool(v) => v.iter().map(|x| u8::from(*x)).collect(),
+                };
+                let mut writer = ShortWriter(Vec::new());
+                array.write_npy(&mut writer).unwrap();
+                let bytes = writer.0;
+                let body = 10 + u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+                assert_eq!(&bytes[body..], &expected, "{} length {n}", array.descr());
+                let decoded = NpyArray::read_npy(&bytes).unwrap();
+                assert_eq!(decoded.shape, array.shape);
+                assert_eq!(decoded.descr(), array.descr());
+                if let NpyData::F32(v) = &array.data {
+                    assert_eq!(
+                        decoded
+                            .as_f32()
+                            .unwrap()
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect::<Vec<_>>(),
+                        v.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                    );
+                } else {
+                    assert_eq!(decoded, array);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_payload_propagates_a_tail_write_failure() {
+        let array = NpyArray::i64(
+            vec![ARRAY_WRITE_BYTES / 8 + 1],
+            vec![42; ARRAY_WRITE_BYTES / 8 + 1],
+        );
+        let mut complete = Vec::new();
+        array.write_npy(&mut complete).unwrap();
+        // Enough for the header and first chunk, but not the final element.
+        let mut buffer = vec![0u8; complete.len() - 1];
+        let err = array.write_npy(&mut buffer.as_mut_slice()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+    }
 
     #[test]
     fn arrays_round_trip_through_a_zip() {

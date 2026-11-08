@@ -297,11 +297,19 @@ training cap, so they also change the average reuse of a row at the same epoch c
 | `--weight-decay` / `--clip` / `--ema-rounds` | 0.01 / 5.0 / 2 |
 
 `--save-trainer-state` writes the network, AdamW moments, EMA, RNG states, history, options
-and the **whole replay window** to `<out>.trainer.npz` after every round. Snapshot size
-depends on the number of stored rows, including tree continuations; `--save-every N` keeps
-immutable `<out>.stepN.npz` / `.ema.npz` / `.trainer.npz`.
+and the **whole replay window** to `<out>.trainer.npz` every **10 cumulative rounds** by
+default. `--save-trainer-every N` changes that interval (positive; use 1 for every round).
+The final round always saves trainer state when enabled. `--save-every N` additionally
+saves immutable `<out>.stepN.npz` / `.ema.npz` / `.trainer.npz` at archive rounds, including
+when they fall between trainer intervals; trainer archives require trainer state saving.
+Raw and EMA weight files still update every round. Snapshot size depends on the number of
+stored rows, including tree continuations. Array payloads use bounded 64 KiB writes with
+the same little-endian NPY encoding.
 `--resume-state` restores all of it bit-exactly (a smaller `--replay-rounds` keeps the newest
-rounds); the default window schedule continues from the saved round.
+rounds) and enables trainer state saving; the default window schedule continues from the
+saved round. It inherits the saved trainer interval unless explicitly overridden; older
+snapshots without an interval use 10. An interrupted run resumes at its last saved round,
+so work since that snapshot must be repeated.
 `--resume` loads weights only. `<out>.history.json` records per-round losses,
 gradient norms, entropies, target KL, the ended sample counts and timings. Losses and
 per-epoch metrics currently describe the last training epoch, not an independent
@@ -409,16 +417,14 @@ early positions, and track empty-board/buy-without-play rates in the new recipes
 Fresh unsplit value MSE remains roughly .23–.26 and early-turn R² is low;
 neither establishes an irreducible noise floor. Replay loss is not directly comparable
 because split-prefix labels average continuations and training uses sample weights.
-Review artifacts are local in `runs/main_training_review_20261107/`; all 90 scheduled
-evaluations completed successfully, alongside the additional arenas and diagnostics.
+All 90 scheduled evaluations completed successfully, alongside the additional arenas
+and diagnostics.
 
 ### Borrowed-VM parameter campaign (2026-11-06–07)
 
 Finished at **Nov 7 10:55 CST**, ahead of the noon deadline. The final audit reached
 all **310 borrowed hosts** and verified no experiment directories or related processes
-remained. Plans, checkpoints, detailed results and cleanup evidence are local in
-`runs/borrowed_hparam_20261106/`; the quality/cost comparison is available as JSON,
-CSV, PNG and SVG. One timed-out FPU replicate was excluded from complete-group analyses.
+remained. One timed-out FPU replicate was excluded from complete-group analyses.
 
 A 100-setting C_PUCT / temperature / noise grid used three training seeds per setting;
 important candidates received five- or ten-seed follow-ups. The table below uses ten
@@ -469,67 +475,60 @@ campaign compared network depth with E2 and constant lr=3e-5.
 
 ### Pre-norm FFN depth comparison (2026-11-07)
 
-Four fresh v10 runs on TavernGym 37.0.2: **6/8/10/12 blocks**, respectively
-**2.378M / 2.774M / 3.169M / 3.565M** parameters. All use width 256, embedding 32,
-FFN width 384, seed 444444444 and the same default training/search recipe
-(128 roots, sims 256, search probability .33, split T4, E2, lr 3e-5, batch 512).
-Restarted from scratch with max-samples 80,000 (+22% per epoch) and the scheduled
-3→6-round replay window. A larger window broadens data coverage; at a fixed draw size
-it does not by itself increase average row reuse. The brief initial lr=1e-4 runs were discarded.
-Each gets 128 physical cores on one NUMA node. This is a one-seed screening experiment.
+Trained four v10 models from scratch on TavernGym 37.0.2, comparing **6/8/10/12
+blocks** at width256, embedding32 and FFN width384. All used 128 roots, sims256,
+search probability .33, splitT4, E2, lr3e-5, batch512, max-samples80k and replay3→6.
+Each run had 128 physical cores and one training seed.
 
-`tools/agent_depth_experiment.py` trains each depth independently to **3,000 rounds**,
-matching the previous overnight campaign, and archives checkpoints every **100 rounds**.
-Training nodes do no eval, Arena or behaviour probes. `tools/agent_remote_eval.py`
-queues raw/EMA eval every 100 rounds and an ongoing eight-player league on six borrowed
-64-core BF16-capable hosts. Each host runs one job at a time. Scripted eval uses 512 games at
-round 100 and 2048 thereafter. Teacher eval uses 2048 games for every raw/EMA checkpoint,
-including a backfill of existing checkpoints. `teacher.rs` implements AutoTavern 5075b273's
-no-composition policy with fixed leveling, pairs/triples and early Dark Gift rules; it needs
-no external data. Teacher results use `teacher_eval_step*.json` and a separately hashed
-evaluation binary; the running training and scripted-eval binaries stay fixed. The league puts all raw/EMA checkpoints into one pool,
-samples eight distinct models per table, with 80% inverse-count weight and a 20% uniform floor and records full placements (64 simulations).
-`tools/league_elo.py` fits Plackett–Luce Elo-scale ratings, with whole-game bootstrap uncertainty.
-Paired Arena results are historical only and are excluded from league ratings.
-Training never waits for the evaluation queue.
+At the common **800-round** checkpoint, EMA evaluation with 64 search simulations
+produced the following mean placements (lower is better). Teacher is the AutoTavern
+rule policy without composition tables.
 
-Queue state, results and PNG figures are mirrored locally in `runs/depth_remote_eval_20261107/`.
-Completed results are also published back to the training archive. Borrowed hosts receive
-only per-job `/tmp/tavernagent-depth-eval-*` directories; finally cleanup, an independent
-watchdog and post-job verification cover normal completion, failures and abandoned jobs.
-The 20-minute notification card includes separate scripted/teacher placement curves and pooled league Elo curves.
+| Blocks | Parameters | Teacher (95% interval) | Scripted | Collection + training hours |
+| --- | ---: | ---: | ---: | ---: |
+| 6 | 2.378M | **1.687 ± .050** | **1.274** | **6.87** |
+| 8 | 2.774M | 1.867 ± .056 | 1.373 | 8.67 |
+| 10 | 3.169M | 1.845 ± .055 | 1.354 | 9.79 |
+| 12 | 3.565M | 1.757 ± .050 | 1.353 | 11.66 |
 
-Scratch/replay: `/tmp/tavernagent-depth-replay-20261107/`; durable results and latest resumable
-states: `<workspace>/runs/depth_replay_20261107/` on experiment.
-The manifest records the source revision, binary hash and settings; `status.json`
-records the training phase, while `d*/status.json` records each lane's training/archive state.
-`remote_eval_status.json` records the external queue and failures.
-Per-depth stage markers and completed result files make restarts idempotent.
-Older immutable replay snapshots are removed after archiving
-weights, while current replay/optimizer/RNG state is retained for exact resume.
+Teacher results use 4,096 games per model. Timing excludes checkpoint I/O and
+evaluation. The runs stopped at **1181 / 993 / 971 / 866 rounds**. The 6-block model
+continued improving: at round1100 it scored approximately **1.523 against teacher**
+and **1.215 against scripted**.
 
+Six blocks gave the best observed quality and speed; deeper models cost 26–70% more
+collection/training time at round800 without better placement. This single-seed
+comparison does not establish that depth itself hurts: initialization and self-play
+trajectories differed. Gradient and BF16 checks found no obvious numerical failure.
+This motivated the following continuation experiment from one shared starting policy.
 
 ### Identity-depth continuation (2026-11-08)
 
-The previous four runs stopped at steps **1181 / 993 / 971 / 866**. All four new runs
-start from the **6-block step1181 EMA**, with the original tensors retained and 0/2/4/6
-identity FFN blocks appended for depths 6/8/10/12 (`tools/agent_expand_depth.py`). New
-up projections use He initialization; down projections and biases are zero; LayerNorm
-starts at gamma=1/beta=0. Shared new blocks have identical initialization across depths.
-On 404 common positions, FP32 and BF16 logits/value match the source exactly, including
-on a borrowed BF16 host; new down projections have nonzero gradients.
+Compared 6/8/10/12-block models starting from the same **6-block step1181 EMA**,
+with added blocks initialized as identity mappings. Optimizer and replay were reset;
+all runs used lr=3e-5, E2, batch512, max-samples80k and splitT4. Training stopped after
+roughly 300–400 additional rounds.
 
-Adam, EMA update count, replay and training steps reset for every depth. The previous
-training binary, lr=3e-5, E2, batch512, max-samples80k, replay3→6, splitT4 and seed444444444
-are retained. Four 128-core NUMA lanes target 3000 additional steps. Step0 and every100
-steps get scripted/teacher evaluation plus the pooled league; latest checkpoints receive
-the same idle precision batches. This isolates a common starting policy, not independent
-training-seed variance. Review the first 200–300 additional steps before interpreting depth.
+EMA mean placement (lower is better), evaluated with 64 search simulations:
 
-Archive on experiment: `runs/depth_identity_20261108/`; scratch:
-`/tmp/tavernagent-depth-identity-20261108/`; local evaluations:
-`runs/depth_identity_remote_20261108/`. The initial directory records source step/hash,
-per-depth weights and numerical validation. The 20-minute card follows this campaign.
+| Model | Teacher +100 | Teacher +200 | Teacher +300 | Scripted +300 |
+| --- | ---: | ---: | ---: | ---: |
+| Common starting policy | 1.503 | — | — | 1.196 |
+| 6 blocks | 1.551 | 1.518 | 1.492 | 1.186 |
+| 8 blocks | 1.582 | 1.474 | 1.526 | 1.196 |
+| 10 blocks | 1.521 | 1.517 | 1.509 | 1.189 |
+| 12 blocks | 1.583 | 1.576 | 1.533 | 1.193 |
+
+Teacher +300 used 4,608 games per model (2,560 for 12 blocks); paired-seed 95%
+intervals showed no significant improvement over the starting policy. The 6-block
++400 result was also flat at **1.497**. Arena showed a temporary advantage for 8-block
++200 that weakened at +300. With one training seed, the current conclusion is a
+plateau under this recipe, with no sustained benefit from adding depth.
+
+The main current suspicion is **data quality caused by v10's `end-explore=0.02`**:
+every eligible decision could force End Turn, and the resulting placements were also
+used to label earlier states. Repeated interventions may distort the value targets
+and prevent further improvement; this explanation still needs a controlled experiment.
 
 ## Open problems
 

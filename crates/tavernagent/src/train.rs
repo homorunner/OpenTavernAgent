@@ -20,6 +20,10 @@ use crate::selfplay::{
     read_training_meta, save_training_state, train_epoch, validate_split_turns,
 };
 
+const fn default_save_trainer_every() -> usize {
+    10
+}
+
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
 pub struct SelfplayArgs {
     /// Cumulative target number of collect+train rounds.
@@ -140,9 +144,14 @@ pub struct SelfplayArgs {
     /// Keep an immutable checkpoint every N rounds (0 = off).
     #[arg(long, default_value_t = 0)]
     pub save_every: usize,
-    /// Write the full trainer state (optimizer, RNGs, replay window) after every round.
+    /// Save full trainer state at --save-trainer-every, archive rounds and the final round.
     #[arg(long, default_value_t = false)]
     pub save_trainer_state: bool,
+    /// Full trainer snapshot interval in cumulative rounds (requires --save-trainer-state;
+    /// also applies to --resume-state). Must be positive.
+    #[arg(long, default_value_t = default_save_trainer_every())]
+    #[serde(default = "default_save_trainer_every")]
+    pub save_trainer_every: usize,
     /// Continue exactly from a trainer state; saved options apply unless given again.
     #[arg(long)]
     pub resume_state: Option<PathBuf>,
@@ -161,6 +170,13 @@ impl Default for SelfplayArgs {
 }
 
 impl SelfplayArgs {
+    fn trainer_checkpoint_due(&self, step: usize) -> bool {
+        self.save_trainer_state
+            && (step.is_multiple_of(self.save_trainer_every)
+                || step == self.steps
+                || (self.save_every > 0 && step.is_multiple_of(self.save_every)))
+    }
+
     /// Capacity at the cumulative training round (integer division).
     pub fn replay_capacity(&self, step: usize) -> usize {
         self.replay_rounds.unwrap_or(3 + (step / 200).min(3))
@@ -231,6 +247,9 @@ impl SelfplayArgs {
         }
         if self.replay_rounds == Some(0) {
             return Err("replay-rounds must be positive".into());
+        }
+        if self.save_trainer_every == 0 {
+            return Err("save-trainer-every must be positive".into());
         }
         if !(self.ema_rounds.is_finite() && self.ema_rounds > 0.0) {
             return Err("ema-rounds must be positive".into());
@@ -539,7 +558,8 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
                 .save(&with_stem(&out, &format!(".step{step}.npz")))?;
             ema.save(&with_stem(&out, &format!(".step{step}.ema.npz")))?;
         }
-        if args.save_trainer_state {
+        if args.trainer_checkpoint_due(step) {
+            let checkpoint_start = Instant::now();
             let state = TrainingState {
                 trainer: &trainer,
                 step,
@@ -557,6 +577,10 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
                     &state,
                 )?;
             }
+            println!(
+                "  trainer checkpoint step {step}: {:.3}s",
+                checkpoint_start.elapsed().as_secs_f64()
+            );
         }
     }
     println!(
@@ -584,6 +608,63 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trainer_snapshots_follow_interval_archive_and_final_rounds() {
+        let mut args = SelfplayArgs {
+            steps: 23,
+            save_trainer_state: true,
+            ..SelfplayArgs::default()
+        };
+        let saved_steps = |args: &SelfplayArgs| {
+            (1..=args.steps)
+                .filter(|&step| args.trainer_checkpoint_due(step))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(saved_steps(&args), vec![10, 20, 23]);
+        args.save_every = 7;
+        assert_eq!(saved_steps(&args), vec![7, 10, 14, 20, 21, 23]);
+        args.save_trainer_every = 6;
+        assert_eq!(saved_steps(&args), vec![6, 7, 12, 14, 18, 21, 23]);
+        args.save_trainer_state = false;
+        assert!(saved_steps(&args).is_empty());
+        args.save_trainer_every = 0;
+        assert_eq!(
+            args.validate().unwrap_err(),
+            "save-trainer-every must be positive"
+        );
+    }
+
+    #[test]
+    fn trainer_snapshot_interval_defaults_for_old_snapshots_and_inherits_overrides() {
+        let args = SelfplayArgs {
+            save_trainer_every: 3,
+            ..SelfplayArgs::default()
+        };
+        let mut saved = serde_json::to_value(&args).unwrap();
+        let current = SelfplayArgs::default();
+        assert_eq!(
+            current
+                .inherit(&saved, &HashSet::new())
+                .unwrap()
+                .save_trainer_every,
+            3
+        );
+        saved.as_object_mut().unwrap().remove("save_trainer_every");
+        assert_eq!(
+            current
+                .inherit(&saved, &HashSet::new())
+                .unwrap()
+                .save_trainer_every,
+            10
+        );
+        assert_eq!(
+            args.inherit(&saved, &HashSet::from(["save_trainer_every".into()]))
+                .unwrap()
+                .save_trainer_every,
+            3
+        );
+    }
 
     #[test]
     fn replay_schedule_uses_cumulative_rounds_and_allows_a_fixed_override() {

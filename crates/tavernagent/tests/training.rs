@@ -8,7 +8,7 @@ use rand_pcg::Pcg64Mcg;
 use tavernagent::heroes::select_heroes;
 use tavernagent::mcts::{self, A_END_TURN, Evaluator, Observation, SearchOptions, observe_seat};
 use tavernagent::net::{ENDED_TURN_FEATURE, N_ACTIONS, NetConfig, PolicyValueNet};
-use tavernagent::npz::Npz;
+use tavernagent::npz::{NpyArray, Npz};
 use tavernagent::rules::Budgets;
 use tavernagent::selfplay::{
     OptimizerHparams, PlayOptions, ReplayWindow, Sample, Stats, StepOptions, Trainer,
@@ -486,6 +486,124 @@ fn selfplay_args(out: PathBuf, steps: usize) -> SelfplayArgs {
         out,
         ..SelfplayArgs::default()
     }
+}
+
+#[test]
+fn cli_trainer_cadence_archives_and_resumes_exactly() {
+    let dir = tmp("trainer-cadence");
+    let full_path = dir.join("full.npz");
+    let run_cli = |args: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_tavernagent"))
+            .env("RAYON_NUM_THREADS", "2")
+            .arg("selfplay")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let checkpoint_steps = |log: &str| -> Vec<usize> {
+        log.lines()
+            .filter_map(|line| {
+                line.trim()
+                    .strip_prefix("trainer checkpoint step ")?
+                    .split(':')
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .collect()
+    };
+    let log = run_cli(&[
+        "--steps",
+        "11",
+        "--games",
+        "1",
+        "--sims",
+        "1",
+        "--workers",
+        "1",
+        "--hidden",
+        "8",
+        "--blocks",
+        "1",
+        "--embedding-dim",
+        "2",
+        "--max-samples",
+        "4",
+        "--batch",
+        "4",
+        "--epochs",
+        "1",
+        "--search-prob",
+        "0.05",
+        "--end-explore",
+        "0",
+        "--split-turn",
+        "--probe-every",
+        "0",
+        "--save-trainer-state",
+        "--save-every",
+        "7",
+        "--out",
+        full_path.to_str().unwrap(),
+    ]);
+    assert_eq!(checkpoint_steps(&log), vec![7, 10, 11]);
+    let archive = dir.join("full.step7.trainer.npz");
+    assert_eq!(
+        tavernagent::selfplay::read_training_meta(&archive)
+            .unwrap()
+            .step,
+        7
+    );
+    assert_eq!(
+        tavernagent::selfplay::read_training_meta(&dir.join("full.trainer.npz"))
+            .unwrap()
+            .step,
+        11
+    );
+
+    // Emulate saved options from before the cadence field existed, then explicitly
+    // override it on resume. Restoring RNGs/replay must still produce the same weights.
+    let mut old = Npz::load(&archive).unwrap();
+    let mut meta: tavernagent::selfplay::TrainerMeta =
+        serde_json::from_str(&old.get("metadata").unwrap().as_text().unwrap()).unwrap();
+    meta.options
+        .as_object_mut()
+        .unwrap()
+        .remove("save_trainer_every");
+    old.insert(
+        "metadata",
+        NpyArray::text(&serde_json::to_string(&meta).unwrap()),
+    );
+    old.save(&archive).unwrap();
+    let resumed_path = dir.join("resumed.npz");
+    let log = run_cli(&[
+        "--resume-state",
+        archive.to_str().unwrap(),
+        "--steps",
+        "11",
+        "--save-trainer-every",
+        "2",
+        "--out",
+        resumed_path.to_str().unwrap(),
+    ]);
+    assert_eq!(checkpoint_steps(&log), vec![8, 10, 11]);
+    assert_eq!(
+        PolicyValueNet::load(&full_path).unwrap().p,
+        PolicyValueNet::load(&resumed_path).unwrap().p
+    );
+    assert_eq!(
+        PolicyValueNet::load(&dir.join("full.ema.npz")).unwrap().p,
+        PolicyValueNet::load(&dir.join("resumed.ema.npz"))
+            .unwrap()
+            .p
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
