@@ -25,6 +25,9 @@ $A selfplay --resume-state runs/agent/model.trainer.npz --steps 200
 # Paired evaluation against seven scripted bots on the same seeds.
 $A eval --model runs/agent/model.ema.npz --games 1024 --sims 64 --workers 32 --out runs/agent/eval.json
 
+# Same evaluation against the fixed, table-free teacher policy.
+$A eval --model runs/agent/model.ema.npz --opponent teacher --games 2048 --sims 64 --workers 32 --out runs/agent/teacher_eval.json
+
 # Two checkpoints against each other (seat swaps, seed-clustered intervals); up to eight at
 # one table; or a league of many checkpoints for rating fits.
 $A arena --a runs/agent/model.npz --b runs/agent/model.step50.npz --games 512 --workers 32 --out runs/agent/arena.json
@@ -446,8 +449,12 @@ Each gets 128 physical cores on one NUMA node. This is a one-seed screening expe
 matching the previous overnight campaign, and archives checkpoints every **100 rounds**.
 Training nodes do no eval, Arena or behaviour probes. `tools/agent_remote_eval.py`
 queues raw/EMA eval every 100 rounds and an ongoing eight-player league on six borrowed
-64-core BF16-capable hosts. Each host runs one job at a time. Eval uses 512 games at
-round 100 and 2048 thereafter. The league puts all raw/EMA checkpoints into one pool,
+64-core BF16-capable hosts. Each host runs one job at a time. Scripted eval uses 512 games at
+round 100 and 2048 thereafter. Teacher eval uses 2048 games for every raw/EMA checkpoint,
+including a backfill of existing checkpoints. `teacher.rs` implements AutoTavern 5075b273's
+no-composition policy with fixed leveling, pairs/triples and early Dark Gift rules; it needs
+no external data. Teacher results use `teacher_eval_step*.json` and a separately hashed
+evaluation binary; the running training and scripted-eval binaries stay fixed. The league puts all raw/EMA checkpoints into one pool,
 samples eight distinct models per table, with 80% inverse-count weight and a 20% uniform floor and records full placements (64 simulations).
 `tools/league_elo.py` fits Plackett–Luce Elo-scale ratings, with whole-game bootstrap uncertainty.
 Paired Arena results are historical only and are excluded from league ratings.
@@ -457,7 +464,7 @@ Queue state, results and PNG figures are mirrored locally in `runs/depth_remote_
 Completed results are also published back to the training archive. Borrowed hosts receive
 only per-job `/tmp/tavernagent-depth-eval-*` directories; finally cleanup, an independent
 watchdog and post-job verification cover normal completion, failures and abandoned jobs.
-The 20-minute notification card includes placement curves and pooled league Elo curves.
+The 20-minute notification card includes separate scripted/teacher placement curves and pooled league Elo curves.
 
 Scratch/replay: `/tmp/tavernagent-depth-replay-20261107/`; durable results and latest resumable
 states: `<workspace>/runs/depth_replay_20261107/` on experiment.
@@ -467,6 +474,29 @@ records the training phase, while `d*/status.json` records each lane's training/
 Per-depth stage markers and completed result files make restarts idempotent.
 Older immutable replay snapshots are removed after archiving
 weights, while current replay/optimizer/RNG state is retained for exact resume.
+
+
+### Identity-depth continuation (2026-11-08)
+
+The previous four runs stopped at steps **1181 / 993 / 971 / 866**. All four new runs
+start from the **6-block step1181 EMA**, with the original tensors retained and 0/2/4/6
+identity FFN blocks appended for depths 6/8/10/12 (`tools/agent_expand_depth.py`). New
+up projections use He initialization; down projections and biases are zero; LayerNorm
+starts at gamma=1/beta=0. Shared new blocks have identical initialization across depths.
+On 404 common positions, FP32 and BF16 logits/value match the source exactly, including
+on a borrowed BF16 host; new down projections have nonzero gradients.
+
+Adam, EMA update count, replay and training steps reset for every depth. The previous
+training binary, lr=3e-5, E2, batch512, max-samples80k, replay3→6, splitT4 and seed444444444
+are retained. Four 128-core NUMA lanes target 3000 additional steps. Step0 and every100
+steps get scripted/teacher evaluation plus the pooled league; latest checkpoints receive
+the same idle precision batches. This isolates a common starting policy, not independent
+training-seed variance. Review the first 200–300 additional steps before interpreting depth.
+
+Archive on experiment: `runs/depth_identity_20261108/`; scratch:
+`/tmp/tavernagent-depth-identity-20261108/`; local evaluations:
+`runs/depth_identity_remote_20261108/`. The initial directory records source step/hash,
+per-depth weights and numerical validation. The 20-minute card follows this campaign.
 
 ## Open problems
 
@@ -481,7 +511,7 @@ weights, while current replay/optimizer/RNG state is retained for exact resume.
   pooling away warband order would discard strategically relevant information.
 
 Idle evaluation slots add independent 512-game seed batches to the latest checkpoints,
-up to 16,384 eval games per checkpoint. Spare slots run 128-game league batches until
+up to 16,384 eval games per checkpoint **per opponent** (scripted and teacher independently). Spare slots run 128-game league batches until
 each model has at least 16,384 seat appearances. New checkpoint evaluations take priority
 at job boundaries. Reports pool all games; league uncertainty resamples whole games. Repeated monitoring uses descriptive 95% intervals,
 not a sequential significance test. Cards show only progress, placement intervals and plots.
@@ -490,4 +520,4 @@ League selection uses `0.2/N + 0.8 * (count+256)^-1 / sum((count+256)^-1)`
 for each model, sampling without replacement and shuffling seats. Counts include completed
 games and exact reserved lineups of running/queued batches, and increase after each planned
 table. Failed jobs release their reservations. The league executable accepts these explicit
-tables; the training/eval executable and inference code remain unchanged.
+tables; the training/scripted-eval executable and inference code remain unchanged.

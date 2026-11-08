@@ -48,7 +48,7 @@ def metadata(path, name='metadata'):
     return json.loads(raw[end:])
 
 
-def training_args(binary, work, depth, stage, seed, workers):
+def training_args(binary, work, depth, stage, seed, workers, initial=None):
     args = [str(binary), 'selfplay', '--hidden', '256', '--embedding-dim', '32',
             '--blocks', str(depth), '--steps', str(stage), '--seed', str(seed),
             '--games', '128', '--sims', '256', '--search-prob', '0.33',
@@ -64,6 +64,8 @@ def training_args(binary, work, depth, stage, seed, workers):
         if m['format'] != 8 or m['net']['hidden'] != 256 or m['net']['embedding_dim'] != 32 or m['net']['blocks'] != depth:
             raise ValueError(f'Unexpected trainer schema: {state}')
         args += ['--resume-state', str(state)]
+    elif initial is not None or (work / 'initial.npz').exists():
+        args += ['--resume', str(initial if initial is not None else work / 'initial.npz')]
     return args
 
 
@@ -167,6 +169,7 @@ def main():
     p.add_argument('--revision', required=True)
     p.add_argument('--seed', type=int, default=444444444)
     p.add_argument('--workers', type=int, default=128)
+    p.add_argument('--initial-dir', type=Path, help='Per-depth dN.npz starting weights; optimizer/replay restart')
     p.add_argument('--dry-run', action='store_true')
     a = p.parse_args()
     a.binary, a.work, a.archive = (x.resolve() for x in (a.binary, a.work, a.archive))
@@ -185,15 +188,34 @@ def main():
                     evaluation='remote raw/EMA eval every 100 rounds; pooled eight-player league with Plackett-Luce Elo',
                     matched_compute='sum of collect_seconds+train_seconds; excludes pauses, evaluation and checkpoint I/O',
                     limitation='One training seed: screening only; replicate winners before concluding depth is better.')
+    if a.initial_dir:
+        a.initial_dir = a.initial_dir.resolve()
+        manifest['initial_weights'] = {str(d): dict(path=str(a.initial_dir/f'd{d}.npz'),
+            sha256=hashlib.sha256((a.initial_dir/f'd{d}.npz').read_bytes()).hexdigest()) for d in DEPTHS}
+        manifest['initialization'] = 'Common EMA; added blocks identity; fresh optimizer, EMA and replay; steps restart at zero'
     manifest = json.loads(json.dumps(manifest))
     if a.dry_run:
-        print(json.dumps(dict(manifest=manifest, first_commands=[training_args(a.binary,a.work/f'd{d}',d,100,a.seed,a.workers) for d in DEPTHS]), indent=2))
+        print(json.dumps(dict(manifest=manifest, first_commands=[training_args(a.binary,a.work/f'd{d}',d,100,a.seed,a.workers,
+                initial=a.initial_dir/f'd{d}.npz' if a.initial_dir else None) for d in DEPTHS]), indent=2))
         return
     a.work.mkdir(parents=True, exist_ok=True)
     a.archive.mkdir(parents=True, exist_ok=True)
     mp = a.archive / 'manifest.json'
     if mp.exists() and json.loads(mp.read_text()) != manifest:
         raise ValueError('Manifest differs; use a new experiment directory')
+    if a.initial_dir:
+        for d in DEPTHS:
+            target = a.work/f'd{d}'/'initial.npz'
+            source = a.initial_dir/f'd{d}.npz'
+            if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() != manifest['initial_weights'][str(d)]['sha256']:
+                raise ValueError(f'Initial checkpoint changed: {target}')
+            if not target.exists():
+                copy_atomic(source, target)
+            # Step zero makes the shared starting strength visible in evaluation and plots.
+            for suffix in ['.npz', '.ema.npz']:
+                checkpoint = a.archive/f'd{d}'/f'model.step0{suffix}'
+                if not checkpoint.exists():
+                    copy_atomic(source, checkpoint)
     atomic_json(mp, manifest)
     run_independent(a)
     curves = {}

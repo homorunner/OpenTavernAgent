@@ -15,18 +15,47 @@ from agent_remote_eval import jobs_for, league_jobs, STAGES, DEPTHS
 class PlanningTests(unittest.TestCase):
     def test_jobs_wait_only_for_their_own_inputs_and_cover_every_100_rounds(self):
         index=dict(checkpoints={'d6/model.step100.ema.npz':'path'},matched=None)
-        self.assertEqual(len(jobs_for(index)),1)
+        self.assertEqual(len(jobs_for(index)),2)
         index['checkpoints']['d8/model.step100.ema.npz']='path2'
         jobs=jobs_for(index)
         self.assertEqual([j['kind'] for j in jobs].count('arena'),0)
-        self.assertEqual([j['kind'] for j in jobs].count('eval'),2)
+        self.assertEqual([j['kind'] for j in jobs].count('eval'),4)
         index['checkpoints']={f'd{d}/model.step{s}{suffix}':'path'
             for d in DEPTHS for s in STAGES for suffix in ['.ema.npz','.npz']}
         index['matched']={'steps':{str(d):3000 for d in DEPTHS}}
         jobs=jobs_for(index)
-        self.assertEqual(len(jobs),240)
-        self.assertEqual(len({j['id'] for j in jobs}),240)
+        self.assertEqual(len(jobs),480)
+        self.assertEqual(len({j['id'] for j in jobs}),480)
         self.assertEqual({j['step'] for j in jobs if j['kind']=='eval'},set(range(100,3001,100)))
+
+    def test_teacher_backfill_and_idle_batches_are_independent(self):
+        from agent_eval_precision import extras, merge
+        from agent_remote_eval import complete
+        index = {'checkpoints': {f'd6/model.step{s}.ema.npz': 'path' for s in (100, 200)}}
+        jobs = jobs_for(index)
+        self.assertEqual(len({j['relative'] for j in jobs}), 4)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for j in jobs:
+                teacher = j['opponent'] == 'teacher'
+                games = int(j['args'][j['args'].index('--games')+1])
+                self.assertEqual(games, 2048 if teacher or j['step'] != 100 else 512)
+                self.assertEqual('--opponent' in j['args'], teacher)
+                target = root/'results'/j['relative']
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps({'opponent': j['opponent'], 'summary': {'network': {'n': games}}}))
+            batches = extras(jobs, root, set(), complete)
+            self.assertEqual(len(batches), 2)
+            self.assertEqual({j['opponent'] for j in batches}, {'scripted', 'teacher'})
+            self.assertTrue(all(j['step'] == 200 for j in batches))
+            for j in batches:
+                self.assertEqual(j['args'][j['args'].index('--games')+1], '512')
+                self.assertGreater(int(j['args'][j['args'].index('--seed')+1]), 61002048)
+            remaining = extras(jobs, root, {batches[0]['id']}, complete)
+            self.assertEqual(len(remaining), 1)
+            self.assertNotEqual(remaining[0]['opponent'], batches[0]['opponent'])
+        with self.assertRaisesRegex(AssertionError, 'Different evaluation opponents'):
+            merge({'placements': {}, 'opponent': 'teacher'}, {'opponent': 'scripted'}, 'bad')
 
     def test_league_uses_every_checkpoint_and_disjoint_batch_seeds(self):
         index={'checkpoints':{f'd{d}/model.step100{suffix}':'path'

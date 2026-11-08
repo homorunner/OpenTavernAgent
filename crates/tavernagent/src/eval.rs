@@ -1,4 +1,4 @@
-//! Evaluate checkpoints against the scripted bot on paired seeds.
+//! Evaluate checkpoints against a fixed scripted or teacher opponent on paired seeds.
 //!
 //! Seat 0 is played by each checkpoint and by the bot over the same seeds; reports mean
 //! placement, standard error and paired differences. Paired seeds matter: an 8-player
@@ -25,6 +25,8 @@ pub struct EvalArgs {
     pub model: PathBuf,
     #[arg(long, default_value_t = 40)]
     pub games: usize,
+    #[arg(long, value_enum, default_value_t = Opponent::Scripted)]
+    pub opponent: Opponent,
     #[arg(long, default_value_t = 48)]
     pub sims: usize,
     #[arg(long, default_value_t = 0)]
@@ -52,17 +54,35 @@ pub struct EvalArgs {
     pub compare_model: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Opponent {
+    #[default]
+    Scripted,
+    Teacher,
+}
+
+impl Opponent {
+    fn choose(self, game: &mut Game, seat: usize) -> taverngym::Action {
+        match self {
+            Self::Scripted => bot_action(game, seat),
+            Self::Teacher => crate::teacher::choose_action(game, seat),
+        }
+    }
+}
+
 pub enum Policy<'a> {
     Net(&'a PolicyValueNet),
     Bot,
 }
 
-/// Seat 0 under `policy` against seven scripted bots; returns seat 0's placement.
+/// Seat 0 under `policy` against seven copies of `opponent`; returns its placement.
 pub fn play(
     policy: &Policy,
     seed: u64,
     budgets: &Budgets,
     search: &SearchOptions,
+    opponent: Opponent,
 ) -> Result<u8, String> {
     let mut game = Game::new(seed, budgets.config()?);
     select_heroes(&mut game, seed)?;
@@ -82,7 +102,7 @@ pub fn play(
         let mut moved = false;
         for p in 1..game.players.len() {
             if game.needs_action(p) {
-                let a = bot_action(&mut game, p);
+                let a = opponent.choose(&mut game, p);
                 game.apply(p, a).map_err(|e| e.to_string())?;
                 moved = true;
             }
@@ -156,13 +176,19 @@ pub fn run(args: EvalArgs) -> Result<(), String> {
                 for (name, net) in &nets {
                     row.insert(
                         name.clone(),
-                        play(&Policy::Net(net), seed, &args.budgets, &search)?,
+                        play(
+                            &Policy::Net(net),
+                            seed,
+                            &args.budgets,
+                            &search,
+                            args.opponent,
+                        )?,
                     );
                 }
                 if !args.no_baselines {
                     row.insert(
                         "bot".into(),
-                        play(&Policy::Bot, seed, &args.budgets, &search)?,
+                        play(&Policy::Bot, seed, &args.budgets, &search, args.opponent)?,
                     );
                 }
                 Ok::<_, String>(row)
@@ -227,6 +253,7 @@ pub fn run(args: EvalArgs) -> Result<(), String> {
         let result = json!({
             "seeds": seeds,
             "sims": args.sims,
+            "opponent": args.opponent,
 
             "c_puct": args.c_puct,
             "search_version": mcts::SEARCH_VERSION,

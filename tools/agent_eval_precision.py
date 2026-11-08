@@ -9,6 +9,7 @@ def merge(base, extra, ident):
     if ident in base.get('_batches',[]):
         return base
     if 'placements' in base:
+        assert base.get('opponent', 'scripted') == extra.get('opponent', 'scripted'), 'Different evaluation opponents'
         assert not set(base['seeds']) & set(extra['seeds']), 'Repeated evaluation seeds'
         base['seeds']+=extra['seeds']
         for name,values in extra['placements'].items():
@@ -39,7 +40,7 @@ def extras(planned, root, busy, complete):
     latest={}
     for j in planned:
         if j['step']>3000: continue
-        key=(j['kind'],tuple((a,p.split('/model.step')[0],p.endswith('.ema.npz')) for a,p in j['inputs'].items()))
+        key=(j['kind'],j.get('opponent', 'scripted'),tuple((a,p.split('/model.step')[0],p.endswith('.ema.npz')) for a,p in j['inputs'].items()))
         if key not in latest or j['step']>latest[key]['step']: latest[key]=j
     candidates=[]
     import json

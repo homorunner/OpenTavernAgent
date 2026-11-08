@@ -47,7 +47,7 @@ def publish(source, archive, relative, local):
 
 def snapshot(source, archive):
     code = r'''
-import json,pathlib,sys
+import hashlib,json,pathlib,sys
 archive=pathlib.Path(sys.argv[1])
 m=json.loads((archive/'manifest.json').read_text())
 work=pathlib.Path(m['work'])
@@ -58,10 +58,12 @@ for root in [work,archive]:
    if '.trainer.' in p.name: continue
    checkpoints[f'd{d}/{p.name}']=str(p)
 results={str(p.relative_to(archive)):str(p) for p in archive.glob('d*/eval_step*.json')}
+results.update({str(p.relative_to(archive)):str(p) for p in archive.glob('d*/teacher_eval_step*.json')})
 results.update({p.name:str(p) for p in archive.glob('league_batch*.json')})
+hashes={name:hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest() for name,path in results.items()}
 status=json.loads((archive/'status.json').read_text())
 matched=json.loads((archive/'matched_compute.json').read_text()) if (archive/'matched_compute.json').exists() else None
-print(json.dumps(dict(manifest=m,checkpoints=checkpoints,results=results,status=status,matched=matched)))
+print(json.dumps(dict(manifest=m,checkpoints=checkpoints,results=results,result_hashes=hashes,status=status,matched=matched)))
 '''
     return json.loads(ssh(source, ['python3', '-B', '-c', code, archive], timeout=45).stdout)
 
@@ -69,16 +71,22 @@ print(json.dumps(dict(manifest=m,checkpoints=checkpoints,results=results,status=
 def jobs_for(index):
     checkpoints = index['checkpoints']
     jobs = []
-    for step in STAGES:
+    stages = ([0] if index.get('manifest', {}).get('initial_weights') else []) + list(STAGES)
+    for step in stages:
         for depth in DEPTHS:
             for variant in ['ema', 'raw']:
                 name = f'd{depth}/model.step{step}' + ('.ema.npz' if variant == 'ema' else '.npz')
                 if name not in checkpoints:
                     continue
-                jobs.append(dict(id=f'eval_{step}_d{depth}_{variant}', kind='eval', step=step,
-                    relative=f'd{depth}/eval_step{step}_{variant}.json', inputs={'model.npz': name},
-                    args=['eval', '--model', 'model.npz', '--games', str(512 if step == 100 else 2048),
-                          '--sims', '64', '--seed', '61000000', '--no-baselines', '--out', 'result.json']))
+                for opponent in ['scripted', 'teacher']:
+                    prefix = 'teacher_' if opponent == 'teacher' else ''
+                    games = 512 if opponent == 'scripted' and step == 100 else 2048
+                    opponent_args = ['--opponent', 'teacher'] if opponent == 'teacher' else []
+                    jobs.append(dict(id=f'{prefix}eval_{step}_d{depth}_{variant}', kind='eval',
+                        opponent=opponent, step=step,
+                        relative=f'd{depth}/{prefix}eval_step{step}_{variant}.json', inputs={'model.npz': name},
+                        args=['eval', '--model', 'model.npz', '--games', str(games), *opponent_args,
+                              '--sims', '64', '--seed', '61000000', '--no-baselines', '--out', 'result.json']))
     return jobs
 
 
@@ -131,15 +139,17 @@ def main():
     p.add_argument('--poll-seconds', type=float, default=30)
     p.add_argument('--once', action='store_true')
     p.add_argument('--league-binary', type=Path, required=True)
+    p.add_argument('--teacher-binary', type=Path, required=True)
     a = p.parse_args()
     a.root = a.root.resolve()
     a.root.mkdir(parents=True, exist_ok=True)
     hosts = json.loads(a.hosts.read_text())
     if not hosts or len({h['host'] for h in hosts}) != len(hosts):
         p.error('Hosts must be nonempty and unique')
-    total = len(STAGES)*len(DEPTHS)*2
     binary = a.root/'tavernagent'
     first = snapshot(a.source, a.archive)
+    stages = ([0] if first['manifest'].get('initial_weights') else []) + list(STAGES)
+    total = len(stages)*len(DEPTHS)*2*2
     digest = first['manifest']['binary_sha256']
     if not binary.exists():
         fetch(a.source, first['manifest']['binary'], binary)
@@ -148,8 +158,11 @@ def main():
     binary.chmod(0o700)
     league_binary=a.league_binary.resolve()
     league_digest=hashlib.sha256(league_binary.read_bytes()).hexdigest()
+    teacher_binary=a.teacher_binary.resolve()
+    teacher_digest=hashlib.sha256(teacher_binary.read_bytes()).hexdigest()
     atomic_json(a.root/'manifest.json', dict(source=a.source, archive=a.archive,
-        training_binary_sha256=digest, league_binary_sha256=league_digest, hosts=hosts, stages=STAGES, total_jobs=total))
+        training_binary_sha256=digest, league_binary_sha256=league_digest,
+        teacher_binary_sha256=teacher_digest, hosts=hosts, stages=stages, total_jobs=total))
     quarantined, failures, retry_at = {}, {}, {}
 
     def recover(skip=()):
@@ -167,7 +180,7 @@ def main():
 
     recover()
     active = {}
-    published_hashes = {}
+    published_hashes = first['result_hashes']
     last_scan = 0
     last_recovery = time.time()
     index = first
@@ -185,8 +198,10 @@ def main():
                         rows=result['matches']
                         if len(rows)!=len(job['tables']) or {r['game'] for r in rows}!=set(range(len(rows))) or any(r['models']!=job['tables'][r['game']] for r in rows):
                             raise ValueError('League results do not match reserved tables')
+                    if job['kind']=='eval' and result.get('opponent', 'scripted') != job['opponent']:
+                        raise ValueError('Evaluation opponent does not match job')
                     result['_execution'] = dict(host=host['host'], workers=host['cpus'],
-                        binary_sha256=league_digest if job['kind']=='league' else digest,
+                        binary_sha256=job['binary_sha256'],
                         sampling=job.get('sampling'), seconds=response['seconds'], cleanup_verified=True,
                         checkpoints=job['checkpoints'], completed=time.time())
                     output = a.root/'results'/job['relative']
@@ -245,7 +260,10 @@ def main():
                     resolved[alias] = str(local)
                 job = dict(job, checkpoints=job['inputs'], inputs=resolved,
                            args=job['args']+['--workers', str(host['cpus'])])
-                future = pool.submit(run_remote, job, host, league_binary if job['kind']=='league' else binary, a.root/'jobs'/job['id'])
+                job_binary, job_digest = ((league_binary, league_digest) if job['kind']=='league'
+                    else (teacher_binary, teacher_digest) if job['opponent']=='teacher' else (binary, digest))
+                job['binary_sha256'] = job_digest
+                future = pool.submit(run_remote, job, host, job_binary, a.root/'jobs'/job['id'])
                 active[future] = (job, host)
             # Publishing is retried independently; failed transfers never repeat a completed match.
             published = 0

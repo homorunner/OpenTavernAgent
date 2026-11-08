@@ -21,7 +21,7 @@ struct Cli {
 enum Command {
     /// All-seat self-play training with checkpoints and exact resume.
     Selfplay(Box<train::SelfplayArgs>),
-    /// Paired evaluation of checkpoints against the scripted bot.
+    /// Paired evaluation of checkpoints against scripted or teacher opponents.
     Eval(eval::EvalArgs),
     /// Two checkpoints against each other with seat swaps.
     Arena(arena::ArenaArgs),

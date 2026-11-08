@@ -26,37 +26,41 @@ def render(root, out):
     root, out = Path(root), Path(out)
     out.mkdir(parents=True, exist_ok=True)
     plt.rcParams.update({'font.size': 11, 'axes.spines.top': False, 'axes.spines.right': False})
-    fig, ax = plt.subplots(figsize=(11, 5.5), layout='constrained')
-    n = 0
-    latest = 100
-    for depth, color in zip(DEPTHS, COLORS):
-        for variant, style in [('ema', '-'), ('raw', '--')]:
-            rows = []
-            for path in (root/f'd{depth}').glob(f'eval_step*_{variant}.json'):
-                result = read(path)
-                if result:
-                    step = int(re.search(r'step(\d+)', path.name)[1])
-                    summary = result['summary']['network']
-                    rows.append((step, summary['mean'], summary['se']))
-            rows.sort()
-            if not rows:
-                continue
-            n += len(rows)
-            latest=max(latest,rows[-1][0])
-            x, y, se = np.array(rows).T
-            ax.errorbar(x, y, yerr=1.96*se, color=color, ls=style, marker='o' if variant=='ema' else '.',
-                        capsize=3, alpha=1 if variant=='ema' else .45, label=f'{depth} blocks / {variant.upper()}')
-    ax.set(title='Evaluation against scripted bots', xlabel='Training round', ylabel='Mean placement (lower is better)')
-    ax.grid(alpha=.2)
-    ax.set_xlim(0,latest+100)
-    if n:
-        ax.legend(ncol=2, fontsize=9)
-    else:
-        ax.text(.5,.5,'Awaiting evaluation results',ha='center',transform=ax.transAxes)
-    fig.suptitle('Error bars: 95% confidence intervals | 64 search simulations',fontsize=10)
-    eval_path = out/'eval.png'
-    fig.savefig(eval_path, dpi=160)
-    plt.close(fig)
+    eval_paths = []
+    for prefix, label, filename in [('', 'scripted bots', 'eval.png'),
+                                    ('teacher_', 'teacher bots (no composition tables)', 'teacher_eval.png')]:
+        fig, ax = plt.subplots(figsize=(11, 5.5), layout='constrained')
+        n = 0
+        latest = 100
+        for depth, color in zip(DEPTHS, COLORS):
+            for variant, style in [('ema', '-'), ('raw', '--')]:
+                rows = []
+                for path in (root/f'd{depth}').glob(f'{prefix}eval_step*_{variant}.json'):
+                    result = read(path)
+                    if result:
+                        step = int(re.search(r'step(\d+)', path.name)[1])
+                        summary = result['summary']['network']
+                        rows.append((step, summary['mean'], summary['se']))
+                rows.sort()
+                if not rows:
+                    continue
+                n += len(rows)
+                latest=max(latest,rows[-1][0])
+                x, y, se = np.array(rows).T
+                ax.errorbar(x, y, yerr=1.96*se, color=color, ls=style, marker='o' if variant=='ema' else '.',
+                            capsize=3, alpha=1 if variant=='ema' else .45, label=f'{depth} blocks / {variant.upper()}')
+        ax.set(title=f'Evaluation against {label}', xlabel='Training round', ylabel='Mean placement (lower is better)')
+        ax.grid(alpha=.2)
+        ax.set_xlim(0,latest+100)
+        if n:
+            ax.legend(ncol=2, fontsize=9)
+        else:
+            ax.text(.5,.5,'Awaiting evaluation results',ha='center',transform=ax.transAxes)
+        fig.suptitle('Error bars: 95% confidence intervals | 64 search simulations',fontsize=10)
+        eval_path = out/filename
+        fig.savefig(eval_path, dpi=160)
+        plt.close(fig)
+        eval_paths.append(eval_path)
 
     import importlib.util
     spec=importlib.util.spec_from_file_location("league_ratings",Path(__file__).with_name("league_elo.py"))
@@ -99,7 +103,7 @@ def render(root, out):
     league_path=out/'elo.png'
     fig.savefig(league_path,dpi=160)
     plt.close(fig)
-    return [eval_path,league_path]
+    return [*eval_paths,league_path]
 
 
 if __name__ == '__main__':

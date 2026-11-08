@@ -16,5 +16,6 @@ pub mod play;
 pub mod probe;
 pub mod rules;
 pub mod selfplay;
+pub mod teacher;
 pub mod tournament;
 pub mod train;

@@ -127,6 +127,7 @@ fn evaluation_keeps_bot_actions_in_engine_coordinates() {
         17,
         &Budgets::default(),
         &SearchOptions::default(),
+        eval::Opponent::Scripted,
     )
     .unwrap();
     assert!((1..=8).contains(&place));
