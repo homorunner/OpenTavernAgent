@@ -194,9 +194,25 @@ Move is not a rule but an absence: it is outside the agent's action space altoge
 All eight seats play the current network. Every searched decision records the observation, legal
 mask, root visit distribution, the action played and the final placement reward
 `1 - 2 (placement - 1) / 7`. Each End Turn also records the ended position
-(`end_turn_effects` on a copy): no policy target, the same value label. `--end-explore`
-(0.02) forces End Turn with a small probability so that ended positions with unspent Gold
-also appear; the search distribution stays the policy target.
+(`end_turn_effects` on a copy): no policy target, the same value label.
+
+`--end-explore` (0.25) selects a fraction of root games for one forced End Turn.
+Uniformly choose one of the eight seats and an action index from **1 through 32**.
+Count all of that seat's decisions, including cheap actions and pending choices;
+at the selected index, force End Turn. If it is illegal (including the must-spend-Gold
+mask), defer until the next legal End Turn. A normal End Turn also counts and consumes
+the intervention if selected. No planning rollout or replay is used.
+
+Binary splitting remains enabled: exactly one randomly chosen child inherits a pending
+intervention and its counter; after it fires, neither child can fire again. Discard the
+selected seat's earlier rows on the intervention path, including shared ancestors. Keep
+the forced decision, ended-position row, later rows, all other seats' rows and unaffected
+siblings. If the seat dies or the game ends before the intervention can fire, retain all
+rows; the actual fraction with a forced end can therefore be below 25%.
+
+The intervention gets a search even if originally cheap, so its policy target remains
+the search distribution, not a one-hot End Turn target. Other seats' value labels still
+include their opponent's intervention; they are not unbiased for intervention-free play.
 
 **Tree rollouts.** Self-play defaults to `--split-turn 4`: each root splits once into
 two continuations after turn 4. `selfplay --split-turn "4,8"` splits each root into two
@@ -255,7 +271,7 @@ training cap, so they also change the average reuse of a row at the same epoch c
 | `--sims` / `--c-puct` | 256 / 1.9 |
 | `--replay-rounds` / `--epochs` / `--max-samples` / `--batch` | scheduled 3→6 / 2 / 80,000 / 512 |
 | `--lr` / `--lr-min` / `--lr-decay-steps` | 3e-5 / 3e-5 (unused without decay) / 0 (constant) |
-| `--noise` / `--noise-alpha` / `--end-explore` | 0.20 / 0.3 / 0.02 |
+| `--noise` / `--noise-alpha` / `--end-explore` | 0.20 / 0.3 / 0.25 |
 | `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 0.5 / 0.5 |
 | `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 0 / 0.15 |
 | `--search-prob` / `--fpu-reduction` | 0.33 / 1.5 |
@@ -500,8 +516,8 @@ per-depth weights and numerical validation. The 20-minute card follows this camp
 
 ## Open problems
 
-- Ended-position labels come from actual stopping states plus `--end-explore`. Scoring
-  hypothetical earlier stops remains extrapolation; fresh value validation is needed.
+- Validate value calibration on early-stop states: `--end-explore` samples one stop
+  within the first 32 actions (or the next legal end), so coverage remains limited.
 - Search improvement under visit-count selection and the fixed FPU reduction needs
   controlled comparisons. Tree splits also change sample counts, weights and data reuse.
 - **TODO: value head.** Test a small nonlinear value head and, separately, short-term

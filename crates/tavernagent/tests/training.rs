@@ -242,14 +242,12 @@ fn self_play_records_one_ended_position_per_end_turn() {
             .unwrap_err()
             .contains("probability")
     );
-    // Exploration changes what is played, not the target.
-    let (explored, _) = play_one(&EndOrFirst, 31, &play_options(2, 1.0), None).unwrap();
-    assert!(
-        explored
-            .iter()
-            .filter(|s| !s.is_ended() && s.mask[A_END_TURN])
-            .all(|s| s.action == A_END_TURN as i64)
-    );
+    // The selected action may already be End Turn; the one-shot schedule is still
+    // consumed and earlier rows of that seat are removed.
+    let normal = play_one(&EndOrFirst, 31, &play_options(2, 0.0), None).unwrap();
+    let explored = play_one(&EndOrFirst, 31, &play_options(2, 1.0), None).unwrap();
+    assert_eq!(explored.1, normal.1);
+    assert!(explored.0.len() <= normal.0.len());
 }
 
 /// Only searched decisions become training rows; the ended positions are kept either
@@ -671,6 +669,10 @@ fn split_turn_cli_and_required_saved_options() {
             .args
             .split_turn
             .is_empty()
+    );
+    assert_eq!(
+        Cli::try_parse_from(["test"]).unwrap().args.end_explore,
+        0.25
     );
     assert!(Cli::try_parse_from(["test", "--split-turn", "4,no"]).is_err());
     assert!(validate_split_turns(&[3, 6, 9]).is_ok());
