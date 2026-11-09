@@ -1155,7 +1155,8 @@ impl<'g> Ctx<'g> {
         let (tentacle, mishmash, _) = stat_watcher_ids();
         if self.src.is_some_and(|s| {
             let n = db().normal_of(s);
-            n == tentacle || n == mishmash
+            // temporary fix: Smuggler's Health grants must not restart Tentacle reactions.
+            n == tentacle || n == mishmash || n == db().id("BG34_Giant_064")
         }) {
             return;
         }
