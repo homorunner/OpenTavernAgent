@@ -212,24 +212,6 @@ mask, root visit distribution, the action played and the final placement reward
 `1 - 2 (placement - 1) / 7`. Each End Turn also records the ended position
 (`end_turn_effects` on a copy): no policy target, the same value label.
 
-`--end-explore` (0.25) selects a fraction of root games for one forced End Turn.
-Uniformly choose one of the eight seats and an action index from **1 through 32**.
-Count all of that seat's decisions, including cheap actions and pending choices;
-at the selected index, force End Turn. If it is illegal (including the must-spend-Gold
-mask), defer until the next legal End Turn. A normal End Turn also counts and consumes
-the intervention if selected. No planning rollout or replay is used.
-
-Binary splitting remains enabled: exactly one randomly chosen child inherits a pending
-intervention and its counter; after it fires, neither child can fire again. Discard the
-selected seat's earlier rows on the intervention path, including shared ancestors. Keep
-the forced decision, ended-position row, later rows, all other seats' rows and unaffected
-siblings. If the seat dies or the game ends before the intervention can fire, retain all
-rows; the actual fraction with a forced end can therefore be below 25%.
-
-The intervention gets a search even if originally cheap, so its policy target remains
-the search distribution, not a one-hot End Turn target. Other seats' value labels still
-include their opponent's intervention; they are not unbiased for intervention-free play.
-
 **Tree rollouts.** Self-play defaults to `--split-turn 4`: each root splits once into
 two continuations after turn 4. `selfplay --split-turn "4,8"` splits each root into two
 continuations after turn 4 and each surviving continuation into two after turn 8. A split happens
@@ -287,7 +269,7 @@ training cap, so they also change the average reuse of a row at the same epoch c
 | `--sims` / `--c-puct` | 256 / 1.9 |
 | `--replay-rounds` / `--epochs` / `--max-samples` / `--batch` | scheduled 3→6 / 2 / 80,000 / 512 |
 | `--lr` / `--lr-min` / `--lr-decay-steps` | 3e-5 / 3e-5 (unused without decay) / 0 (constant) |
-| `--noise` / `--noise-alpha` / `--end-explore` | 0.20 / 0.3 / 0.25 |
+| `--noise` / `--noise-alpha` | 0.20 / 0.3 |
 | `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 0.5 / 0.5 |
 | `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 0 / 0.15 |
 | `--search-prob` / `--fpu-reduction` | 0.33 / 1.5 |
@@ -525,15 +507,32 @@ intervals showed no significant improvement over the starting policy. The 6-bloc
 +200 that weakened at +300. With one training seed, the current conclusion is a
 plateau under this recipe, with no sustained benefit from adding depth.
 
-The main current suspicion is **data quality caused by v10's `end-explore=0.02`**:
-every eligible decision could force End Turn, and the resulting placements were also
-used to label earlier states. Repeated interventions may distort the value targets
-and prevent further improvement; this explanation still needs a controlled experiment.
+### v11 training results (2026-11-09–10)
+
+The four v11 runs used 6 blocks, lr=3e-5, E2, batch512, max-samples80k and splitT4.
+Latest EMA mean placements with 64 search simulations:
+
+| Seed | Eval step | Scripted | Teacher |
+| ---: | ---: | ---: | ---: |
+| 444444444 | 2000 | 1.199 | 1.479 |
+| 555555555 | 1900 | 1.248 | 1.640 |
+| 666666666 | 1800 | 1.289 | 1.816 |
+| 777777777 | 2000 | 1.229 | 1.600 |
+
+Each entry used 2,560–3,584 games. The first run leads overall and continues to
+improve: teacher placement was 1.654 at step1500. The earlier sampling variants
+have been retired; current training follows the selected run's ordinary policy
+actions throughout. Stopped the other runs at 1916/1898/2042 steps; only
+seed444444444 continues toward 3000. The network and checkpoint version remain v11.
+Retain step500/1000/1500 checkpoints and rolling latest inference/trainer state.
+
+A single-step timing check from the same step2040 state measured **35.9 s** with
+128 workers bound to one NUMA node, versus **27.7/29.2/39.5 s** unbound with
+256/512/1024 workers (rollout plus training). Continued with **256 search workers,
+128 gradient threads and no CPU/NUMA binding**; learning hyperparameters are unchanged.
 
 ## Open problems
 
-- Validate value calibration on early-stop states: `--end-explore` samples one stop
-  within the first 32 actions (or the next legal end), so coverage remains limited.
 - Search improvement under visit-count selection and the fixed FPU reduction needs
   controlled comparisons. Tree splits also change sample counts, weights and data reuse.
 - **TODO: value auxiliary targets.** Test short-term combat/damage targets alongside the
@@ -542,11 +541,35 @@ and prevent further improvement; this explanation still needs a controlled exper
   zone and position information. Current input projection remains per slot; simply
   pooling away warband order would discard strategically relevant information.
 
+Model/input experiment TODOs (discussion item numbers; initial priority: 1 → 4 → 3 → 2 → 5):
+
+1. Add key survival features: the current combat damage cap, lethal-damage protection
+   and effective health relative to the cap. Distinguish missing state from derived features.
+2. Shared shop-card encoding, sum pooling and a shared per-card Buy scorer; move the
+   corresponding legality bits with each card. Test hand encoding separately, preserving
+   meaningful hand order and the Play action's hand/board-position correspondence.
+3. Hide unfrozen shop cards in ended-turn observations, after end-of-turn effects resolve.
+   Audit intervening effects and shared-pool dependencies before treating this as equivalent.
+4. One-hot encode Tavern Tier first; evaluate other small discrete state variables separately.
+5. Evaluate embedding initialization scale and representation sharing. The current trainable
+   32-dimensional embeddings start from a normal distribution with standard deviation 0.1.
+6. **Hide spent trinkets from observations.** Once a one-shot effect is fully resolved
+   (for example, a Discover has completed) and no future behavior depends on that trinket,
+   omit it if its lasting consequences are already represented. Keep Safety Patch visible
+   while its Ice Block is active and hide it after protection is consumed, using the actual
+   secret state rather than purchase history. This makes its presence a protection signal.
+   Apply the rule to source-mapped power/reward slots and related count features too;
+   audit replacement/copy interactions and protection whose source slot is not represented.
+   This is observation filtering only: preserve engine ownership and game effects.
+
 Idle evaluation slots add independent 512-game seed batches to the latest checkpoints,
 up to 16,384 eval games per checkpoint **per opponent** (scripted and teacher independently). Spare slots run 128-game league batches until
 each model has at least 16,384 seat appearances. New checkpoint evaluations take priority
 at job boundaries. Reports pool all games; league uncertainty resamples whole games. Repeated monitoring uses descriptive 95% intervals,
 not a sequential significance test. Cards show only progress, placement intervals and plots.
+Plot fitting runs in a separate background service; notifications read completed images
+and still send text if an image upload fails. Elo reuses encoded rankings, warm-starts
+weighted whole-game bootstrap fits, and caches unchanged league results.
 
 League selection uses `0.2/N + 0.8 * (count+256)^-1 / sum((count+256)^-1)`
 for each model, sampling without replacement and shuffling seats. Counts include completed

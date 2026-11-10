@@ -28,29 +28,48 @@ def load(path):
     return games
 
 
-def plackett_luce(games, names, iters=500, tol=1e-9):
-    """MM estimate of log-strengths from full rankings."""
-    index = {n: i for i, n in enumerate(names)}
-    rankings = []
-    for models, places in games:
-        order = sorted(range(len(models)), key=lambda s: places[s])
-        rankings.append([index[models[s]] for s in order])
-    n = len(names)
-    # Group equal table sizes; full league tables have eight distinct models.
-    groups = [np.array([r for r in rankings if len(r)==k],dtype=int)
-              for k in sorted({len(r) for r in rankings})]
-    wins = sum((np.bincount(r[:,:-1].ravel(),minlength=n) for r in groups),np.zeros(n))
-    gamma = np.ones(n)
+def encode_rankings(games, names):
+    """Encode each full game once, retaining its position for bootstrap weights."""
+    index = {name: i for i, name in enumerate(names)}
+    groups = defaultdict(list)
+    positions = defaultdict(list)
+    for game_id, (models, places) in enumerate(games):
+        order = sorted(range(len(models)), key=lambda seat: places[seat])
+        groups[len(models)].append([index[models[seat]] for seat in order])
+        positions[len(models)].append(game_id)
+    return [(np.asarray(groups[k], dtype=np.int32), np.asarray(positions[k], dtype=np.intp))
+            for k in sorted(groups)]
+
+
+def fit_rankings(groups, n, iters=500, tol=1e-9, weights=None, initial=None):
+    """Same MM estimator; integer game weights exactly represent resampling."""
+    wins = np.zeros(n)
+    appearances = np.zeros(n)
+    prepared = []
+    for rankings, positions in groups:
+        w = None if weights is None else np.asarray(weights[positions], dtype=float)
+        if w is not None:
+            keep = w > 0
+            rankings, w = rankings[keep], w[keep]
+        flat = rankings.ravel()
+        k = rankings.shape[1]
+        wins += np.bincount(rankings[:, :-1].ravel(),
+                            weights=None if w is None else np.repeat(w, k-1), minlength=n)
+        appearances += np.bincount(flat, weights=None if w is None else np.repeat(w, k), minlength=n)
+        prepared.append((rankings, flat, w))
+    # Absent models are unidentifiable; use the original cold-start convention.
+    gamma = np.ones(n) if initial is None or np.any(appearances == 0) else np.exp(
+        (np.asarray(initial) - np.mean(initial)) * np.log(10) / 400)
     for _ in range(iters):
         denom = np.zeros(n)
-        for r in groups:
-            suffix = np.cumsum(gamma[r][:,::-1],axis=1)[:,::-1]
-            inv=1.0/suffix
-            inv[:,-1]=0
-            exposure=np.cumsum(inv,axis=1)
-            denom+=np.bincount(r.ravel(),weights=exposure.ravel(),minlength=n)
-        # A model never placed above anyone (or absent from a bootstrap sample) gets a
-        # small floor instead of zero so the geometric mean stays defined.
+        for rankings, flat, w in prepared:
+            suffix = np.cumsum(gamma[rankings][:, ::-1], axis=1)[:, ::-1]
+            inv = 1.0 / suffix
+            inv[:, -1] = 0
+            exposure = np.cumsum(inv, axis=1)
+            if w is not None:
+                exposure *= w[:, None]
+            denom += np.bincount(flat, weights=exposure.ravel(), minlength=n)
         new = np.where(denom > 0, np.maximum(wins, 0.5) / np.maximum(denom, 1e-12), gamma)
         new /= np.exp(np.mean(np.log(new)))
         if np.max(np.abs(np.log(new) - np.log(gamma))) < tol:
@@ -58,6 +77,28 @@ def plackett_luce(games, names, iters=500, tol=1e-9):
             break
         gamma = new
     return 400.0 * np.log10(gamma)
+
+
+def plackett_luce(games, names, iters=500, tol=1e-9):
+    """MM estimate of log-strengths from full rankings."""
+    return fit_rankings(encode_rankings(games, names), len(names), iters, tol)
+
+
+def ratings_with_bootstrap(games, names, bootstrap=32, workers=4, seed=0):
+    """Full-game bootstrap without rebuilding and sorting Python game lists."""
+    from concurrent.futures import ThreadPoolExecutor
+    groups = encode_rankings(games, names)
+    elo = fit_rankings(groups, len(names))
+    rng = np.random.default_rng(seed)
+    # Keep the original multinomial bootstrap and deterministic sample order.
+    weights = [np.bincount(rng.integers(len(games), size=len(games)), minlength=len(games))
+               for _ in range(bootstrap)]
+    def fit(w):
+        return fit_rankings(groups, len(names), iters=100, weights=w, initial=elo)
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, bootstrap))) as pool:
+        boots = np.asarray(list(pool.map(fit, weights)))
+    counts = sum((np.bincount(r.ravel(), minlength=len(names)) for r, _ in groups), np.zeros(len(names), dtype=int))
+    return elo, np.std(boots, axis=0, ddof=1), counts
 
 
 def main():

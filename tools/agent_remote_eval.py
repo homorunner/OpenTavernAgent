@@ -11,10 +11,19 @@ import subprocess
 import time
 import zipfile
 
-from agent_depth_experiment import DEPTHS, STAGES, atomic_json
 from agent_remote_job import SSH, cleanup, run_remote
 from agent_eval_precision import merge, extras
 from agent_league_sampling import weighted_tables, BATCH_GAMES, UNIFORM_SHARE, COUNT_PRIOR
+
+
+DEPTHS = (6, 8, 10, 12)
+STAGES = tuple(range(100, 3001, 100))
+
+
+def atomic_json(path, value):
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    tmp.write_text(json.dumps(value, indent=2) + '\n')
+    tmp.replace(path)
 
 
 def ssh(host, args, **kw):
@@ -52,13 +61,18 @@ archive=pathlib.Path(sys.argv[1])
 m=json.loads((archive/'manifest.json').read_text())
 work=pathlib.Path(m['work'])
 checkpoints={}
+run_ids=[r['id'] for r in m.get('runs',[])] or [f'd{d}' for d in m['depths']]
 for root in [work,archive]:
- for d in m['depths']:
-  for p in (root/f'd{d}').glob('model.step*.npz'):
+ for run in run_ids:
+  for p in (root/run).glob('model.step*.npz'):
    if '.trainer.' in p.name: continue
-   checkpoints[f'd{d}/{p.name}']=str(p)
-results={str(p.relative_to(archive)):str(p) for p in archive.glob('d*/eval_step*.json')}
-results.update({str(p.relative_to(archive)):str(p) for p in archive.glob('d*/teacher_eval_step*.json')})
+   checkpoints[f'{run}/{p.name}']=str(p)
+for baseline in m.get('baselines',[]):
+ p=pathlib.Path(baseline['path'])
+ if hashlib.sha256(p.read_bytes()).hexdigest()!=baseline['sha256']:
+  raise ValueError('Baseline checkpoint changed: '+baseline['name'])
+ checkpoints[baseline['checkpoint']]=str(p)
+results={str(p.relative_to(archive)):str(p) for run in run_ids for p in (archive/run).glob('*eval_step*.json')}
 results.update({p.name:str(p) for p in archive.glob('league_batch*.json')})
 hashes={name:hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest() for name,path in results.items()}
 status=json.loads((archive/'status.json').read_text())
@@ -73,18 +87,19 @@ def jobs_for(index):
     jobs = []
     stages = ([0] if index.get('manifest', {}).get('initial_weights') else []) + list(STAGES)
     for step in stages:
-        for depth in DEPTHS:
+        for run in index.get('manifest', {}).get('runs', []) or [dict(id=f'd{d}') for d in DEPTHS]:
+            run_id = run['id']
             for variant in ['ema', 'raw']:
-                name = f'd{depth}/model.step{step}' + ('.ema.npz' if variant == 'ema' else '.npz')
+                name = f'{run_id}/model.step{step}' + ('.ema.npz' if variant == 'ema' else '.npz')
                 if name not in checkpoints:
                     continue
                 for opponent in ['scripted', 'teacher']:
                     prefix = 'teacher_' if opponent == 'teacher' else ''
                     games = 512 if opponent == 'scripted' and step == 100 else 2048
                     opponent_args = ['--opponent', 'teacher'] if opponent == 'teacher' else []
-                    jobs.append(dict(id=f'{prefix}eval_{step}_d{depth}_{variant}', kind='eval',
+                    jobs.append(dict(id=f'{prefix}eval_{step}_{run_id}_{variant}', kind='eval',
                         opponent=opponent, step=step,
-                        relative=f'd{depth}/{prefix}eval_step{step}_{variant}.json', inputs={'model.npz': name},
+                        relative=f'{run_id}/{prefix}eval_step{step}_{variant}.json', inputs={'model.npz': name},
                         args=['eval', '--model', 'model.npz', '--games', str(games), *opponent_args,
                               '--sims', '64', '--seed', '61000000', '--no-baselines', '--out', 'result.json']))
     return jobs
@@ -100,7 +115,11 @@ def league_jobs(index, root, active, count):
     first=max(completed+running+[0])+1
     inputs={f'm{i}.npz':name for i,name in enumerate(checkpoints)}
     specs=[]
+    baseline_names = {b['checkpoint']: b['name'] for b in index.get('manifest', {}).get('baselines', [])}
     for alias,name in inputs.items():
+        if name in baseline_names:
+            specs += ['--model', f'{baseline_names[name]}={alias}']
+            continue
         depth,filename=name.split('/')
         step=filename.split('step')[1].split('.')[0]
         variant='ema' if '.ema.' in filename else 'raw'
@@ -130,6 +149,19 @@ def league_jobs(index, root, active, count):
 
 
 
+def prune_cached_checkpoints(root, index, active):
+    """Respect source retention without removing inputs of in-flight jobs."""
+    if not index['manifest'].get('checkpoint_retention'):
+        return
+    keep = set(index['checkpoints'])
+    for job, _ in active.values():
+        keep.update(job['checkpoints'].values())
+    cache = root/'checkpoints'
+    for path in cache.rglob('*.npz'):
+        if str(path.relative_to(cache)) not in keep:
+            path.unlink()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--source', default='experiment')
@@ -149,7 +181,7 @@ def main():
     binary = a.root/'tavernagent'
     first = snapshot(a.source, a.archive)
     stages = ([0] if first['manifest'].get('initial_weights') else []) + list(STAGES)
-    total = len(stages)*len(DEPTHS)*2*2
+    total = len(stages)*len(first['manifest'].get('runs') or DEPTHS)*2*2
     digest = first['manifest']['binary_sha256']
     if not binary.exists():
         fetch(a.source, first['manifest']['binary'], binary)
@@ -162,7 +194,8 @@ def main():
     teacher_digest=hashlib.sha256(teacher_binary.read_bytes()).hexdigest()
     atomic_json(a.root/'manifest.json', dict(source=a.source, archive=a.archive,
         training_binary_sha256=digest, league_binary_sha256=league_digest,
-        teacher_binary_sha256=teacher_digest, hosts=hosts, stages=stages, total_jobs=total))
+        teacher_binary_sha256=teacher_digest, hosts=hosts, stages=stages, total_jobs=total,
+        runs=first['manifest'].get('runs', []), baselines=first['manifest'].get('baselines', [])))
     quarantined, failures, retry_at = {}, {}, {}
 
     def recover(skip=()):
@@ -229,6 +262,7 @@ def main():
                     if not complete(local):
                         fetch(a.source, remote, local)
                 last_scan = now
+            prune_cached_checkpoints(a.root, index, active)
             planned = jobs_for(index)
             busy_hosts = {h['host'] for _, h in active.values()}
             busy_jobs = {j['id'] for j, _ in active.values()}
@@ -282,7 +316,12 @@ def main():
                 if published_hashes.get(local.name)!=checksum:
                     publish(a.source,a.archive,local.name,local)
                     published_hashes[local.name]=checksum
-            finished = published == total and not active
+            if index['manifest'].get('checkpoint_retention'):
+                total = len(planned)
+                finished = (index['status'].get('phase') == 'training_complete'
+                            and published == total and not active)
+            else:
+                finished = published == total and not active
             state = dict(state='complete' if finished else 'running', updated=time.time(),
                 completed=published, total=total, available=len(planned), failed=failures,
                 quarantined=quarantined, active=[dict(id=j['id'], kind=j['kind'], host=h['host']) for j,h in active.values()])

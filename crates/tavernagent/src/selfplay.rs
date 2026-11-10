@@ -7,9 +7,7 @@
 //! records the ended position (`Game::end_turn_effects` on a copy): no legal actions, so
 //! no policy target, but the same final-placement value label. That is the state the
 //! search evaluates when it considers ending the turn, so the single value head is
-//! trained exactly where it is used. In an `end_explore` fraction of roots, one seat
-//! gets one forced End Turn at a random action index. Its earlier
-//! rows on the intervention path (including shared ancestors) are discarded.
+//! trained exactly where it is used.
 //!
 //! Training is AdamW with a cosine schedule, gradient clipping and an EMA copy, drawing
 //! each epoch's samples uniformly from a replay window of the last rounds.
@@ -94,7 +92,6 @@ pub fn ended_sample(game: &Game, seat: usize) -> Result<Sample, String> {
 pub struct PlayOptions {
     pub search: SearchOptions,
     pub temperature: f32,
-    pub end_explore: f32,
     pub budgets: Budgets,
     /// Probability that a decision is searched (and recorded); the rest play the prior.
     pub search_prob: f32,
@@ -240,43 +237,6 @@ impl RolloutState {
     }
 }
 
-/// One online intervention per selected root. Only one child inherits a pending
-/// intervention at a split, so counting follows one continuation without replay.
-struct EndExplore {
-    seat: usize,
-    target: usize,
-    decisions: usize,
-    fired: bool,
-    rng: Pcg64Mcg,
-}
-
-impl EndExplore {
-    fn new(seed: u64, probability: f32, seats: usize) -> Option<Self> {
-        let mut rng = Pcg64Mcg::seed_from_u64(seed ^ 0x0045_4E44_5F41_5558);
-        if probability == 0.0 || rng.random::<f32>() >= probability {
-            return None;
-        }
-        Some(Self {
-            seat: rng.random_range(0..seats),
-            target: rng.random_range(1..=32),
-            decisions: 0,
-            fired: false,
-            rng,
-        })
-    }
-
-    fn force(&mut self, seat: usize, can_end: bool) -> bool {
-        if self.fired || seat != self.seat {
-            return false;
-        }
-        self.decisions += 1;
-        // Count all this seat's decisions, including cheap actions and menus.
-        // A pending choice / must-spend mask delays the end until it is legal.
-        self.fired = self.decisions >= self.target && can_end;
-        self.fired
-    }
-}
-
 /// Play one root and all its binary continuations. Shared prefix rows occur once;
 /// their labels are conditional means of the two child subtrees. The returned seat-0
 /// reward uses the same probability weights, independent of training sample weights.
@@ -288,45 +248,28 @@ pub fn play_one<E: Evaluator + ?Sized>(
     opts: &PlayOptions,
     pool: Option<&rayon::ThreadPool>,
 ) -> Result<(Vec<Sample>, f32), String> {
-    if !(0.0..=1.0).contains(&opts.end_explore) {
-        return Err("end_explore must be a probability".into());
-    }
     if !(0.0..=1.0).contains(&opts.search_prob) {
         return Err("search_prob must be a probability".into());
     }
     validate_split_turns(&opts.split_turn)?;
     let mut game = Game::new(seed, opts.budgets.config()?);
     select_heroes(&mut game, seed)?;
-    let mut explore = EndExplore::new(seed, opts.end_explore, game.players.len());
     let state = RolloutState::new(game, game_rng(seed));
-    let (samples, rewards) = play_branch_exploring(net, state, opts, pool, 1.0, explore.as_mut())?;
+    let (samples, rewards) = play_branch(net, state, opts, pool, 1.0)?;
     Ok((samples, rewards[0]))
 }
 
-#[cfg(test)]
 fn play_branch<E: Evaluator + ?Sized>(
-    net: &E,
-    state: RolloutState,
-    opts: &PlayOptions,
-    pool: Option<&rayon::ThreadPool>,
-    weight: f32,
-) -> Result<(Vec<Sample>, Vec<f32>), String> {
-    play_branch_exploring(net, state, opts, pool, weight, None)
-}
-
-fn play_branch_exploring<E: Evaluator + ?Sized>(
     net: &E,
     mut state: RolloutState,
     opts: &PlayOptions,
     pool: Option<&rayon::ThreadPool>,
     weight: f32,
-    mut explore: Option<&mut EndExplore>,
 ) -> Result<(Vec<Sample>, Vec<f32>), String> {
     let seed = state.game.seed;
     let mut samples: Vec<Sample> = Vec::new();
     let mut seats: Vec<usize> = Vec::new();
     let mut descendants = Vec::new();
-    let mut retain_from = None;
     let rewards = loop {
         if state.game.is_over() {
             break state
@@ -382,28 +325,14 @@ fn play_branch_exploring<E: Evaluator + ?Sized>(
                 state.game.players[seat].pending.last()
             ));
         }
-        let mut decision = match pre_result {
+        let decision = match pre_result {
             Some(r) => r,
             None => {
                 let (full, seed) = draw_decision(opts, &mut state.rng);
                 decide(&state.game, seat, &obs, net, opts, full, seed)?
             }
         };
-        let mut action = decision.choose(opts.temperature, &mut state.rng);
-        let forced = explore
-            .as_deref_mut()
-            .is_some_and(|e| e.force(seat, obs.mask[A_END_TURN]));
-        if forced {
-            retain_from = Some(samples.len());
-            // Always retain the intervention decision, including originally cheap
-            // moves. The policy target remains search, never the forced action.
-            if matches!(decision, Decision::Direct(_)) {
-                decision = decide(&state.game, seat, &obs, net, opts, true, state.rng.random())?;
-            }
-            action = A_END_TURN;
-        }
-        // Search targets stay unchanged by the forced action. Ended positions are
-        // always recorded, including the intervention and every later turn.
+        let action = decision.choose(opts.temperature, &mut state.rng);
         if let Decision::Searched(result) = decision {
             samples.push(Sample {
                 x: obs.x,
@@ -438,28 +367,13 @@ fn play_branch_exploring<E: Evaluator + ?Sized>(
             // completed sibling. Scheduling and subtree size cannot change them.
             let seeds: [(u64, u64); 2] =
                 std::array::from_fn(|_| (state.rng.random(), state.rng.random()));
-            let exploring_child = explore
-                .as_deref_mut()
-                .filter(|e| !e.fired)
-                .map(|e| e.rng.random_range(0..2));
-            for (index, (environment_seed, policy_seed)) in seeds.into_iter().enumerate() {
+            for (environment_seed, policy_seed) in seeds {
                 let mut child = state.clone();
                 child.game.rng = taverngym::rng::Rng::new(environment_seed);
                 child.rng = Pcg64Mcg::seed_from_u64(policy_seed);
                 child.game.resume_combat().map_err(str::to_string)?;
-                let child_explore = if exploring_child == Some(index) {
-                    explore.as_deref_mut()
-                } else {
-                    None
-                };
-                let (rows, rewards) = play_branch_exploring(
-                    net,
-                    child,
-                    opts,
-                    pool,
-                    weight * SPLIT_SAMPLE_WEIGHT,
-                    child_explore,
-                )?;
+                let (rows, rewards) =
+                    play_branch(net, child, opts, pool, weight * SPLIT_SAMPLE_WEIGHT)?;
                 for (m, r) in mean.iter_mut().zip(rewards) {
                     *m += 0.5 * r;
                 }
@@ -468,21 +382,9 @@ fn play_branch_exploring<E: Evaluator + ?Sized>(
             break mean;
         }
     };
-    let discard_seat = explore.as_ref().filter(|e| e.fired).map(|e| e.seat);
-    // The selected seat's shared ancestor rows also depend on the forced branch.
-    // Unaffected sibling rows and every other seat's rows are kept.
-    samples = samples
-        .into_iter()
-        .zip(seats)
-        .enumerate()
-        .filter_map(|(index, (mut row, seat))| {
-            if discard_seat == Some(seat) && retain_from.is_none_or(|first| index < first) {
-                return None;
-            }
-            row.z = rewards[seat];
-            Some(row)
-        })
-        .collect();
+    for (row, seat) in samples.iter_mut().zip(seats) {
+        row.z = rewards[seat];
+    }
     samples.extend(descendants);
     Ok((samples, rewards))
 }
@@ -1262,152 +1164,10 @@ mod split_tests {
         }
     }
 
-    struct RefreshThenEnd;
-    impl Evaluator for RefreshThenEnd {
-        fn evaluate(&self, obs: &Observation) -> Result<(Vec<f32>, f32), String> {
-            let mut pi = vec![0.0; N_ACTIONS];
-            let refresh = taverngym::actions::A_REFRESH;
-            if obs.mask[refresh] {
-                pi[refresh] = 1.0;
-            } else if obs.mask[A_END_TURN] {
-                pi[A_END_TURN] = 1.0;
-            }
-            Ok((pi, 0.0))
-        }
-    }
-
-    #[test]
-    fn early_stop_sampling_is_uniform_over_roots_seats_and_first_32_actions() {
-        let mut roots = 0;
-        let mut seats = [0; 8];
-        let mut targets = [0; 32];
-        for seed in 0..20_000 {
-            let Some(explore) = EndExplore::new(seed, 0.25, 8) else {
-                continue;
-            };
-            roots += 1;
-            seats[explore.seat] += 1;
-            targets[explore.target - 1] += 1;
-        }
-        assert!((4700..5300).contains(&roots));
-        assert!(seats.iter().all(|n| (500..750).contains(n)), "{seats:?}");
-        assert!(targets.iter().all(|n| (90..230).contains(n)), "{targets:?}");
-        assert!(EndExplore::new(1, 0.0, 8).is_none());
-    }
-
-    #[test]
-    fn early_stop_counts_only_selected_seat_and_defers_until_legal_once() {
-        let mut explore = EndExplore::new(31, 1.0, 8).unwrap();
-        explore.seat = 0;
-        explore.target = 3;
-        assert!(!explore.force(1, true));
-        assert_eq!(explore.decisions, 0);
-        assert!(!explore.force(0, false));
-        assert!(!explore.force(0, true));
-        assert!(!explore.force(0, false)); // Third action cannot end yet.
-        assert!(!explore.force(1, true));
-        assert_eq!(explore.decisions, 3);
-        assert!(explore.force(0, true));
-        assert_eq!(explore.decisions, 4);
-        assert!(!explore.force(0, true));
-        assert!(!explore.force(1, true));
-    }
-
-    #[test]
-    fn early_stop_after_split_discards_ancestors_but_keeps_siblings_and_future_rows() {
-        let (mut game, mut opts) = fixture(3);
-        game.cfg.turn_action_caps = vec![4];
-        opts.search.sims = 2;
-        let state = RolloutState::new(game, game_rng(31));
-        let (ordinary, _) = play_branch(&RefreshThenEnd, state.clone(), &opts, None, 1.0).unwrap();
-        assert_eq!(ordinary.len(), 56);
-        let mut explore = EndExplore::new(31, 1.0, 8).unwrap();
-        explore.seat = 0;
-        // T1: three refreshes + End. T2: two refreshes, then force action seven.
-        explore.target = 7;
-        // Route the pending intervention into the second child for a sibling check.
-        let branch_seed = (0..100)
-            .find(|&seed| Pcg64Mcg::seed_from_u64(seed).random_range(0..2) == 1)
-            .unwrap();
-        explore.rng = Pcg64Mcg::seed_from_u64(branch_seed);
-        let (rows, _) =
-            play_branch_exploring(&RefreshThenEnd, state, &opts, None, 1.0, Some(&mut explore))
-                .unwrap();
-        assert!(explore.fired);
-        assert_eq!(explore.decisions, 7);
-        // Seven shared rows + untouched 24-row sibling + 25 intervention-subtree rows.
-        assert_eq!(rows.len(), 56);
-        for (row, original) in rows[..7].iter().zip(&ordinary[1..8]) {
-            assert_eq!(row.x, original.x);
-            assert_eq!(row.cards, original.cards);
-        }
-        assert_eq!(&rows[7..31], &ordinary[8..32]);
-        let forced: Vec<_> = rows.iter().filter(|s| !s.is_ended()).collect();
-        assert_eq!(
-            forced.len(),
-            1,
-            "exactly one forced decision, even with nested splits"
-        );
-        assert_eq!(forced[0].action, A_END_TURN as i64);
-        assert_eq!(forced[0].weight, SPLIT_SAMPLE_WEIGHT);
-        assert_eq!(rows[31], *forced[0]);
-        assert!(rows[32].is_ended());
-        assert_eq!(rows[31].z, rows[32].z);
-        assert!(
-            rows[40..]
-                .iter()
-                .all(|s| s.weight == SPLIT_SAMPLE_WEIGHT.powi(2))
-        );
-    }
-
-    #[test]
-    fn early_stop_keeps_rows_if_game_ends_before_target_and_is_pool_independent() {
-        let (mut game, mut opts) = fixture(3);
-        game.cfg.turn_action_caps = vec![4];
-        opts.search.sims = 2;
-        let state = RolloutState::new(game, game_rng(31));
-        let mut explore = EndExplore::new(31, 1.0, 8).unwrap();
-        explore.target = 32;
-        let normal = play_branch(&RefreshThenEnd, state.clone(), &opts, None, 1.0).unwrap();
-        let unchanged = play_branch_exploring(
-            &RefreshThenEnd,
-            state.clone(),
-            &opts,
-            None,
-            1.0,
-            Some(&mut explore),
-        )
-        .unwrap();
-        assert!(!explore.fired);
-        assert_eq!(unchanged, normal);
-        opts.search_prob = 0.5;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap();
-        let run = |pool| {
-            let mut explore = EndExplore::new(31, 1.0, 8).unwrap();
-            explore.target = 2;
-            let result = play_branch_exploring(
-                &RefreshThenEnd,
-                state.clone(),
-                &opts,
-                pool,
-                1.0,
-                Some(&mut explore),
-            )
-            .unwrap();
-            assert!(explore.fired);
-            result
-        };
-        assert_eq!(run(None), run(Some(&pool)));
-    }
-
     fn fixture(max_turns: u32) -> (Game, PlayOptions) {
         let opts = PlayOptions {
             search: SearchOptions::default(),
             temperature: 0.0,
-            end_explore: 0.0,
             search_prob: 0.0,
             budgets: Budgets::default(),
             split_turn: vec![1, 2],

@@ -94,10 +94,6 @@ pub struct SelfplayArgs {
     /// (negative = the original rule, unvisited edges at Q = 0).
     #[arg(long, default_value_t = crate::mcts::DEFAULT_FPU_REDUCTION)]
     pub fpu_reduction: f32,
-    /// Fraction of games scheduling one forced End Turn: uniform seat and action
-    /// index 1..=32 (deferred until legal). Discard its earlier intervention-path rows.
-    #[arg(long, default_value_t = 0.25)]
-    pub end_explore: f32,
     #[arg(long, default_value_t = crate::mcts::DEFAULT_C_PUCT)]
     pub c_puct: f32,
     #[arg(long, default_value = "gelu", value_parser = Activation::parse)]
@@ -228,7 +224,6 @@ impl SelfplayArgs {
         for (name, v) in [
             ("noise", self.noise),
             ("policy-smoothing", self.policy_smoothing),
-            ("end-explore", self.end_explore),
         ] {
             if !(0.0..=1.0).contains(&v) {
                 return Err(format!("{name} must be in [0, 1]"));
@@ -422,7 +417,6 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
                 keep_games: false,
             },
             temperature,
-            end_explore: args.end_explore,
             budgets: args.budgets,
             search_prob: args.search_prob,
             split_turn: args.split_turn.clone(),

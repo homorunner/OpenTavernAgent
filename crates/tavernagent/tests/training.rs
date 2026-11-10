@@ -170,14 +170,13 @@ impl Evaluator for EndOrFirst {
     }
 }
 
-fn play_options(sims: usize, end_explore: f32) -> PlayOptions {
+fn play_options(sims: usize) -> PlayOptions {
     PlayOptions {
         search: SearchOptions {
             sims,
             ..SearchOptions::default()
         },
         temperature: 0.0,
-        end_explore,
         budgets: Budgets::default(),
         search_prob: 1.0,
         split_turn: Vec::new(),
@@ -188,7 +187,7 @@ fn play_options(sims: usize, end_explore: f32) -> PlayOptions {
 /// concurrent seat searches, and its thread count, change nothing.
 #[test]
 fn self_play_does_not_depend_on_the_search_pool() {
-    let opts = play_options(2, 0.0);
+    let opts = play_options(2);
     let global = play_one(&EndOrFirst, 31, &opts, None).unwrap();
     let single = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
@@ -220,7 +219,7 @@ fn self_play_does_not_depend_on_the_search_pool() {
 
 #[test]
 fn self_play_records_one_ended_position_per_end_turn() {
-    let (samples, _) = play_one(&EndOrFirst, 31, &play_options(2, 0.0), None).unwrap();
+    let (samples, _) = play_one(&EndOrFirst, 31, &play_options(2), None).unwrap();
     let ended = samples.iter().filter(|s| s.is_ended()).count();
     let ends = samples
         .iter()
@@ -237,27 +236,16 @@ fn self_play_records_one_ended_position_per_end_turn() {
         }
     }
     assert!(samples.iter().all(|s| (-1.0..=1.0).contains(&s.z)));
-    assert!(
-        play_one(&EndOrFirst, 31, &play_options(1, 1.5), None)
-            .unwrap_err()
-            .contains("probability")
-    );
-    // The selected action may already be End Turn; the one-shot schedule is still
-    // consumed and earlier rows of that seat are removed.
-    let normal = play_one(&EndOrFirst, 31, &play_options(2, 0.0), None).unwrap();
-    let explored = play_one(&EndOrFirst, 31, &play_options(2, 1.0), None).unwrap();
-    assert_eq!(explored.1, normal.1);
-    assert!(explored.0.len() <= normal.0.len());
 }
 
 /// Only searched decisions become training rows; the ended positions are kept either
 /// way, and the split is a function of the seed.
 #[test]
 fn unsearched_decisions_play_the_prior_and_leave_no_policy_row() {
-    let full = play_options(2, 0.0);
-    let mut none = play_options(2, 0.0);
+    let full = play_options(2);
+    let mut none = play_options(2);
     none.search_prob = 0.0;
-    let mut half = play_options(2, 0.0);
+    let mut half = play_options(2);
     half.search_prob = 0.5;
     let (all, _) = play_one(&EndOrFirst, 31, &full, None).unwrap();
     let (direct, _) = play_one(&EndOrFirst, 31, &none, None).unwrap();
@@ -281,7 +269,7 @@ fn unsearched_decisions_play_the_prior_and_leave_no_policy_row() {
             .zip(&mixed)
             .all(|(a, b)| a.action == b.action && a.pi == b.pi)
     );
-    let mut bad = play_options(2, 0.0);
+    let mut bad = play_options(2);
     bad.search_prob = 1.5;
     assert!(
         play_one(&EndOrFirst, 31, &bad, None)
@@ -541,8 +529,6 @@ fn cli_trainer_cadence_archives_and_resumes_exactly() {
         "1",
         "--search-prob",
         "0.05",
-        "--end-explore",
-        "0",
         "--split-turn",
         "--probe-every",
         "0",
@@ -768,10 +754,6 @@ fn split_turn_cli_and_required_saved_options() {
             .args
             .split_turn
             .is_empty()
-    );
-    assert_eq!(
-        Cli::try_parse_from(["test"]).unwrap().args.end_explore,
-        0.25
     );
     assert!(Cli::try_parse_from(["test", "--split-turn", "4,no"]).is_err());
     assert!(validate_split_turns(&[3, 6, 9]).is_ok());
