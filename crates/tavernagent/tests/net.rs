@@ -31,9 +31,9 @@ fn cfg(activation: Activation, head_norm: bool) -> NetConfig {
 #[test]
 fn parameter_count_and_input_layout() {
     let net = PolicyValueNet::new(0, NetConfig::default()).unwrap();
-    assert_eq!(net.n_input_features(), 1724);
+    assert_eq!(net.n_input_features(), 1732);
     assert_eq!(net.n_card_slots(), 57);
-    assert_eq!(net.n_params(), 2_315_637);
+    assert_eq!(net.n_params(), 2_317_685);
     assert_eq!(net.p.tensors.len(), 11 + 6 * net.cfg.blocks);
     assert_eq!(net.p.names().last().unwrap(), "bv");
     let wide = PolicyValueNet::new(
@@ -55,7 +55,9 @@ fn parameter_count_and_input_layout() {
     assert!(wide.p.is_weight(net::w_up(0)) && wide.p.is_weight(net::w_down(0)));
     assert!(!wide.p.is_weight(wide.p.bp()) && !wide.p.is_weight(wide.p.bv()));
     assert!(net::input_feature_indices().contains(&net::ENDED_TURN_FEATURE));
-    assert!(!net::input_feature_indices().contains(&0));
+    assert!(net::input_feature_indices().contains(&0));
+    assert!(net::input_feature_indices().contains(&net::COMBAT_PROTECTED_FEATURE));
+    assert!(!net::input_feature_indices().contains(&net::OPP_BOARD_FEATURE_START));
     assert!(!net::input_feature_indices().contains(&1));
     assert!(!net::input_feature_indices().contains(&15));
     let features = net::input_feature_indices();
@@ -68,6 +70,59 @@ fn parameter_count_and_input_layout() {
     assert!(
         !slots.contains(&3) && !slots.contains(&14) && !slots.contains(&18) && slots.contains(&19)
     );
+}
+
+#[test]
+fn damage_cap_protection_uses_current_health_armor_and_round_start_survivors() {
+    let mut game = position(23);
+    game.players[0].pending.clear();
+    let flag = |g: &Game| {
+        let obs = observe_seat(g, 0);
+        assert_eq!(obs.x.len(), N_FEATURES);
+        assert_eq!(
+            &obs.x[..taverngym::obs::OBS_FLOATS],
+            taverngym::obs::observe(g, 0).floats.as_slice()
+        );
+        obs.x[net::COMBAT_PROTECTED_FEATURE]
+    };
+    for (turn, cap) in [(1, 5), (3, 5), (4, 10), (7, 10), (8, 15), (16, 15)] {
+        game.turn = turn;
+        game.turn_alive = 5;
+        for armor in [0, 3] {
+            game.players[0].armor = armor;
+            for margin in [-1, 0, 1] {
+                game.players[0].health = cap - armor + margin;
+                assert_eq!(flag(&game), (margin > 0) as u8 as f32);
+            }
+        }
+    }
+    game.players[0].health = 100;
+    game.turn_alive = 4;
+    assert_eq!(flag(&game), 0.0); // No cap, even with high health.
+    for player in &mut game.players[4..] {
+        player.alive = false;
+    }
+    game.turn_alive = 5;
+    assert_eq!(flag(&game), 1.0); // The fifth player died during this recruit phase.
+    game.turn_alive = 0;
+    assert_eq!(flag(&game), 0.0); // Unknown round-start count falls back to live players.
+    game.players[4].alive = true;
+    assert_eq!(flag(&game), 1.0);
+    game.players[0].alive = false;
+    game.turn_alive = 5;
+    assert_eq!(flag(&game), 0.0);
+
+    game.players[0].alive = true;
+    game.cfg.damage_caps = vec![(1, 12)];
+    game.players[0].health = 10;
+    game.players[0].armor = 3;
+    assert_eq!(flag(&game), 1.0);
+    let mut ended = tavernagent::selfplay::end_turn_preview(&game, 0).unwrap();
+    assert_eq!(flag(&ended), 1.0);
+    ended.players[0].health = 9;
+    let sample = tavernagent::selfplay::ended_sample_of(&ended, 0).unwrap();
+    assert!(sample.is_ended());
+    assert_eq!(sample.x[net::COMBAT_PROTECTED_FEATURE], 0.0);
 }
 
 #[test]
@@ -381,7 +436,7 @@ fn checkpoints_round_trip_and_reject_other_schemas() {
     let npz = Npz::load(&path).unwrap();
     assert_eq!(
         npz.get("W0").unwrap().shape,
-        vec![1724 + 57 * 4 + N_ACTIONS, net.cfg.hidden]
+        vec![1732 + 57 * 4 + N_ACTIONS, net.cfg.hidden]
     );
     assert_eq!(npz.get("bp").unwrap().shape, vec![N_ACTIONS]);
     assert_eq!(
@@ -389,6 +444,19 @@ fn checkpoints_round_trip_and_reject_other_schemas() {
         vec![net.cfg.hidden, 128]
     );
     assert_eq!(npz.get("Wv").unwrap().shape, vec![128, 1]);
+    let mut old_version = npz.clone();
+    let mut old_meta: serde_json::Value =
+        serde_json::from_str(&old_version.get("meta").unwrap().as_text().unwrap()).unwrap();
+    old_meta["version"] = serde_json::json!(11);
+    old_version.insert(
+        "meta",
+        tavernagent::npz::NpyArray::text(&old_meta.to_string()),
+    );
+    assert!(
+        PolicyValueNet::from_npz(&old_version)
+            .unwrap_err()
+            .contains("unsupported checkpoint format v11")
+    );
     let mut other_cards = npz.clone();
     let meta = other_cards.get("meta").unwrap().as_text().unwrap();
     let meta = meta.replace(

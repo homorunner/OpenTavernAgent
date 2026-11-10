@@ -37,7 +37,7 @@ use crate::rules::Budgets;
 
 pub const TRAINER_FORMAT: i64 = 9;
 /// Per-child sample weight multiplier. Label expectations always use 1/2 instead.
-pub const SPLIT_SAMPLE_WEIGHT: f32 = 0.55;
+pub const SPLIT_SAMPLE_WEIGHT: f32 = 0.75;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
@@ -200,7 +200,7 @@ fn presearch_ply<E: Evaluator + ?Sized>(
 }
 
 /// Seed-derived generator for one self-play game: root noise, simulation seeds,
-/// and temperature sampling. Early-stop scheduling uses a separate generator.
+/// and temperature sampling.
 pub fn game_rng(seed: u64) -> Pcg64Mcg {
     Pcg64Mcg::seed_from_u64(seed ^ 0x504C_4159)
 }
@@ -211,6 +211,15 @@ pub fn validate_split_turns(turns: &[u32]) -> Result<(), String> {
         return Err("split-turn must contain strictly increasing positive turns (e.g. 4,8)".into());
     }
     Ok(())
+}
+
+/// Select one schedule for the whole root, independently of its game/search streams.
+pub fn choose_split_turns(schedules: &[Vec<u32>], seed: u64) -> &[u32] {
+    if schedules.is_empty() {
+        return &[];
+    }
+    let mut rng = Pcg64Mcg::seed_from_u64(seed ^ 0x0053_504C_4954);
+    &schedules[rng.random_range(0..schedules.len())]
 }
 
 /// Keep the seat cursor and outstanding searches across combat, including a split.

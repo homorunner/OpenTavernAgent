@@ -84,7 +84,8 @@ def plackett_luce(games, names, iters=500, tol=1e-9):
     return fit_rankings(encode_rankings(games, names), len(names), iters, tol)
 
 
-def ratings_with_bootstrap(games, names, bootstrap=32, workers=4, seed=0):
+def ratings_with_bootstrap(games, names, bootstrap=32, workers=4, seed=0,
+                           anchor=None, anchor_rating=1000.0):
     """Full-game bootstrap without rebuilding and sorting Python game lists."""
     from concurrent.futures import ThreadPoolExecutor
     groups = encode_rankings(games, names)
@@ -97,6 +98,11 @@ def ratings_with_bootstrap(games, names, bootstrap=32, workers=4, seed=0):
         return fit_rankings(groups, len(names), iters=100, weights=w, initial=elo)
     with ThreadPoolExecutor(max_workers=max(1, min(workers, bootstrap))) as pool:
         boots = np.asarray(list(pool.map(fit, weights)))
+    if anchor is not None:
+        index = names.index(anchor)
+        elo = elo - elo[index] + anchor_rating
+        # Anchor each resampled fit too, preserving covariance in relative errors.
+        boots = boots - boots[:, index:index+1] + anchor_rating
     counts = sum((np.bincount(r.ravel(), minlength=len(names)) for r, _ in groups), np.zeros(len(names), dtype=int))
     return elo, np.std(boots, axis=0, ddof=1), counts
 
@@ -106,7 +112,8 @@ def main():
     ap.add_argument("league")
     ap.add_argument("--out", default=None, help="PNG path (default: next to the input)")
     ap.add_argument("--bootstrap", type=int, default=200)
-    ap.add_argument("--anchor", default=None, help="model whose rating is fixed at 0")
+    ap.add_argument("--anchor", default=None, help="model whose rating is fixed at --anchor-rating")
+    ap.add_argument("--anchor-rating", type=float, default=1000.0)
     ap.add_argument("--json", default=None, help="also write ratings as JSON")
     ap.add_argument(
         "--exclude",
@@ -132,15 +139,14 @@ def main():
     for models, _ in games:
         for m in models:
             counts[m] += 1
-    elo = plackett_luce(games, names)
-    rng = np.random.default_rng(0)
-    boots = []
-    for _ in range(args.bootstrap):
-        sample = [games[i] for i in rng.integers(0, len(games), len(games))]
-        boots.append(plackett_luce(sample, names, iters=200))
-    se = np.std(np.array(boots), axis=0)
-    if args.anchor:
-        elo = elo - elo[names.index(args.anchor)]
+    if args.bootstrap < 2:
+        ap.error("--bootstrap must be at least 2")
+    if args.anchor and args.anchor not in names:
+        ap.error("--anchor must name a model in the league")
+    elo, se, _ = ratings_with_bootstrap(
+        games, names, bootstrap=args.bootstrap,
+        anchor=args.anchor, anchor_rating=args.anchor_rating,
+    )
 
     table = sorted(zip(names, elo, se), key=lambda t: -t[1])
     print(
@@ -193,7 +199,8 @@ def main():
         ax.axhline(e, linestyle="--", linewidth=1)
         ax.text(ax.get_xlim()[1] if runs else 0, e, name, fontsize=8, va="bottom", ha="right")
     ax.set_xlabel("training round")
-    ax.set_ylabel("Elo (Plackett-Luce, mean 0)" + (f", {args.anchor} = 0" if args.anchor else ""))
+    origin = f"{args.anchor} = {args.anchor_rating:g}" if args.anchor else "pool mean = 0"
+    ax.set_ylabel(f"Elo (Plackett-Luce, {origin})")
     ax.set_title(
         f"League of {len(names)} checkpoints, {len(games)} games, {min(counts.values())}-{max(counts.values())} per model"
     )

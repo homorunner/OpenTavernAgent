@@ -256,6 +256,20 @@ pub struct Observation {
 pub fn observe_seat(game: &Game, seat: usize) -> Observation {
     let mut o = observe(game, seat);
     map_owned_trinkets(&game.players[seat], &mut o.cards);
+    // Combat fixes cap eligibility at recruit start, even if a player dies mid-turn.
+    let alive = match game.turn_alive {
+        0 => game.alive_count(),
+        n => n,
+    };
+    let player = &game.players[seat];
+    let protected = player.alive
+        && game
+            .cfg
+            .damage_cap(game.turn, alive)
+            .is_some_and(|cap| player.health.saturating_add(player.armor) > cap);
+    // Avoid doubling every observation's capacity for this one extra feature.
+    o.floats.reserve_exact(1);
+    o.floats.push(protected as u8 as f32);
     Observation {
         x: o.floats,
         cards: o.cards,

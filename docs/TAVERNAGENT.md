@@ -5,8 +5,8 @@ self-play. It is the Rust crate `crates/tavernagent` and the `tavernagent` binar
 on the `taverngym` crate directly and needs no Python. Checkpoints are numpy-readable `.npz`
 files, so weights stay inspectable from Python.
 
-The default model has **2,315,637 parameters**, with a linear policy head and a nonlinear
-value head. Model format is v11, trainer format is 9, and the search protocol is
+The default model has **2,317,685 parameters**, with a linear policy head and a nonlinear
+value head. Model format is v12, trainer format is 9, and the search protocol is
 `ended-state-v9-compact-play`.
 
 ## Commands
@@ -15,7 +15,7 @@ value head. Model format is v11, trainer format is 9, and the search protocol is
 cargo build --release -p tavernagent
 A=target/release/tavernagent
 
-# Train 100 rounds (128 roots per round, binary split before turn-4 combat;
+# Train 100 rounds (128 roots per round, binary split before turn-4 or turn-5 combat;
 # a third of decisions searched at 256 simulations; 2 epochs, constant lr 3e-5).
 $A selfplay --steps 100 --workers 32 --save-trainer-state --save-every 50 --out runs/agent/model.npz
 
@@ -52,8 +52,9 @@ Results do not depend on the thread count.
 ## Network and inputs
 
 ```
-1708 numeric features + 16 turn one-hot bits + 57 card slots x 32-dim card embedding + 116 mask bits
-  -> Linear(3664, 256) -> LayerNorm -> GELU
+1710 numeric features (including the safety bit) + 16 turn bits + 6 tier bits
+  + 57 card slots x 32-dim card embedding + 116 mask bits
+  -> Linear(3672, 256) -> LayerNorm -> GELU
   -> 6 pre-norm residual blocks:
        h <- h + scale * (W_down GELU(W_up LayerNorm(h) + b_up) + b_down)
        256 -> 384 -> 256
@@ -73,13 +74,24 @@ Results do not depend on the thread count.
   as depth increases.
   The residual scale remains 1, head norm remains off, and the policy head remains linear.
   The value hidden width is fixed at 128 and uses GELU.
-- The raw turn scalar (`turn / 20`) is replaced inside TavernAgent by 16 one-hot bits:
-  T1 through T15 have separate bins; T16 and later share the last bin. The engine
-  observation schema is unchanged; pre-game turn 0 maps to T1.
+- Turn uses 16 one-hot bits **plus the original `turn / 20` scalar** (17 features).
+  T1 through T15 have separate bins; T16 and later share the last bin. The scalar
+  keeps the actual turn, including T17+; pre-game turn 0 maps to the T1 bin.
+- Tavern Tier uses 6 one-hot bits **plus the original `tier / 7` scalar** (7 features).
+  Tiers 1–5 have separate bins; tiers 6 and 7 share the last bin, while the scalar
+  distinguishes them. Both one-hot groups enter the same input projection as the scalars.
+- An agent-only **damage-cap protection bit** is appended to the raw observation:
+  it is 1 for an alive player when a combat damage cap exists and current
+  **Health + Armor > cap**, and 0 otherwise. Equality is potentially lethal. It uses
+  the engine's rule and recruit-start survivor count: by default at least 5 players,
+  with caps 5 on T1–3, 10 on T4–7 and 15 from T8. It is recalculated for every observed
+  position, including ended-turn states; it does not predict future health spending
+  or encode Ice Block or other separate protection effects.
 - The 116-bit `agent_mask` enters the shared trunk as 0/1 features, so both policy and
   value can use legality. Training and inference use the same mask; ended states use
   an all-zero mask. The ended-turn flag remains in the original numeric input.
-- The environment exposes 3,235 floats and 124 card indices; the network drops the 1,519
+- The environment exposes 3,235 floats and 124 card indices. TavernAgent appends the
+  protection bit for 3,236 raw floats, without changing TavernGym. The network drops the 1,519
   historical-opponent-warband floats, the 49 historical warband card slots and three
   redundant global flags (hero selection, game over, the Tavern-wide freeze flag), keeping
   the opponents' public summaries and heroes.
@@ -212,10 +224,16 @@ mask, root visit distribution, the action played and the final placement reward
 `1 - 2 (placement - 1) / 7`. Each End Turn also records the ended position
 (`end_turn_effects` on a copy): no policy target, the same value label.
 
-**Tree rollouts.** Self-play defaults to `--split-turn 4`: each root splits once into
-two continuations after turn 4. `selfplay --split-turn "4,8"` splits each root into two
-continuations after turn 4 and each surviving continuation into two after turn 8. A split happens
-after all seats' end-of-turn effects and recruit eliminations, immediately before combat:
+**Tree rollouts.** Self-play defaults to `--split-turn "4/5"`: each root chooses
+turn 4 or turn 5 with equal probability and splits once into two continuations.
+Commas separate split turns within one schedule; slashes separate alternative schedules.
+For example, `--split-turn "4,8/5,9/6"` chooses `[4,8]`, `[5,9]` or `[6]`, each with
+probability 1/3. Choose once per root, and use that schedule for all its descendants.
+The selection uses a separate seed-derived random stream, so it is reproducible across
+thread counts and resume, without advancing the game's or search's random streams.
+A single schedule such as `--split-turn "4,8"` still splits after turns 4 and 8.
+A split happens after all seats' end-of-turn effects and recruit eliminations,
+immediately before combat:
 that turn's combat is already independent in the children. Both environment and policy/search
 random streams are reseeded deterministically per child. The shared prefix is stored once;
 its value labels average the two child subtree returns with probability 1/2 each. Thus,
@@ -226,16 +244,18 @@ keep the label expectation unchanged. Ended-position rows of the split turn belo
 the shared prefix.
 
 Every split multiplies **both policy and value sample weights** by the code constant
-`selfplay::SPLIT_SAMPLE_WEIGHT = 0.55` (no CLI option). For `4,8`, weights are 1, 0.55,
-and 0.3025 across the three stages. The multiplier affects training only, never the
-probabilities used to average labels; it gives each additional depth 1.1 times the
+`selfplay::SPLIT_SAMPLE_WEIGHT = 0.75` (no CLI option). For `4,8`, weights are 1, 0.75,
+and 0.5625 across the three stages. The multiplier affects training only, never the
+probabilities used to average labels; it gives each additional depth 1.5 times the
 aggregate sample weight when both children survive. `--games` still counts independent
 roots, and reported placement averages subtree returns per root. Replay draws remain
 uniform over stored rows; loss weighting applies after the draw. Collection cost and
 replay size grow with the continuations, while `--max-samples` still bounds each epoch's
 training draw. Splits execute depth first within each root, retaining parallel seat
 searches and parallel roots. Pass `--split-turn` without values for ordinary rollouts;
-turns must be positive, unique and increasing (for example `--split-turn "3,6,9"`).
+each schedule must be nonempty, with positive, unique, increasing turns
+(for example `--split-turn "3,6,9"`). Saved schedules are inherited on resume unless
+`--split-turn` is supplied again; old single-schedule trainer states remain readable.
 
 **Loss.** Policy cross-entropy against the (smoothed, `--policy-smoothing 0.05`) visit
 distribution, normalized by the sum of weights of rows with legal actions; `--value-weight`
@@ -255,7 +275,8 @@ of threads (`tests/training.rs` checks one against seven threads bit for bit). C
 **Data.** Every recorded search decision and ended position enters a replay window of
 `min(6, 3 + step / 200)` rounds (integer division using the cumulative training round):
 3 initially, 4 at round 200, 5 at 400, and 6 from 600. `--replay-rounds N` overrides
-this with a fixed window. Each epoch (`--epochs 2`) trains on a uniform draw of
+this with a fixed window. `--replay-start` and `--replay-max` change the growing
+window bounds; growth remains one round every 200 steps. Each epoch (`--epochs 2`) trains on a uniform draw of
 `--max-samples` (80,000) from the window. Tree rollouts add rows without increasing this
 training cap, so they also change the average reuse of a row at the same epoch count.
 
@@ -273,7 +294,7 @@ training cap, so they also change the average reuse of a row at the same epoch c
 | `--temperature-warm` (first `--warm-steps` 5) / `--temperature` | 0.5 / 0.5 |
 | `--root-temperature` / `--lcb-stdevs` / `--lcb-min-visit-prop` | 1.1 / 0 / 0.15 |
 | `--search-prob` / `--fpu-reduction` | 0.33 / 1.5 |
-| `--split-turn` | 4 (one binary split) |
+| `--split-turn` | 4/5 (one binary split, turn chosen uniformly per root) |
 | `--hidden` / `--blocks` / `--embedding-dim` | 256 / 6 / 32 |
 | `--value-weight` | 0.5 |
 | `--weight-decay` / `--clip` / `--ema-rounds` | 0.01 / 5.0 / 2 |
@@ -509,27 +530,70 @@ plateau under this recipe, with no sustained benefit from adding depth.
 
 ### v11 training results (2026-11-09–10)
 
-The four v11 runs used 6 blocks, lr=3e-5, E2, batch512, max-samples80k and splitT4.
-Latest EMA mean placements with 64 search simulations:
+The four v11 runs used 6 blocks, lr=3e-5, E2, batch512, max-samples80k and splitT4
+(child sample weight 0.55). Seed **444444444** led the comparison; the other three
+runs stopped near 1900–2000 steps. Their last teacher means were 1.640/1.816/1.600
+for seeds 555555555/666666666/777777777 (evaluated at steps 1900/1800/2000).
+The selected run stopped at **2836**, short of
+the original 3000-step target. EMA mean placements with 64 search simulations:
 
-| Seed | Eval step | Scripted | Teacher |
+| Step | Scripted | Teacher | Games per opponent |
 | ---: | ---: | ---: | ---: |
-| 444444444 | 2000 | 1.199 | 1.479 |
-| 555555555 | 1900 | 1.248 | 1.640 |
-| 666666666 | 1800 | 1.289 | 1.816 |
-| 777777777 | 2000 | 1.229 | 1.600 |
+| 500 | 1.428 | 2.167 | 5,120 |
+| 1000 | 1.306 | 1.898 | 3,072 / 2,560 |
+| 1500 | 1.237 | 1.647 | 16,384 |
+| 2000 | 1.199 | 1.479 | 3,072 |
+| 2400 | 1.188 | 1.439 | 16,384 |
+| 2600 | 1.178 | 1.410 | 16,384 |
+| 2800 | 1.181 | 1.418 | 12,288 |
 
-Each entry used 2,560–3,584 games. The first run leads overall and continues to
-improve: teacher placement was 1.654 at step1500. The earlier sampling variants
-have been retired; current training follows the selected run's ordinary policy
-actions throughout. Stopped the other runs at 1916/1898/2042 steps; only
-seed444444444 continues toward 3000. The network and checkpoint version remain v11.
-Retain step500/1000/1500 checkpoints and rolling latest inference/trainer state.
+Improvements became small around 2400–2600, with no sustained gain thereafter.
+On 12,288 shared seeds, teacher placement at 2800 minus 2600 was **+0.006**
+(95% CI **[-0.023, +0.036]**); late Arena ratings also fluctuated near 117–121 Elo.
+Retain **step2800 EMA** as the final v11 baseline, plus **step500 and step1000 EMA**.
+Training, evaluation and notifications are stopped; other experimental artifacts
+and trainer states have been removed. These retained weights use model format v11.
 
-A single-step timing check from the same step2040 state measured **35.9 s** with
-128 workers bound to one NUMA node, versus **27.7/29.2/39.5 s** unbound with
-256/512/1024 workers (rollout plus training). Continued with **256 search workers,
-128 gradient threads and no CPU/NUMA binding**; learning hyperparameters are unchanged.
+### v12 warm-start validation (2026-11-10)
+
+Migrated v11 step2500 EMA by copying existing weights and zeroing the eight new
+input rows. Policy/value outputs matched exactly on 967 positions. With fresh
+Adam, EMA and replay, trained 100 rounds at lr=3e-5, E2, batch512, max-samples80k,
+split4/5 and child weight 0.75. All 2,048 new weights learned; no numerical failures.
+On 512 paired seeds per opponent at 256 simulations, scripted placement changed
+**1.178 → 1.189**, teacher **1.381 → 1.500**; both difference intervals included zero.
+This verified training, without demonstrating a strength gain or isolating the input changes.
+
+On 8,192 sampled replay positions, zeroing the new rows changed the final shared
+representation by **4.04%** in weighted RMS and expected placement by **0.097** on
+average in absolute terms; the protection bit had the largest effect. This measures
+sensitivity, not playing-strength improvement. Also fixed observation-vector capacity
+doubling when appending the bit: identical first-round sampling fell from **85.6 s
+to 33.5 s**. Temporary v12 checkpoints, data and analysis scripts have been removed.
+
+### v12 replay-volume comparison (2026-11-10)
+
+Four 6-block runs start from the same v11 step2800 EMA, migrated to v12 with
+zero weights for the eight new inputs and fresh Adam, EMA and replay. All use seed
+444444444, lr=3e-5 without decay, E2, batch512, EMA2 rounds, 128 games/round,
+256 simulations, search probability .33, temperature .5, split4/5 and child weight .75.
+Each run has one NUMA node and 128 workers; the target is 2000 additional rounds.
+
+| Run | Replay window | Max samples per epoch | Updates per round |
+| --- | --- | ---: | ---: |
+| A | min(6, 3 + step/200) | 80,000 | 314 |
+| B | min(8, 4 + step/200) | 106,667 | 418 |
+| C | min(8, 4 + step/200) | 133,333 | 522 |
+| D | min(10, 5 + step/200) | 133,333 | 522 |
+
+Integer division applies to the window schedules. Keep batch size and learning rate
+fixed to compare replay retention and training draws; these settings do not generate
+more self-play games. Compare both equal rounds and elapsed time because larger draws
+also increase optimizer updates. EMA decay is adjusted to preserve its two-round window.
+No strength results yet. Every 100 rounds, evaluate raw and EMA against scripted and
+teacher bots (2048 games each, 64 simulations), independently of training. The league
+contains these checkpoints and one shared step0, always anchored at Elo1000; bootstrap
+intervals use the same anchor in every replicate. Progress cards run every 20 minutes.
 
 ## Open problems
 
@@ -541,16 +605,16 @@ A single-step timing check from the same step2040 state measured **35.9 s** with
   zone and position information. Current input projection remains per slot; simply
   pooling away warband order would discard strategically relevant information.
 
-Model/input experiment TODOs (discussion item numbers; initial priority: 1 → 4 → 3 → 2 → 5):
+Model/input experiment TODOs (discussion item numbers; initial priority: 1 → 3 → 2 → 5):
 
-1. Add key survival features: the current combat damage cap, lethal-damage protection
-   and effective health relative to the cap. Distinguish missing state from derived features.
+1. The damage-cap protection bit is implemented in v12. Consider also encoding the
+   cap itself and effective health relative to it; distinguish these from separate immunity effects.
 2. Shared shop-card encoding, sum pooling and a shared per-card Buy scorer; move the
    corresponding legality bits with each card. Test hand encoding separately, preserving
    meaningful hand order and the Play action's hand/board-position correspondence.
 3. Hide unfrozen shop cards in ended-turn observations, after end-of-turn effects resolve.
    Audit intervening effects and shared-pool dependencies before treating this as equivalent.
-4. One-hot encode Tavern Tier first; evaluate other small discrete state variables separately.
+4. Tavern Tier one-hot plus scalar is implemented in v12; evaluate other small discrete variables separately.
 5. Evaluate embedding initialization scale and representation sharing. The current trainable
    32-dimensional embeddings start from a normal distribution with standard deviation 0.1.
 6. **Hide spent trinkets from observations.** Once a one-shot effect is fully resolved

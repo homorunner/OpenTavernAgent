@@ -1,7 +1,7 @@
 //! A small pre-norm residual policy/value network with a shared card embedding.
 //!
 //! ```text
-//! numeric features + turn one-hot + card embeddings + legal mask
+//! numeric features + turn/tier one-hots + card embeddings + legal mask
 //!     -> 256 -> pre-norm FFN residual blocks
 //!     -> policy: Linear(256, 116)
 //!     -> value: Linear(256, 128) -> GELU -> Linear(128, 1) -> tanh
@@ -28,28 +28,33 @@ use crate::npz::{NpyArray, Npz};
 
 /// Compact policy layout; resolved to engine actions using the current state.
 pub const N_ACTIONS: usize = crate::actions::N_ACTIONS;
-pub const N_FEATURES: usize = o::OBS_FLOATS;
+/// Agent-only flag appended to the unchanged engine observation.
+pub const COMBAT_PROTECTED_FEATURE: usize = o::OBS_FLOATS;
+pub const N_FEATURES: usize = o::OBS_FLOATS + 1;
 pub const N_CARD_SLOTS: usize = o::OBS_CARDS;
 pub const DEFAULT_HIDDEN: usize = 256;
 pub const DEFAULT_EMBEDDING_DIM: usize = 32;
 pub const DEFAULT_BLOCKS: usize = 6;
-pub const MODEL_VERSION: i64 = 11;
+pub const MODEL_VERSION: i64 = 12;
 pub const TURN_BINS: usize = 16;
+pub const TIER_BINS: usize = 6;
+pub const ONE_HOT_FEATURES: usize = TURN_BINS + TIER_BINS;
 pub const VALUE_HIDDEN: usize = 128;
 pub const N_OPP_BOARD_SLOTS: usize = o::N_OPP * a::N_BOARD;
-pub const OPP_BOARD_FEATURE_START: usize = N_FEATURES - N_OPP_BOARD_SLOTS * o::MINION_F;
+pub const OPP_BOARD_FEATURE_START: usize = o::OBS_FLOATS - N_OPP_BOARD_SLOTS * o::MINION_F;
 /// The ended-turn flag: the seat has finished recruiting and has no legal action.
 pub const ENDED_TURN_FEATURE: usize = o::ENDED_TURN_F;
 /// Global flags the network never needs: hero selection (1), game over (2) and the
 /// Tavern-wide freeze flag (15, encoded per shop item instead).
 const EXCLUDED_GLOBALS: [usize; 3] = [1, 2, 15];
 
-/// Raw numeric features retained after the turn is replaced by TURN_BINS one-hot bits.
+/// Retain raw turn/tier scalars alongside their one-hot encodings and the safety flag.
 /// Historical opponent warbands, extra quests and three redundant global flags are omitted.
 pub fn input_feature_indices() -> Vec<usize> {
-    (1..OPP_BOARD_FEATURE_START)
+    (0..OPP_BOARD_FEATURE_START)
         .filter(|i| !EXCLUDED_GLOBALS.contains(i))
         .filter(|i| !(o::GLOBAL_F + o::QUEST_F..o::GLOBAL_F + o::N_QUESTS * o::QUEST_F).contains(i))
+        .chain(std::iter::once(COMBAT_PROTECTED_FEATURE))
         .collect()
 }
 
@@ -585,7 +590,7 @@ impl PolicyValueNet {
         if !(cfg.residual_scale > 0.0 && cfg.residual_scale <= 1.0) {
             return Err("residual_scale must be in (0, 1]".into());
         }
-        if N_FEATURES != 3235 || N_CARD_SLOTS != 124 {
+        if o::OBS_FLOATS != 3235 || N_CARD_SLOTS != 124 {
             return Err("observation schema changed; update the network".into());
         }
         let input_features = input_feature_indices();
@@ -605,7 +610,7 @@ impl PolicyValueNet {
             Mat::from_vec(rows, cols, data)
         };
         let he = |fan_in: usize| (2.0 / fan_in as f32).sqrt();
-        let in_dim = TURN_BINS + input_features.len() + card_slots.len() * d + N_ACTIONS;
+        let in_dim = ONE_HOT_FEATURES + input_features.len() + card_slots.len() * d + N_ACTIONS;
         let mut tensors = Vec::with_capacity(11 + 6 * cfg.blocks);
         let mut e = randn(n_cards, d, 0.1);
         for v in e.row_mut(0) {
@@ -660,7 +665,7 @@ impl PolicyValueNet {
     }
 
     pub fn n_input_features(&self) -> usize {
-        TURN_BINS + self.input_features.len()
+        ONE_HOT_FEATURES + self.input_features.len()
     }
 
     pub fn n_card_slots(&self) -> usize {
@@ -699,9 +704,15 @@ impl PolicyValueNet {
         // The engine keeps turn / 20 in x[0]. Round before converting to avoid
         // float truncation at integer boundaries; pre-game states use the T1 bin.
         let turn = (x[0] * 20.0).round().clamp(1.0, TURN_BINS as f32) as usize;
-        row[..TURN_BINS].fill(0.0);
+        row[..ONE_HOT_FEATURES].fill(0.0);
         row[turn - 1] = 1.0;
-        for (dst, &i) in row[TURN_BINS..n].iter_mut().zip(&self.input_features) {
+        // Tier 7 shares the final one-hot bin with tier 6; tier / 7 still distinguishes it.
+        let tier = (x[10] * 7.0).round().clamp(1.0, TIER_BINS as f32) as usize;
+        row[TURN_BINS + tier - 1] = 1.0;
+        for (dst, &i) in row[ONE_HOT_FEATURES..n]
+            .iter_mut()
+            .zip(&self.input_features)
+        {
             *dst = x[i];
         }
         for (s, &slot) in self.card_slots.iter().enumerate() {
@@ -1181,7 +1192,34 @@ mod input_tests {
     use super::*;
 
     #[test]
-    fn turn_one_hot_replaces_scalar_and_caps_at_sixteen() {
+    fn tier_one_hot_keeps_scalar_and_safety_flag() {
+        let net = PolicyValueNet::new(1, NetConfig::default()).unwrap();
+        let mut x = vec![0.0; N_FEATURES];
+        let cards = vec![0; N_CARD_SLOTS];
+        let mask = vec![false; N_ACTIONS];
+        let mut row = vec![99.0; net.p.tensors[W0].rows];
+        for tier in 1..=7 {
+            x[10] = tier as f32 / 7.0;
+            for protected in [0.0, 1.0] {
+                x[COMBAT_PROTECTED_FEATURE] = protected;
+                net.write_input(&x, &cards, &mask, &mut row, None).unwrap();
+                for (index, &value) in row[TURN_BINS..ONE_HOT_FEATURES].iter().enumerate() {
+                    assert_eq!(value, (index == tier.min(6) - 1) as u8 as f32);
+                }
+                for feature in [10, COMBAT_PROTECTED_FEATURE] {
+                    let offset = net
+                        .input_features
+                        .iter()
+                        .position(|&i| i == feature)
+                        .unwrap();
+                    assert_eq!(row[ONE_HOT_FEATURES + offset], x[feature]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn turn_one_hot_caps_at_sixteen_and_keeps_the_original_scalar() {
         let net = PolicyValueNet::new(1, NetConfig::default()).unwrap();
         let mut x = vec![0.0; N_FEATURES];
         x[7] = 0.8; // Other numeric features must keep their value and offset.
@@ -1196,7 +1234,11 @@ mod input_tests {
                 assert_eq!(*value, if index == expected { 1.0 } else { 0.0 });
             }
             assert_eq!(
-                row[TURN_BINS + net.input_features.iter().position(|&i| i == 7).unwrap()],
+                row[ONE_HOT_FEATURES + net.input_features.iter().position(|&i| i == 0).unwrap()],
+                turn as f32 / 20.0
+            );
+            assert_eq!(
+                row[ONE_HOT_FEATURES + net.input_features.iter().position(|&i| i == 7).unwrap()],
                 0.8
             );
         }
@@ -1206,7 +1248,7 @@ mod input_tests {
             net.infer_f32(&x, &cards, &mask).unwrap()
         };
         assert_ne!(infer(5), infer(6));
-        assert_eq!(infer(16), infer(17));
-        assert_eq!(infer(16), infer(100));
+        assert_ne!(infer(16), infer(17));
+        assert_ne!(infer(16), infer(100));
     }
 }

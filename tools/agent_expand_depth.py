@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Append identity residual FFN blocks to a v11 checkpoint; keep every existing tensor.
+"""Append identity residual FFN blocks to a v12 checkpoint; keep every existing tensor.
 
 New W_up is random, W_down and both biases are zero, LayerNorm gamma=1/beta=0.
 Thus the residual branch is zero initially, while W_down can learn on the first update.
@@ -20,8 +20,8 @@ def expand(source, destination, blocks, seed=444444444):
     with np.load(source, allow_pickle=False) as z:
         arrays = {k: z[k].copy() for k in z.files}
     meta = json.loads(arrays['meta'].tobytes())
-    if meta['version'] != 11:
-        raise ValueError('Only v11 pre-norm FFN checkpoints are supported')
+    if meta['version'] != 12:
+        raise ValueError('Only v12 pre-norm FFN checkpoints are supported')
     old = meta['blocks']
     if blocks < old:
         raise ValueError('Cannot remove existing blocks')

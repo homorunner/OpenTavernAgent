@@ -312,7 +312,7 @@ fn full_trainer_snapshot_restores_optimizer_rng_and_replay_exactly() {
     let (game, decision) = batch();
     let mut end = ended_sample(&game, 0).unwrap();
     end.z = -0.5;
-    end.weight = 0.55;
+    end.weight = 0.75;
     let hparams = OptimizerHparams {
         wd: 0.02,
         clip: 2.0,
@@ -701,14 +701,14 @@ fn split_training_resumes_with_saved_schedule_and_weights() {
     let args = |name: &str, steps| SelfplayArgs {
         hidden: 16,
         blocks: 1,
-        split_turn: vec![4, 8],
+        split_turn: vec![vec![4, 8], vec![5, 9]],
         ..selfplay_args(dir.join(name), steps)
     };
     train::run(args("full.npz", 2), &HashSet::new()).unwrap();
     train::run(args("split.npz", 1), &HashSet::new()).unwrap();
     let mut resumed = args("ignored.npz", 2);
     resumed.resume_state = Some(dir.join("split.trainer.npz"));
-    resumed.split_turn.clear(); // Not explicitly provided: inherit the saved 4,8.
+    resumed.split_turn.clear(); // Not explicitly provided: inherit the saved 4,8/5,9.
     train::run(
         resumed,
         &HashSet::from(["steps".into(), "resume_state".into()]),
@@ -722,10 +722,42 @@ fn split_training_resumes_with_saved_schedule_and_weights() {
         }
     }
     let meta = tavernagent::selfplay::read_training_meta(&dir.join("split.trainer.npz")).unwrap();
-    assert_eq!(meta.options["split_turn"], serde_json::json!([4, 8]));
+    assert_eq!(
+        meta.options["split_turn"],
+        serde_json::json!([[4, 8], [5, 9]])
+    );
     let weights = b.get("replay/0/weight").unwrap().as_f32().unwrap();
-    assert!(weights.contains(&1.0) && weights.contains(&0.55) && weights.contains(&(0.55 * 0.55)));
+    assert!(weights.contains(&1.0) && weights.contains(&0.75) && weights.contains(&(0.75 * 0.75)));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn split_schedule_choice_is_uniform_seeded_and_pool_independent() {
+    use tavernagent::selfplay::choose_split_turns;
+    let schedules = vec![vec![4, 8], vec![5, 9], vec![6]];
+    let mut counts = [0; 3];
+    for seed in 0..10_000 {
+        let chosen = choose_split_turns(&schedules, seed);
+        assert_eq!(chosen, choose_split_turns(&schedules, seed));
+        counts[schedules.iter().position(|s| s == chosen).unwrap()] += 1;
+    }
+    assert!(
+        counts.iter().all(|n| (3000..3700).contains(n)),
+        "{counts:?}"
+    );
+    assert!(choose_split_turns(&[], 31).is_empty());
+    let single = vec![vec![4, 8]];
+    assert_eq!(choose_split_turns(&single, 31), &[4, 8]);
+    let mut opts = play_options(2);
+    opts.split_turn = choose_split_turns(&schedules, 31).to_vec();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    assert_eq!(
+        play_one(&EndOrFirst, 31, &opts, None).unwrap(),
+        play_one(&EndOrFirst, 31, &opts, Some(&pool)).unwrap()
+    );
 }
 
 #[test]
@@ -742,11 +774,11 @@ fn split_turn_cli_and_required_saved_options() {
             .unwrap()
             .args
             .split_turn,
-        vec![4, 8]
+        vec![vec![4, 8]]
     );
     assert_eq!(
         Cli::try_parse_from(["test"]).unwrap().args.split_turn,
-        vec![4]
+        vec![vec![4], vec![5]]
     );
     assert!(
         Cli::try_parse_from(["test", "--split-turn", "--steps", "1"])
@@ -755,12 +787,38 @@ fn split_turn_cli_and_required_saved_options() {
             .split_turn
             .is_empty()
     );
-    assert!(Cli::try_parse_from(["test", "--split-turn", "4,no"]).is_err());
+    assert_eq!(
+        Cli::try_parse_from(["test", "--split-turn", "4,8/5,9/6"])
+            .unwrap()
+            .args
+            .split_turn,
+        vec![vec![4, 8], vec![5, 9], vec![6]]
+    );
+    for invalid in ["4,no", "4/", "/5", "4//5", "4,", "0/5", "8,4/5", "4,4/5"] {
+        assert!(
+            Cli::try_parse_from(["test", "--split-turn", invalid]).is_err(),
+            "{invalid}"
+        );
+    }
     assert!(validate_split_turns(&[3, 6, 9]).is_ok());
     for turns in [&[0][..], &[4, 4], &[8, 4]] {
         assert!(validate_split_turns(turns).is_err());
     }
     let mut saved = serde_json::to_value(SelfplayArgs::default()).unwrap();
+    saved["split_turn"] = serde_json::json!([4, 8]);
+    assert_eq!(
+        serde_json::from_value::<SelfplayArgs>(saved.clone())
+            .unwrap()
+            .split_turn,
+        vec![vec![4, 8]]
+    );
+    saved["split_turn"] = serde_json::json!([]);
+    assert!(
+        serde_json::from_value::<SelfplayArgs>(saved.clone())
+            .unwrap()
+            .split_turn
+            .is_empty()
+    );
     saved.as_object_mut().unwrap().remove("split_turn");
     assert!(serde_json::from_value::<SelfplayArgs>(saved).is_err());
 }
@@ -852,7 +910,7 @@ fn training_step_does_not_depend_on_the_thread_count() {
             mask: obs.mask,
             pi,
             z: 1.0 - 2.0 * (seed % 8) as f32 / 7.0,
-            weight: 0.55f32.powi((seed % 3) as i32),
+            weight: 0.75f32.powi((seed % 3) as i32),
             action: -1,
         });
     }

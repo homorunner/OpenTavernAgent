@@ -16,12 +16,48 @@ use crate::probe;
 use crate::rules::Budgets;
 use crate::selfplay::{
     OptimizerHparams, PlayOptions, ReplayWindow, Sample, Stats, StepOptions, Trainer,
-    TrainingState, cosine_lr, ema_decay_for_window, load_training_state, play_one,
-    read_training_meta, save_training_state, train_epoch, validate_split_turns,
+    TrainingState, choose_split_turns, cosine_lr, ema_decay_for_window, load_training_state,
+    play_one, read_training_meta, save_training_state, train_epoch, validate_split_turns,
 };
 
 const fn default_save_trainer_every() -> usize {
     10
+}
+
+const fn default_replay_start() -> usize {
+    3
+}
+
+const fn default_replay_max() -> usize {
+    6
+}
+
+fn parse_split_turns(value: &str) -> Result<Vec<u32>, String> {
+    let turns = value
+        .split(',')
+        .map(|v| {
+            v.trim()
+                .parse::<u32>()
+                .map_err(|_| format!("invalid split turn: {v:?}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_split_turns(&turns)?;
+    Ok(turns)
+}
+
+fn deserialize_split_schedules<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Vec<u32>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Schedules {
+        Multiple(Vec<Vec<u32>>),
+        Single(Vec<u32>),
+    }
+    Ok(match Schedules::deserialize(deserializer)? {
+        Schedules::Multiple(schedules) => schedules,
+        Schedules::Single(turns) => vec![turns],
+    })
 }
 
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
@@ -39,10 +75,12 @@ pub struct SelfplayArgs {
     /// network prior at the play temperature and are not training rows.
     #[arg(long, default_value_t = 0.33)]
     pub search_prob: f32,
-    /// Binary splits after these turns' end effects, before combat (e.g. 4,8).
+    /// Choose one binary split schedule uniformly per root (e.g. 4,8/5,9/6).
+    /// Commas separate turns; slashes separate schedules. Split after end effects, before combat.
     /// Pass --split-turn without values to disable splitting.
-    #[arg(long, value_delimiter = ',', num_args = 0.., default_value = "4")]
-    pub split_turn: Vec<u32>,
+    #[arg(long, value_delimiter = '/', num_args = 0.., default_value = "4/5", value_parser = parse_split_turns)]
+    #[serde(deserialize_with = "deserialize_split_schedules")]
+    pub split_turn: Vec<Vec<u32>>,
     /// Training passes per round; each draws `max_samples` from the replay window.
     #[arg(long, default_value_t = 2)]
     pub epochs: usize,
@@ -131,9 +169,17 @@ pub struct SelfplayArgs {
     /// Start from these weights (optimizer and step count start over).
     #[arg(long)]
     pub resume: Option<PathBuf>,
-    /// Fixed replay window override; otherwise min(6, 3 + step / 200) rounds.
+    /// Fixed replay window override; otherwise min(replay-max, replay-start + step / 200).
     #[arg(long)]
     pub replay_rounds: Option<usize>,
+    /// Initial capacity of the growing replay window, in self-play rounds.
+    #[arg(long, default_value_t = default_replay_start())]
+    #[serde(default = "default_replay_start")]
+    pub replay_start: usize,
+    /// Maximum capacity; the growing replay window adds one round every 200 steps.
+    #[arg(long, default_value_t = default_replay_max())]
+    #[serde(default = "default_replay_max")]
+    pub replay_max: usize,
     /// Length of the cosine schedule in rounds (0 = constant learning rate).
     #[arg(long, default_value_t = 0)]
     pub lr_decay_steps: usize,
@@ -175,7 +221,11 @@ impl SelfplayArgs {
 
     /// Capacity at the cumulative training round (integer division).
     pub fn replay_capacity(&self, step: usize) -> usize {
-        self.replay_rounds.unwrap_or(3 + (step / 200).min(3))
+        self.replay_rounds.unwrap_or(
+            self.replay_start
+                .saturating_add(step / 200)
+                .min(self.replay_max),
+        )
     }
 
     pub fn net_config(&self) -> NetConfig {
@@ -204,7 +254,12 @@ impl SelfplayArgs {
     }
 
     fn validate(&self) -> Result<(), String> {
-        validate_split_turns(&self.split_turn)?;
+        for turns in &self.split_turn {
+            if turns.is_empty() {
+                return Err("split-turn schedules must not be empty".into());
+            }
+            validate_split_turns(turns)?;
+        }
         if [
             self.steps,
             self.games,
@@ -242,6 +297,11 @@ impl SelfplayArgs {
         }
         if self.replay_rounds == Some(0) {
             return Err("replay-rounds must be positive".into());
+        }
+        if self.replay_start == 0 || self.replay_max < self.replay_start {
+            return Err(
+                "replay-start must be positive and replay-max must be >= replay-start".into(),
+            );
         }
         if self.save_trainer_every == 0 {
             return Err("save-trainer-every must be positive".into());
@@ -419,13 +479,17 @@ pub fn run(mut args: SelfplayArgs, provided: &HashSet<String>) -> Result<(), Str
             temperature,
             budgets: args.budgets,
             search_prob: args.search_prob,
-            split_turn: args.split_turn.clone(),
+            split_turn: Vec::new(),
         };
         let seeds: Vec<u64> = (0..args.games as u64)
             .map(|i| args.seed + step as u64 * 10_000 + i)
             .collect();
         let net_ref = &trainer.net;
         let one_game = |seed: u64| -> Result<(Vec<Sample>, f32, usize), String> {
+            let play = PlayOptions {
+                split_turn: choose_split_turns(&args.split_turn, seed).to_vec(),
+                ..play.clone()
+            };
             let (samples, place) = play_one(net_ref, seed, &play, Some(&pool))
                 .map_err(|e| format!("self-play seed={seed}: {e}"))?;
             let decisions = samples.len();
@@ -690,6 +754,48 @@ mod tests {
     }
 
     #[test]
+    fn larger_replay_schedules_and_sampling_budgets_resume_with_saved_options() {
+        for (start, end, samples, updates) in [
+            (4, 8, 106_667, 418),
+            (4, 8, 133_333, 522),
+            (5, 10, 133_333, 522),
+        ] {
+            let args = SelfplayArgs {
+                replay_start: start,
+                replay_max: end,
+                max_samples: samples,
+                ..SelfplayArgs::default()
+            };
+            assert!(args.validate().is_ok());
+            assert_eq!(args.replay_capacity(0), start);
+            assert_eq!(args.replay_capacity(199), start);
+            assert_eq!(args.replay_capacity(200), start + 1);
+            assert_eq!(args.replay_capacity(200 * (end - start) - 1), end - 1);
+            assert_eq!(args.replay_capacity(200 * (end - start)), end);
+            assert_eq!(args.replay_capacity(usize::MAX), end);
+            assert_eq!(args.updates_per_round(), updates);
+            let saved = serde_json::to_value(&args).unwrap();
+            let inherited = SelfplayArgs::default()
+                .inherit(&saved, &HashSet::new())
+                .unwrap();
+            assert_eq!(inherited.replay_capacity(200), start + 1);
+            assert_eq!(inherited.replay_capacity(2000), end);
+            assert_eq!(inherited.updates_per_round(), updates);
+        }
+        for (start, end) in [(0, 6), (5, 4)] {
+            assert!(
+                SelfplayArgs {
+                    replay_start: start,
+                    replay_max: end,
+                    ..SelfplayArgs::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn constant_lr_allows_rates_below_the_unused_cosine_minimum() {
         let mut args = SelfplayArgs {
             lr: 1e-5,
@@ -717,7 +823,7 @@ mod tests {
             args.inherit(&saved, &HashSet::from(["split_turn".into()]))
                 .unwrap()
                 .split_turn,
-            vec![4]
+            vec![vec![4], vec![5]]
         );
         saved.as_object_mut().unwrap().remove("split_turn");
         assert!(args.inherit(&saved, &HashSet::new()).is_err());

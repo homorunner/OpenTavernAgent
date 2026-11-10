@@ -58,7 +58,7 @@ fn two_ordinary_slots_with_power_and_reward_sources_are_observation_only() {
     expected[TRINKET_SLOT_START..TRINKET_SLOT_START + 8].fill(0);
     expected[TRINKET_SLOT_START..TRINKET_SLOT_START + 2].fill(index(ordinary));
     assert_eq!(obs.cards, expected);
-    assert_eq!(obs.x, raw.floats);
+    assert_eq!(&obs.x[..raw.floats.len()], &raw.floats);
     assert_eq!(serde_json::to_value(&g).unwrap(), before);
     assert_eq!(g.players[0].trinkets.len(), 4);
     assert_eq!(OWNED_TRINKET_SLOTS, 2);
