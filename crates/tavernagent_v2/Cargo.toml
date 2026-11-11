@@ -1,0 +1,28 @@
+[package]
+name = "tavernagent_v2"
+description = "FP32 actor-critic self-play with PPO-Clip and GAE over TavernGym"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+taverngym = { path = "../taverngym" }
+matrixmultiply = { version = "0.3", features = ["avx512"] }
+rayon = "1.10"
+rand = "0.9"
+rand_distr = "0.5"
+rand_pcg = { version = "0.9", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zip = { version = "2", default-features = false }
+clap = { version = "4.5", features = ["derive"] }
+tikv-jemallocator = "0.7"
+
+[dev-dependencies]
+tavernagent = { path = "../tavernagent" }
+
+[[bin]]
+name = "tavernagent_v2"
+path = "src/bin/tavernagent_v2.rs"

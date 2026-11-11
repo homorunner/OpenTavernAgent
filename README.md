@@ -166,6 +166,7 @@ action selection. [Implementation, options and recent results](docs/TAVERNAGENT.
 | [TavernGym](docs/TAVERNGYM.md) | Game APIs, batched environments, observations, actions, configuration and speed. |
 | [TavernBench](docs/TAVERNBENCH.md) | Dataset layout, labels, scoring, model runners, tool use and reproduction notes. |
 | [TavernAgent](docs/TAVERNAGENT.md) | Network, search, self-play training, evaluation commands and experiment results. |
+| [TavernAgent v2](docs/TAVERNAGENT_V2.md) | PPO-Clip + GAE implementation, training, evaluation and experiment results (Chinese). |
 | [Architecture](docs/ARCHITECTURE.md) | Engine structure, interfaces and how the components fit together. |
 | [Content coverage](docs/CONTENT.md) | Implemented minions, heroes, spells, trinkets and other game objects. |
 | [Timewarp](docs/TIMEWARP.md) | The Timewarped Tavern (off by default in 37.0.2; two heroes still visit it). |

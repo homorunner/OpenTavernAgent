@@ -126,12 +126,13 @@ pip install ".[bench]"
 
 ## 文档
 
-下列详细技术文档目前为英文：
+详细技术文档如下；除 TavernAgent v2 外，主要为英文：
 
 | 文档 | 内容 |
 | :--- | :--- |
 | [TavernGym](docs/TAVERNGYM.md) | 游戏 API、批量环境、观测、动作与配置。 |
 | [TavernBench](docs/TAVERNBENCH.md) | 数据布局、标签、评分、模型运行器与工具调用。 |
+| [TavernAgent v2](docs/TAVERNAGENT_V2.md) | PPO-Clip + GAE 实现、训练评估、并发配置与实验结果。 |
 | [引擎架构](docs/ARCHITECTURE.md) | 引擎结构、接口与模块协作。 |
 | [内容覆盖](docs/CONTENT.md) | 已实现的随从、英雄、法术、饰品等。 |
 | [时空酒馆](docs/TIMEWARP.md) | 当前默认关闭的时空酒馆系统；部分英雄仍可进入。 |

@@ -1,5 +1,9 @@
 # TavernAgent
 
+**Archived on 2026-11-11.** All v1 experiments and scheduled jobs are stopped;
+experimental models and data have been removed. Final experiment results are recorded below.
+The descriptions below are historical. [PPO/v2](TAVERNAGENT_V2.md) is a separate project.
+
 TavernAgent is a policy/value network with PUCT search over TavernGym, trained by all-seat
 self-play. It is the Rust crate `crates/tavernagent` and the `tavernagent` binary; it depends
 on the `taverngym` crate directly and needs no Python. Checkpoints are numpy-readable `.npz`
@@ -133,9 +137,8 @@ Results do not depend on the thread count.
   BF16-weight/FMA; the final 128-to-1 value projection uses an FP32 dot product.
   Packed dot weights are built lazily and invalidated by `params_changed` along with
   the other inference weights. Training stays FP32; `infer_f32` is the exact reference.
-- BF16 reduces weight traffic, but does **not** guarantee L2 residency. The experiment
-  CPU has 1 MiB L2 per physical core; the default model's BF16 matrix weights alone
-  exceed it. Active input rows, shared L3, model depth and concurrency all affect speed.
+- BF16 reduces weight traffic, but does **not** guarantee cache residency.
+  Cache capacity, active input rows, model depth and concurrency all affect speed.
   Native BF16 also introduces activation rounding; verify value error, policy KL and
   action margins on trained checkpoints, not just initialized weights.
 - Reproduce the FMA/native-BF16 and fresh/reused-workspace comparison with
@@ -145,11 +148,10 @@ Results do not depend on the thread count.
   it measures network inference, not complete search or self-play throughput.
 
 
-On experiment (EPYC 9976), a 128-thread, 71-observation preflight measured **2.42M →
-2.62M predictions/s** for six blocks and **1.16M → 1.40M/s** for twelve blocks when
-switching the reusable-workspace FFN kernel from FMA to native BF16. These are short
-network-only benchmarks. The allocation test proves zero intermediate allocations;
-fresh/reused timing differences were small or noisy, so no allocator speedup is claimed.
+The allocation test proves zero intermediate allocations with workspace reuse.
+Fresh/reused timing differences in short network-only benchmarks were small or
+noisy, so no allocator speedup is claimed. Benchmark FMA and native BF16 on the
+target platform before choosing a kernel.
 On a 12-block checkpoint after eight small training rounds, native BF16's maximum
 value error versus FP32 was **0.00244**, mean policy KL **2.09e-7**, with no policy argmax
 flips across those observations. Long-trained checkpoint precision still needs monitoring.
@@ -365,12 +367,11 @@ evaluation; the last evaluated checkpoints were rounds 2500 and 3000 respectivel
 
 ### Tree rollout / batch / epochs comparison (2026-11-06–07)
 
-Four runs on `experiment`, from commit `3eb0302` and identical initial weights:
+Four runs from commit `3eb0302` and identical initial weights:
 A = batch 512 / epochs 1, B = 1024 / 1, C = 512 / 2, D = 1024 / 2.
 All completed 3,000 rounds with 128 roots/round, split-turn=4 (child weight 0.55),
 256 simulations, 128 workers, replay 5, max-samples 65,536, constant lr=3e-5,
-temperature=1, FPU=1.5, LCB=0 and seed 444444444. Remote raw artifacts were
-removed in the 2026-11-07 cleanup.
+temperature=1, FPU=1.5, LCB=0 and seed 444444444.
 
 **Data utilization decreased.** Early collection produces roughly 140k rows/round
 versus 78k without splitting, but each epoch still draws only 65,536 rows from replay.
@@ -423,11 +424,9 @@ because split-prefix labels average continuations and training uses sample weigh
 All 90 scheduled evaluations completed successfully, alongside the additional arenas
 and diagnostics.
 
-### Borrowed-VM parameter campaign (2026-11-06–07)
+### Parameter campaign (2026-11-06–07)
 
-Finished at **Nov 7 10:55 CST**, ahead of the noon deadline. The final audit reached
-all **310 borrowed hosts** and verified no experiment directories or related processes
-remained. One timed-out FPU replicate was excluded from complete-group analyses.
+One timed-out FPU replicate was excluded from complete-group analyses.
 
 A 100-setting C_PUCT / temperature / noise grid used three training seeds per setting;
 important candidates received five- or ten-seed follow-ups. The table below uses ten
@@ -481,7 +480,7 @@ campaign compared network depth with E2 and constant lr=3e-5.
 Trained four v10 models from scratch on TavernGym 37.0.2, comparing **6/8/10/12
 blocks** at width256, embedding32 and FFN width384. All used 128 roots, sims256,
 search probability .33, splitT4, E2, lr3e-5, batch512, max-samples80k and replay3→6.
-Each run had 128 physical cores and one training seed.
+Each run used one training seed.
 
 At the common **800-round** checkpoint, EMA evaluation with 64 search simulations
 produced the following mean placements (lower is better). Teacher is the AutoTavern
@@ -550,9 +549,9 @@ the original 3000-step target. EMA mean placements with 64 search simulations:
 Improvements became small around 2400–2600, with no sustained gain thereafter.
 On 12,288 shared seeds, teacher placement at 2800 minus 2600 was **+0.006**
 (95% CI **[-0.023, +0.036]**); late Arena ratings also fluctuated near 117–121 Elo.
-Retain **step2800 EMA** as the final v11 baseline, plus **step500 and step1000 EMA**.
-Training, evaluation and notifications are stopped; other experimental artifacts
-and trainer states have been removed. These retained weights use model format v11.
+**Step2800 EMA** was selected as the final v11 baseline, with **step500 and step1000 EMA**
+retained for comparison at the time. These used model format v11; all were subsequently
+removed when v1 experiments were archived.
 
 ### v12 warm-start validation (2026-11-10)
 
@@ -577,7 +576,7 @@ Four 6-block runs start from the same v11 step2800 EMA, migrated to v12 with
 zero weights for the eight new inputs and fresh Adam, EMA and replay. All use seed
 444444444, lr=3e-5 without decay, E2, batch512, EMA2 rounds, 128 games/round,
 256 simulations, search probability .33, temperature .5, split4/5 and child weight .75.
-Each run has one NUMA node and 128 workers; the target is 2000 additional rounds.
+The original target was 2000 additional rounds.
 
 | Run | Replay window | Max samples per epoch | Updates per round |
 | --- | --- | ---: | ---: |
@@ -590,10 +589,51 @@ Integer division applies to the window schedules. Keep batch size and learning r
 fixed to compare replay retention and training draws; these settings do not generate
 more self-play games. Compare both equal rounds and elapsed time because larger draws
 also increase optimizer updates. EMA decay is adjusted to preserve its two-round window.
-No strength results yet. Every 100 rounds, evaluate raw and EMA against scripted and
-teacher bots (2048 games each, 64 simulations), independently of training. The league
-contains these checkpoints and one shared step0, always anchored at Elo1000; bootstrap
-intervals use the same anchor in every replicate. Progress cards run every 20 minutes.
+The planned protocol evaluated raw and EMA every 100 rounds against scripted and
+teacher bots (2048 games each, 64 simulations), independently of training. League
+comparisons used a shared step0 anchored at Elo1000, including in bootstrap replicates.
+This section records the original protocol; the final experiment results follow.
+
+### Final experiment — archived 2026-11-11
+
+Development and experiments are closed. All v1 training, evaluation and notification
+jobs are stopped. Experiment checkpoints, replay, logs, binaries and temporary
+workspaces are removed, including the previously retained v11/v12 starting models.
+Repository source and history remain; the separate PPO/v2 work is unaffected.
+
+The final four runs started from the same v12 step0 migrated from v11 step2800 EMA.
+They used C_PUCT **0.1/0.2/0.5/1**, root FPU0, non-root FPU0.1, 64 simulations,
+search probability .33 and Refresh N=8. All completed **200 steps**.
+Other settings: lr3e-5, E2, batch512, max-samples80k, replay min(6,3+step/200),
+noise .2, alpha .3, root temperature1.1, policy smoothing .05 and split4/5.
+
+Final EMA results, using a shared evaluation recipe (64 simulations, C_PUCT1.9,
+root FPU .25, non-root FPU .5, Refresh N=16):
+
+| Training C_PUCT | Scripted placement | Teacher placement | Games per opponent | Arena Elo, approx. |
+| ---: | ---: | ---: | ---: | ---: |
+| 0.1 | 1.482 | 2.217 | 3584 | 866 |
+| 0.2 | 1.377 | 1.910 | 3584 | 921 |
+| 0.5 | 1.256 | 1.643 | 3072 | 957 |
+| 1 | 1.349 | 1.949 | 3072 | 900 |
+
+Step0 was approximately **1.180/1.461** against scripted/teacher, anchored at
+Elo1000. All four runs regressed; reducing C_PUCT did not solve the training problem.
+
+A separate frozen-step0 evaluation used root FPU0, non-root FPU0.1 and Refresh N=8.
+At 8192 games per opponent, practical search settings gave:
+
+| Simulations / C_PUCT | Scripted placement | Teacher placement |
+| --- | ---: | ---: |
+| Greedy policy action | 1.1974 | 1.4896 |
+| 64 / 1.9 | 1.1855 | 1.4645 |
+| 256 / 3.8 | 1.1910 | 1.4257 |
+| 1024 / 7.6 | 1.1902 | 1.4325 |
+
+Small C with more search often worsened play. The working hypothesis is that search
+amplifies action-value estimation errors and produces harmful policy targets;
+the experiments do not isolate the value head as the sole cause.
+
 
 ## Open problems
 
