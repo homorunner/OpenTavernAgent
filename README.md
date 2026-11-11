@@ -159,6 +159,11 @@ seats self-play; training uses AdamW, a replay window and EMA weights. Defaults 
 constant learning rate of 3e-5, one binary rollout split before turn-4 combat, and visit-count
 action selection. [Implementation, options and recent results](docs/TAVERNAGENT.md).
 
+The separate `crates/tavernagent_v2` trains with PPO-Clip + GAE and FP32 inference.
+It supports a CPU backend and an optional CUDA backend for forward/backward passes and
+AdamW, plus checkpoint leagues with relative Elo ratings. See the unified
+[TavernAgent v2 guide](docs/TAVERNAGENT_V2.md) for training, evaluation and notifications.
+
 ## Documentation
 
 | Guide | Contents |

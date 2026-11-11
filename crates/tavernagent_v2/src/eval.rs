@@ -35,6 +35,12 @@ impl Opponent {
 
 #[derive(Debug, Args)]
 pub struct EvalArgs {
+    #[arg(long,value_enum,default_value_t=crate::backend::Backend::Cpu)]
+    pub backend: crate::backend::Backend,
+    #[arg(long, default_value_t = 0)]
+    pub device: usize,
+    #[arg(long, default_value_t = 64)]
+    pub inference_batch: usize,
     #[arg(long)]
     pub model: PathBuf,
     #[arg(long, default_value_t = 128)]
@@ -157,21 +163,36 @@ pub fn run(args: EvalArgs) -> Result<(), String> {
         .num_threads(args.workers)
         .build()
         .map_err(|e| e.to_string())?;
-    let games = pool.install(|| {
-        seeds
-            .par_iter()
-            .map(|&seed| {
-                play_detailed(
-                    &trainer.net,
-                    seed,
-                    &cfg,
-                    args.sample,
-                    args.opponent,
-                    state.options.policy_rules,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-    })?;
+    let games = if args.backend == crate::backend::Backend::Cuda {
+        let execution = crate::backend::Execution::new(args.backend, &trainer, args.device)?;
+        crate::batched_eval::evaluate(
+            &trainer.net,
+            &execution,
+            &seeds,
+            &cfg,
+            state.options.policy_rules,
+            args.opponent,
+            args.sample,
+            args.inference_batch,
+            &pool,
+        )?
+    } else {
+        pool.install(|| {
+            seeds
+                .par_iter()
+                .map(|&seed| {
+                    play_detailed(
+                        &trainer.net,
+                        seed,
+                        &cfg,
+                        args.sample,
+                        args.opponent,
+                        state.options.policy_rules,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?
+    };
     let places: Vec<_> = games.iter().map(|g| g.placement).collect();
     let turn_limit_games = games.iter().filter(|g| g.turn_limit_end).count();
     let truncated_combats: u64 = games.iter().map(|g| u64::from(g.truncated_combats)).sum();
@@ -191,7 +212,7 @@ pub fn run(args: EvalArgs) -> Result<(), String> {
         0.0
     };
     let result = json!({"model": args.model, "iteration": state.iteration, "games": args.games,
-        "seed": args.seed, "sample": args.sample, "inference": "fp32", "opponent": args.opponent.name(),
+        "seed": args.seed, "sample": args.sample, "inference": "fp32", "backend":args.backend,"opponent": args.opponent.name(),
         "model_seed": state.options.seed, "evaluated_seat": 0, "policy_rules":state.options.policy_rules,
         "diagnostics":diagnostics, "turn_limit_games":turn_limit_games,"truncated_combats":truncated_combats,
         "mean_placement": mean, "standard_error": standard_error,

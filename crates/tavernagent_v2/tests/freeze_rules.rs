@@ -137,6 +137,7 @@ fn fork_preserves_weights_adam_rng_and_counters_and_old_metadata_defaults_off() 
     let parent = dir.join("parent.npz");
     let child = dir.join("child.npz");
     train::train(train::TrainArgs {
+        device: 0,
         iterations: 1,
         workers: 1,
         out: parent.clone(),
@@ -152,7 +153,7 @@ fn fork_preserves_weights_adam_rng_and_counters_and_old_metadata_defaults_off() 
         },
     })
     .unwrap();
-    // Recreate the old schema: the policy_rules field did not exist in its metadata.
+    // Recreate the old schema: policy_rules and backend were absent.
     let mut npz = tavernagent_v2::npz::Npz::load(&parent).unwrap();
     // Preserve the exact u128 RNG state; serde_json::Value would round it via f64.
     let meta = npz
@@ -164,11 +165,13 @@ fn fork_preserves_weights_adam_rng_and_counters_and_old_metadata_defaults_off() 
             ",\"policy_rules\":{\"block_consecutive_freeze\":false}",
             "",
             1,
-        );
+        )
+        .replacen("\"backend\":\"cpu\",", "", 1);
     npz.insert("trainer_meta", tavernagent_v2::npz::NpyArray::text(&meta));
     npz.save(&parent).unwrap();
     let (before, old) = checkpoint::load(&parent).unwrap();
     assert!(!old.options.policy_rules.block_consecutive_freeze);
+    assert_eq!(old.options.backend, tavernagent_v2::backend::Backend::Cpu);
     train::fork(train::ForkArgs {
         checkpoint: parent.clone(),
         out: child.clone(),
@@ -198,6 +201,8 @@ fn fork_preserves_weights_adam_rng_and_counters_and_old_metadata_defaults_off() 
         .is_err()
     );
     train::resume(train::ResumeArgs {
+        backend: None,
+        device: 0,
         checkpoint: child.clone(),
         iterations: 2,
         workers: 2,

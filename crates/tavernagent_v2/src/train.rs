@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use taverngym::RulesConfig;
 
+use crate::backend::{Backend, Execution};
 use crate::checkpoint::{self, RunState};
 use crate::net::{Activation, NetConfig, PolicyValueNet};
 use crate::ppo::{self, PpoOptions, Trainer};
@@ -18,6 +19,10 @@ use crate::rules::{ActionCounts, Budgets, PolicyRules};
 
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
 pub struct TrainOptions {
+    /// CPU reference or FP32 CUDA network/optimizer; stored for consistent resume.
+    #[serde(default)]
+    #[arg(long,value_enum,default_value_t=Backend::Cpu)]
+    pub backend: Backend,
     /// Complete eight-seat self-play games collected with each fixed policy.
     #[arg(long, default_value_t = 64)]
     pub games: usize,
@@ -111,6 +116,8 @@ impl TrainOptions {
 
 #[derive(Debug, Args)]
 pub struct TrainArgs {
+    #[arg(long, default_value_t = 0)]
+    pub device: usize,
     /// Zero writes an untrained checkpoint for baseline evaluation.
     #[arg(long, default_value_t = 200)]
     pub iterations: usize,
@@ -127,6 +134,11 @@ pub struct TrainArgs {
 
 #[derive(Debug, Args)]
 pub struct ResumeArgs {
+    /// Defaults to the backend saved in the checkpoint. Switching changes numerical arithmetic.
+    #[arg(long, value_enum)]
+    pub backend: Option<Backend>,
+    #[arg(long, default_value_t = 0)]
+    pub device: usize,
     #[arg(long)]
     pub checkpoint: PathBuf,
     /// Cumulative target; saved network, PPO options, optimizer and RNG are reused exactly.
@@ -197,11 +209,15 @@ pub fn train(args: TrainArgs) -> Result<(), String> {
         args.workers,
         &args.out,
         args.save_every,
+        args.device,
     )
 }
 
 pub fn resume(args: ResumeArgs) -> Result<(), String> {
-    let (trainer, state) = checkpoint::load(&args.checkpoint)?;
+    let (trainer, mut state) = checkpoint::load(&args.checkpoint)?;
+    if let Some(backend) = args.backend {
+        state.options.backend = backend;
+    }
     run(
         trainer,
         state,
@@ -209,6 +225,7 @@ pub fn resume(args: ResumeArgs) -> Result<(), String> {
         args.workers,
         args.out.as_deref().unwrap_or(&args.checkpoint),
         args.save_every,
+        args.device,
     )
 }
 
@@ -226,6 +243,7 @@ fn run(
     workers: usize,
     out: &Path,
     save_every: usize,
+    device: usize,
 ) -> Result<(), String> {
     if workers == 0 || iterations <= state.iteration {
         return Err(
@@ -237,11 +255,13 @@ fn run(
         .build()
         .map_err(|e| e.to_string())?;
     let cfg = state.options.game_config()?;
+    let mut execution = Execution::new(state.options.backend, &trainer, device)?;
     println!(
-        "PPO-Clip + GAE: {} parameters, {} games/iteration, {} workers, FP32 inference",
+        "PPO-Clip + GAE: {} parameters, {} games/iteration, {} workers, FP32 inference, {:?} backend",
         trainer.net.n_params(),
         state.options.games,
-        workers
+        workers,
+        state.options.backend
     );
     for iteration in state.iteration + 1..=iterations {
         let iteration_start = Instant::now();
@@ -255,8 +275,19 @@ fn run(
                     .ok_or_else(|| "game seed overflow".to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let games =
-            rollout::collect_with_rules(&trainer.net, &seeds, &cfg, &pool, opts.policy_rules)?;
+        let games = match opts.backend {
+            Backend::Cpu => {
+                rollout::collect_with_rules(&trainer.net, &seeds, &cfg, &pool, opts.policy_rules)?
+            }
+            Backend::Cuda => crate::batched::collect(
+                &trainer.net,
+                &seeds,
+                &cfg,
+                opts.policy_rules,
+                &pool,
+                &execution,
+            )?,
+        };
         let rollout_seconds = start.elapsed().as_secs_f64();
         let mean_turns = games.iter().map(|g| g.turns as f64).sum::<f64>() / games.len() as f64;
         let turn_limit_games = games.iter().filter(|g| g.turn_limit_end).count();
@@ -278,8 +309,20 @@ fn run(
         rollout::normalize_advantages(&mut samples)?;
         let collect_seconds = start.elapsed().as_secs_f64();
         let start = Instant::now();
-        let metrics = pool.install(|| {
-            ppo::update(
+        let metrics = if opts.backend == Backend::Cpu {
+            pool.install(|| {
+                ppo::update(
+                    &mut trainer,
+                    &samples,
+                    opts.epochs,
+                    opts.batch,
+                    opts.lr,
+                    &opts.ppo,
+                    &mut state.shuffle_rng,
+                )
+            })?
+        } else {
+            execution.update(
                 &mut trainer,
                 &samples,
                 opts.epochs,
@@ -287,8 +330,8 @@ fn run(
                 opts.lr,
                 &opts.ppo,
                 &mut state.shuffle_rng,
-            )
-        })?;
+            )?
+        };
         let train_seconds = start.elapsed().as_secs_f64();
         // No buffer, pending seat transition, or old behavior policy survives this boundary.
         let start = Instant::now();
@@ -298,6 +341,7 @@ fn run(
         state.games += opts.games as u64;
         state.transitions += samples_count as u64;
         let mut entry = json!({"iteration": iteration, "games": opts.games, "transitions": samples_count,
+            "backend":opts.backend,
             "total_games": state.games, "total_transitions": state.transitions,
             "mean_turns": mean_turns, "seat0_mean_placement": seat0_mean_placement,
             "turn_limit_games": turn_limit_games, "truncated_combats": truncated_combats,

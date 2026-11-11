@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit Elo-scale ratings from `tavernagent league` output and plot them per run.
+"""Fit Elo-scale ratings from v1/v2 `league` output and plot them per run.
 
 Ratings come from a Plackett-Luce model of the full 8-player placements (MM algorithm,
 Hunter 2004); the Elo scale is 400 * log10(strength), centred on the mean. Error bars are
@@ -39,6 +39,32 @@ def encode_rankings(games, names):
         positions[len(models)].append(game_id)
     return [(np.asarray(groups[k], dtype=np.int32), np.asarray(positions[k], dtype=np.intp))
             for k in sorted(groups)]
+
+
+def validate_games(games, names):
+    """Only connected, complete, strict rankings identify one shared rating scale."""
+    if not games or len(names) < 2 or len(set(names)) != len(names):
+        raise ValueError("ratings require games and at least two unique model names")
+    neighbors = {name: set() for name in names}
+    for models, places in games:
+        if (len(models) < 2 or len(models) != len(places)
+                or len(set(models)) != len(models)
+                or len(set(places)) != len(places)
+                or any(not isinstance(p, int) or p < 1 for p in places)):
+            raise ValueError("each ranking needs distinct models and strict positive placements")
+        if any(name not in neighbors for name in models):
+            raise ValueError("ranking contains an unknown model")
+        for name in models[1:]:
+            neighbors[models[0]].add(name)
+            neighbors[name].add(models[0])
+    seen, pending = set(), [names[0]]
+    while pending:
+        name = pending.pop()
+        if name not in seen:
+            seen.add(name)
+            pending.extend(neighbors[name] - seen)
+    if len(seen) != len(names):
+        raise ValueError("league comparison graph is disconnected; add bridging games")
 
 
 def fit_rankings(groups, n, iters=500, tol=1e-9, weights=None, initial=None):
@@ -87,6 +113,11 @@ def plackett_luce(games, names, iters=500, tol=1e-9):
 def ratings_with_bootstrap(games, names, bootstrap=32, workers=4, seed=0,
                            anchor=None, anchor_rating=1000.0):
     """Full-game bootstrap without rebuilding and sorting Python game lists."""
+    validate_games(games, names)
+    if bootstrap < 2 or workers < 1:
+        raise ValueError("bootstrap must be >= 2 and workers positive")
+    if anchor is not None and anchor not in names:
+        raise ValueError("anchor must name a model in the league")
     from concurrent.futures import ThreadPoolExecutor
     groups = encode_rankings(games, names)
     elo = fit_rankings(groups, len(names))
@@ -115,6 +146,7 @@ def main():
     ap.add_argument("--anchor", default=None, help="model whose rating is fixed at --anchor-rating")
     ap.add_argument("--anchor-rating", type=float, default=1000.0)
     ap.add_argument("--json", default=None, help="also write ratings as JSON")
+    ap.add_argument("--no-plot", action="store_true", help="fit without importing matplotlib")
     ap.add_argument(
         "--exclude",
         action="append",
@@ -162,6 +194,9 @@ def main():
                 handle,
                 indent=1,
             )
+
+    if args.no_plot:
+        return
 
     import matplotlib
 

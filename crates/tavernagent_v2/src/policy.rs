@@ -98,10 +98,20 @@ pub fn decide(
     greedy: bool,
 ) -> Result<Decision, String> {
     let (logits, value) = net.infer_f32(&obs.x, &obs.cards, &obs.mask)?;
+    from_logits(&logits, value, &obs.mask, rng, greedy)
+}
+
+pub fn from_logits(
+    logits: &[f32],
+    value: f32,
+    mask: &[bool],
+    rng: &mut impl Rng,
+    greedy: bool,
+) -> Result<Decision, String> {
     if !value.is_finite() {
         return Err("nonfinite actor value".into());
     }
-    let dist = Categorical::new(&logits, &obs.mask)?;
+    let dist = Categorical::new(logits, mask)?;
     let action = if greedy {
         dist.greedy()
     } else {

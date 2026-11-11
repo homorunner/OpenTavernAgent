@@ -572,7 +572,7 @@ impl PolicyValueNet {
     }
 
     /// Gather the network input for a batch of raw observations.
-    fn assemble(
+    pub(crate) fn assemble(
         &self,
         xs: &[&[f32]],
         cards: &[&[i32]],

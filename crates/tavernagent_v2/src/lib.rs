@@ -3,11 +3,18 @@
 
 pub mod actions;
 pub mod arena;
+pub mod backend;
+pub mod batched;
+pub mod batched_arena;
+pub mod batched_eval;
 pub mod checkpoint;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod diagnostics;
 pub mod eval;
 pub mod gae;
 pub mod heroes;
+pub mod league;
 pub mod linalg;
 pub mod net;
 pub mod npz;

@@ -15,6 +15,7 @@ fn iteration_zero_is_a_resumable_untrained_checkpoint() {
     };
     let expected = PolicyValueNet::new(options.seed, options.net_config()).unwrap();
     train::train(train::TrainArgs {
+        device: 0,
         iterations: 0,
         workers: 1,
         out: path.clone(),
@@ -36,6 +37,8 @@ fn iteration_zero_is_a_resumable_untrained_checkpoint() {
     assert_eq!(trainer.m.sum_squares(), 0.0);
     assert_eq!(trainer.v.sum_squares(), 0.0);
     train::resume(train::ResumeArgs {
+        backend: None,
+        device: 0,
         checkpoint: path.clone(),
         iterations: 1,
         workers: 2,

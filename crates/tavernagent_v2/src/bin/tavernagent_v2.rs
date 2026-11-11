@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
-use tavernagent_v2::{arena, eval, train};
+use tavernagent_v2::{arena, eval, league, train};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -28,6 +28,11 @@ enum Command {
     Eval(eval::EvalArgs),
     /// Evaluate four candidate copies against four frozen references with paired seats.
     Arena(arena::ArenaArgs),
+    /// Mix eight distinct checkpoints per table; write rankings for league Elo.
+    League(league::LeagueArgs),
+    /// Validate CUDA forward, backward and AdamW against the CPU reference.
+    #[cfg(feature = "cuda")]
+    CudaCheck(tavernagent_v2::cuda::CheckArgs),
 }
 
 fn main() -> ExitCode {
@@ -37,6 +42,9 @@ fn main() -> ExitCode {
         Command::Fork(args) => train::fork(args),
         Command::Eval(args) => eval::run(args),
         Command::Arena(args) => arena::run(args),
+        Command::League(args) => league::run(args),
+        #[cfg(feature = "cuda")]
+        Command::CudaCheck(args) => tavernagent_v2::cuda::check(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -18,6 +18,12 @@ use taverngym::{Game, RulesConfig};
 
 #[derive(Debug, Args)]
 pub struct ArenaArgs {
+    #[arg(long,value_enum,default_value_t=crate::backend::Backend::Cpu)]
+    pub backend: crate::backend::Backend,
+    #[arg(long, default_value_t = 0)]
+    pub device: usize,
+    #[arg(long, default_value_t = 64)]
+    pub inference_batch: usize,
     #[arg(long)]
     pub candidate: PathBuf,
     #[arg(long)]
@@ -95,6 +101,16 @@ pub fn play(
             return Err(format!("arena stalled: seed={seed}"));
         }
     }
+    finish(game, offset, diagnostics)
+}
+
+pub(crate) fn finish(
+    game: Game,
+    offset: usize,
+    diagnostics: Vec<GameDiagnostics>,
+) -> Result<ArenaGame, String> {
+    let is_candidate = |seat: usize| (seat + offset) % 8 < 4;
+    let seed = game.seed;
     let placements: Vec<_> = game.players.iter().map(|p| p.placement).collect();
     if placements.contains(&0) || game.stopped_reason.is_some() {
         return Err("arena missing placement".into());
@@ -149,23 +165,40 @@ pub fn run(args: ArenaArgs) -> Result<(), String> {
         .num_threads(args.workers)
         .build()
         .map_err(|e| e.to_string())?;
-    let mut games = pool.install(|| {
-        (0..args.games)
-            .into_par_iter()
-            .map(|i| {
-                let offset = (i / 2) % 4 + 4 * (i % 2);
-                play(
-                    &candidate.net,
-                    &reference.net,
-                    &cfg,
-                    state.options.policy_rules,
-                    reference_state.options.policy_rules,
-                    seeds[i / 2],
-                    offset,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-    })?;
+    let mut games = if args.backend == crate::backend::Backend::Cuda {
+        let a = crate::backend::Execution::new(args.backend, &candidate, args.device)?;
+        let b = crate::backend::Execution::new(args.backend, &reference, args.device)?;
+        crate::batched_arena::evaluate(
+            &candidate.net,
+            &reference.net,
+            &a,
+            &b,
+            &cfg,
+            state.options.policy_rules,
+            reference_state.options.policy_rules,
+            &seeds,
+            args.inference_batch,
+            &pool,
+        )?
+    } else {
+        pool.install(|| {
+            (0..args.games)
+                .into_par_iter()
+                .map(|i| {
+                    let offset = (i / 2) % 4 + 4 * (i % 2);
+                    play(
+                        &candidate.net,
+                        &reference.net,
+                        &cfg,
+                        state.options.policy_rules,
+                        reference_state.options.policy_rules,
+                        seeds[i / 2],
+                        offset,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })?
+    };
     let pair_means: Vec<_> = games
         .as_chunks::<2>()
         .0
@@ -190,7 +223,7 @@ pub fn run(args: ArenaArgs) -> Result<(), String> {
         "policy_rules":state.options.policy_rules,"reference_policy_rules":reference_state.options.policy_rules,
         "games":args.games,"seed":args.seed,"paired_seeds":pair_means.len(),"sample":false,"inference":"fp32",
         "candidate_mean_placement":mean,"candidate_minus_neutral":mean-4.5,
-        "paired_seed_standard_error":se,"mean_placement_ci95_normal":[mean-1.96*se,mean+1.96*se],
+        "paired_seed_standard_error":se,"mean_placement_ci95_normal":[mean-1.96*se,mean+1.96*se],"backend":args.backend,
         "candidate_team_win_rate":games.iter().filter(|g|g.candidate_won).count() as f64/args.games as f64,
         "candidate_top4_share":games.iter().map(|g|g.candidate_top4_share).sum::<f64>()/args.games as f64,
         "turn_limit_games":games.iter().filter(|g|g.turn_limit_end).count(),

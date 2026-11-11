@@ -81,7 +81,7 @@ pub struct LossMetrics {
 }
 
 impl LossMetrics {
-    fn add_scaled(&mut self, other: &Self, scale: f64) {
+    pub(crate) fn add_scaled(&mut self, other: &Self, scale: f64) {
         self.policy_loss += other.policy_loss * scale;
         self.value_loss += other.value_loss * scale;
         self.entropy += other.entropy * scale;
@@ -164,6 +164,17 @@ fn chunk_gradients(
         .map(|s| s.transition.obs.mask.as_slice())
         .collect();
     let (logits, values, cache) = net.forward(&xs, &cards, &masks)?;
+    let (dlogits, dvalue, metrics) = output_gradients(rows, &logits, &values, opts)?;
+    Ok((net.backward(&cache, &dlogits, &dvalue), metrics))
+}
+
+/// Shared FP64 masked distribution/loss arithmetic for both network backends.
+pub(crate) fn output_gradients(
+    rows: &[&Sample],
+    logits: &Mat,
+    values: &[f32],
+    opts: &PpoOptions,
+) -> Result<(Mat, Vec<f32>, LossMetrics), String> {
     let mut dlogits = Mat::zeros(rows.len(), N_ACTIONS);
     let mut dvalue = vec![0.0; rows.len()];
     let mut metrics = LossMetrics::default();
@@ -173,7 +184,7 @@ fn chunk_gradients(
         }
         let (mut row_metrics, grad) = policy_loss_gradient(
             logits.row(r),
-            masks[r],
+            &sample.transition.obs.mask,
             sample.transition.action,
             sample.transition.old_log_prob,
             sample.advantage,
@@ -186,7 +197,7 @@ fn chunk_gradients(
         dvalue[r] = (2.0 * opts.value_coef * error * (1.0 - (values[r] as f64).powi(2))) as f32;
         metrics.add_scaled(&row_metrics, 1.0);
     }
-    Ok((net.backward(&cache, &dlogits, &dvalue), metrics))
+    Ok((dlogits, dvalue, metrics))
 }
 
 /// Mean batch loss and gradients; old probabilities, advantages and targets are constants.
