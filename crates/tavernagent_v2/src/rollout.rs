@@ -14,6 +14,8 @@ use crate::rules::{ActionCounts, ActionHistory, PolicyRules};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Transition {
+    pub turn: u32,
+    pub health: f32,
     pub obs: Observation,
     pub action: usize,
     pub old_log_prob: f64,
@@ -22,11 +24,12 @@ pub struct Transition {
     pub terminated: bool,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Trajectory {
     pub seed: u64,
     pub seat: usize,
     pub placement: u8,
+    pub terminal_health: f32,
     pub steps: Vec<Transition>,
 }
 
@@ -35,10 +38,21 @@ pub struct Sample {
     pub transition: Transition,
     pub advantage: f32,
     pub return_: f32,
+    pub terminal_reward: f32,
+    pub future_health: Option<f32>,
 }
 
 impl Trajectory {
     pub fn into_samples(self, gamma: f32, lambda: f32) -> Result<Vec<Sample>, String> {
+        self.into_samples_with_trace(gamma, lambda, None)
+    }
+
+    pub fn into_samples_with_trace(
+        self,
+        gamma: f32,
+        lambda: f32,
+        within_turn_lambda: Option<f32>,
+    ) -> Result<Vec<Sample>, String> {
         if let Some(last) = self.steps.last()
             && (!last.terminated
                 || self.steps[..self.steps.len() - 1]
@@ -56,16 +70,58 @@ impl Trajectory {
                 terminated: s.terminated,
             })
             .collect();
-        let targets = gae::estimate(&values, 0.0, gamma, lambda)?;
+        let terminal_reward = self.steps.last().map_or(0.0, |s| s.reward);
+        let mut health_by_turn = std::collections::BTreeMap::new();
+        for step in &self.steps {
+            health_by_turn.entry(step.turn).or_insert(step.health);
+        }
+        let future_health: Vec<_> = self
+            .steps
+            .iter()
+            .map(|step| {
+                health_by_turn
+                    .range(step.turn.saturating_add(3)..)
+                    .next()
+                    .map(|(_, h)| *h)
+                    .or(if self.terminal_health <= 0.0 {
+                        Some(0.0)
+                    } else {
+                        None
+                    })
+                    .map(|h| 2.0 * (h / 60.0).clamp(0.0, 1.0) - 1.0)
+            })
+            .collect();
+        let targets = if let Some(within) = within_turn_lambda {
+            let mut trace = vec![lambda; self.steps.len()];
+            for (i, pair) in self.steps.windows(2).enumerate() {
+                let elapsed = pair[1]
+                    .turn
+                    .checked_sub(pair[0].turn)
+                    .ok_or("trajectory turns must be monotone")?;
+                trace[i] = if elapsed == 0 {
+                    within
+                } else {
+                    lambda.powf(elapsed as f32)
+                };
+            }
+            gae::estimate_with_trace(&values, 0.0, gamma, &trace)?
+        } else {
+            gae::estimate(&values, 0.0, gamma, lambda)?
+        };
         Ok(self
             .steps
             .into_iter()
             .zip(targets)
-            .map(|(transition, (advantage, return_))| Sample {
-                transition,
-                advantage,
-                return_,
-            })
+            .zip(future_health)
+            .map(
+                |((transition, (advantage, return_)), future_health)| Sample {
+                    transition,
+                    advantage,
+                    return_,
+                    terminal_reward,
+                    future_health,
+                },
+            )
             .collect())
     }
 }
@@ -108,6 +164,7 @@ pub fn collect_game_with_rules(
             seed,
             seat,
             placement: 0,
+            terminal_health: 0.0,
             steps: Vec::new(),
         })
         .collect();
@@ -122,15 +179,18 @@ pub fn collect_game_with_rules(
                 continue;
             }
             let turn = game.turn;
+            let health = (game.players[seat].health + game.players[seat].armor).max(0) as f32;
             let obs = observe_seat_with_rules(&game, seat, rules, &histories[seat]);
             let decision = policy::decide(net, &obs, &mut rng, false)
                 .map_err(|e| format!("seed={seed}, seat={seat}, turn={}: {e}", game.turn))?;
-            crate::actions::apply(&mut game, seat, decision.action).map_err(|e| {
-                format!("seed={seed}, seat={seat}, action={}: {e}", decision.action)
-            })?;
+            crate::actions::apply_with_rules(&mut game, seat, decision.action, rules).map_err(
+                |e| format!("seed={seed}, seat={seat}, action={}: {e}", decision.action),
+            )?;
             actions.record(&histories[seat], turn, decision.action);
             histories[seat].record(turn, decision.action);
             trajectory.steps.push(Transition {
+                turn,
+                health,
                 obs,
                 action: decision.action,
                 old_log_prob: decision.log_prob,
@@ -156,6 +216,12 @@ pub fn collect_game_with_rules(
             return Err(format!("missing terminal placement: seed={seed}"));
         }
         trajectory.placement = placement;
+        let p = &game.players[trajectory.seat];
+        trajectory.terminal_health = if p.alive {
+            (p.health + p.armor).max(0) as f32
+        } else {
+            0.0
+        };
         // Elimination may happen while this seat is waiting. Its final action receives
         // the reward, irrespective of which seat triggered the combat or elimination.
         if let Some(last) = trajectory.steps.last_mut() {

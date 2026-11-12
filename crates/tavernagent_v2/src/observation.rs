@@ -139,6 +139,12 @@ pub fn agent_mask_with_rules(
     history: &ActionHistory,
 ) -> Vec<bool> {
     let mut mask = crate::actions::legal_mask(game, seat);
+    let can_freeze = mask[taverngym::actions::A_FREEZE];
+    if rules.freeze_at_end {
+        // Remove the toggle before must-spend escape detection. Otherwise a free
+        // toggle could keep End masked when no productive action remains.
+        mask[taverngym::actions::A_FREEZE] = false;
+    }
     // Apply before the EndTurn/Cancel escape rules, so blocking a free action cannot
     // strand a seat whose only remaining engine action is EndTurn.
     if rules.block_consecutive_freeze && history.follows_freeze(game.turn) {
@@ -155,6 +161,11 @@ pub fn agent_mask_with_rules(
         if !mask.iter().any(|legal| *legal) {
             mask[A_CANCEL] = true;
         }
+    }
+    if rules.freeze_at_end {
+        mask[taverngym::actions::A_FREEZE] = mask[A_END_TURN]
+            && can_freeze
+            && game.players[seat].shop.iter().any(|slot| !slot.frozen);
     }
     mask
 }

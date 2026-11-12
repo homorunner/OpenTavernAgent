@@ -22,7 +22,7 @@ enum Command {
     Train(Box<train::TrainArgs>),
     /// Continue a v2 checkpoint with its saved hyperparameters and optimizer state.
     Resume(train::ResumeArgs),
-    /// Fork a checkpoint for a policy-rule ablation, preserving optimizer and RNG.
+    /// Change selected training options in a new checkpoint, preserving optimizer, RNG and counters.
     Fork(train::ForkArgs),
     /// Evaluate the policy directly against seven scripted or teacher bots.
     Eval(eval::EvalArgs),
@@ -30,6 +30,8 @@ enum Command {
     Arena(arena::ArenaArgs),
     /// Mix eight distinct checkpoints per table; write rankings for league Elo.
     League(league::LeagueArgs),
+    /// Measure frozen critic predictions against lambda returns and terminal rewards.
+    Diagnose(tavernagent_v2::critic::DiagnoseArgs),
     /// Validate CUDA forward, backward and AdamW against the CPU reference.
     #[cfg(feature = "cuda")]
     CudaCheck(tavernagent_v2::cuda::CheckArgs),
@@ -43,6 +45,7 @@ fn main() -> ExitCode {
         Command::Eval(args) => eval::run(args),
         Command::Arena(args) => arena::run(args),
         Command::League(args) => league::run(args),
+        Command::Diagnose(args) => tavernagent_v2::critic::run(args),
         #[cfg(feature = "cuda")]
         Command::CudaCheck(args) => tavernagent_v2::cuda::check(args),
     };

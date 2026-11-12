@@ -81,12 +81,14 @@ impl Running {
         logits: &[f32],
         value: f32,
         sample: bool,
+        rules: PolicyRules,
     ) -> Result<(), String> {
         let turn = self.game.turn;
         let decision = policy::from_logits(logits, value, &obs.mask, &mut self.rng, !sample)?;
         self.diagnostics
             .record(&self.game, 0, &self.history, decision.action);
-        crate::actions::apply(&mut self.game, 0, decision.action).map_err(str::to_owned)?;
+        crate::actions::apply_with_rules(&mut self.game, 0, decision.action, rules)
+            .map_err(str::to_owned)?;
         self.history.record(turn, decision.action);
         Ok(())
     }
@@ -157,7 +159,7 @@ pub fn evaluate(
                     .zip(work.into_par_iter())
                     .try_for_each(|(game, work)| {
                         if let Some((obs, logits, value)) = work {
-                            game.apply(&obs, &logits, value, sample)
+                            game.apply(&obs, &logits, value, sample, rules)
                         } else {
                             Ok(())
                         }

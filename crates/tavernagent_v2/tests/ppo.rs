@@ -35,6 +35,8 @@ fn sample(net: &PolicyValueNet) -> Sample {
     let d = policy::decide(net, &obs, &mut rng, false).unwrap();
     Sample {
         transition: Transition {
+            turn: game.turn,
+            health: 40.,
             obs,
             action: d.action,
             old_log_prob: d.log_prob,
@@ -44,6 +46,8 @@ fn sample(net: &PolicyValueNet) -> Sample {
         },
         advantage: 0.7,
         return_: 0.8,
+        terminal_reward: 1.0,
+        future_health: Some(0.),
     }
 }
 
@@ -210,6 +214,93 @@ fn fp32_behavior_probabilities_match_training_and_full_ppo_gradients() {
             "{}[{j}]: numeric={numeric}, analytic={analytic}",
             net.p.names()[i]
         );
+    }
+}
+
+#[test]
+fn terminal_auxiliary_and_clipped_value_gradients_match_the_reported_loss() {
+    let mut net = PolicyValueNet::new(3, options().net_config()).unwrap();
+    let mut row = sample(&net);
+    row.return_ = 1.4;
+    row.terminal_reward = -1.0;
+    let index = net.p.bv();
+    for clip in [false, true] {
+        let opts = PpoOptions {
+            terminal_value_coef: 0.1,
+            clip_value_target: clip,
+            ..Default::default()
+        };
+        let (grads, _) = ppo::loss_gradients(&net, &[&row], &opts).unwrap();
+        let original = net.p.tensors[index].data[0];
+        net.p.tensors[index].data[0] = original + 1e-3;
+        let hi = ppo::loss_gradients(&net, &[&row], &opts)
+            .unwrap()
+            .1
+            .total_loss(&opts);
+        net.p.tensors[index].data[0] = original - 1e-3;
+        let lo = ppo::loss_gradients(&net, &[&row], &opts)
+            .unwrap()
+            .1
+            .total_loss(&opts);
+        net.p.tensors[index].data[0] = original;
+        assert!(((hi - lo) / 2e-3 - f64::from(grads.tensors[index].data[0])).abs() < 1e-3);
+    }
+}
+
+#[test]
+fn distribution_and_health_heads_preserve_inference_and_have_correct_gradients() {
+    for (distribution, health) in [(true, false), (false, true), (true, true)] {
+        let opts = TrainOptions {
+            critic_distribution: distribution,
+            critic_health: health,
+            ..options()
+        };
+        let mut net = PolicyValueNet::new(13, opts.net_config()).unwrap();
+        let row = sample(&net);
+        let obs = &row.transition.obs;
+        let (logits, values, _) = net.forward(&[&obs.x], &[&obs.cards], &[&obs.mask]).unwrap();
+        let (single, value) = net.infer_f32(&obs.x, &obs.cards, &obs.mask).unwrap();
+        assert!((value - values[0]).abs() < 1e-5);
+        for (a, b) in single.iter().zip(&logits.data) {
+            assert!((a - b).abs() < 1e-5);
+        }
+        assert!((-1.0..=1.0).contains(&value));
+        let restored = PolicyValueNet::from_npz(&net.to_npz()).unwrap();
+        assert_eq!(restored.cfg, net.cfg);
+        assert_eq!(restored.p, net.p);
+        let loss_opts = PpoOptions {
+            terminal_value_coef: 0.1,
+            ..Default::default()
+        };
+        let (grads, _) = ppo::loss_gradients(&net, &[&row], &loss_opts).unwrap();
+        for i in [net.p.wv(), net.p.bv(), net.p.wv_hidden(), net::W0] {
+            for j in [0, net.p.tensors[i].len() - 1] {
+                let original = net.p.tensors[i].data[j];
+                net.p.tensors[i].data[j] = original + 1e-3;
+                let hi = ppo::loss_gradients(&net, &[&row], &loss_opts)
+                    .unwrap()
+                    .1
+                    .total_loss(&loss_opts);
+                net.p.tensors[i].data[j] = original - 1e-3;
+                let lo = ppo::loss_gradients(&net, &[&row], &loss_opts)
+                    .unwrap()
+                    .1
+                    .total_loss(&loss_opts);
+                net.p.tensors[i].data[j] = original;
+                assert!(
+                    ((hi - lo) / 2e-3 - f64::from(grads.tensors[i].data[j])).abs() < 2e-3,
+                    "distribution={distribution} health={health} tensor={i} index={j}"
+                );
+            }
+        }
+        if distribution {
+            let (weight, bias) = (net.p.wv(), net.p.bv());
+            net.p.tensors[weight].data.fill(0.0);
+            net.p.tensors[bias].data.fill(0.0);
+            let (_, metrics) = ppo::loss_gradients(&net, &[&row], &loss_opts).unwrap();
+            assert!((metrics.value_loss - 8.0f64.ln()).abs() < 1e-10);
+            assert!((metrics.terminal_value_loss - 8.0f64.ln()).abs() < 1e-10);
+        }
     }
 }
 

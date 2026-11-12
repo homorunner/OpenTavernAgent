@@ -37,6 +37,10 @@ pub struct TrainOptions {
     pub gamma: f32,
     #[arg(long, default_value_t = 0.95)]
     pub gae_lambda: f32,
+    /// If set, gae-lambda applies across turns and this coefficient within a turn.
+    #[serde(default)]
+    #[arg(long)]
+    pub gae_within_turn_lambda: Option<f32>,
     #[arg(long, default_value_t = 0)]
     pub seed: u64,
     #[arg(long, default_value_t = crate::net::DEFAULT_HIDDEN)]
@@ -51,6 +55,14 @@ pub struct TrainOptions {
     pub residual_scale: f32,
     #[arg(long)]
     pub head_norm: bool,
+    /// Eight placement bins instead of a scalar tanh critic; backbone unchanged.
+    #[serde(default)]
+    #[arg(long)]
+    pub critic_distribution: bool,
+    /// Add a scalar prediction of health+armor at the first decision of turn t+3.
+    #[serde(default)]
+    #[arg(long)]
+    pub critic_health: bool,
     /// Engine turn-limit adjudication; lower only for smoke tests.
     #[arg(long, default_value_t = RulesConfig::default().max_turns)]
     pub max_turns: u32,
@@ -83,6 +95,8 @@ impl TrainOptions {
             activation: self.activation,
             residual_scale: self.residual_scale,
             head_norm: self.head_norm,
+            critic_distribution: self.critic_distribution,
+            critic_health: self.critic_health,
         }
     }
 
@@ -109,6 +123,12 @@ impl TrainOptions {
             return Err("gamma and gae-lambda must be in [0, 1]".into());
         }
         self.ppo.validate()?;
+        if self
+            .gae_within_turn_lambda
+            .is_some_and(|v| !(0.0..=1.0).contains(&v))
+        {
+            return Err("gae-within-turn-lambda must be in [0, 1]".into());
+        }
         self.game_config()?;
         Ok(())
     }
@@ -153,7 +173,7 @@ pub struct ResumeArgs {
     pub save_every: usize,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 pub struct ForkArgs {
     #[arg(long)]
     pub checkpoint: PathBuf,
@@ -161,7 +181,32 @@ pub struct ForkArgs {
     #[arg(long)]
     pub out: PathBuf,
     #[arg(long, action = clap::ArgAction::Set)]
-    pub block_consecutive_freeze: bool,
+    pub block_consecutive_freeze: Option<bool>,
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub freeze_at_end: Option<bool>,
+    #[arg(long)]
+    pub lr: Option<f64>,
+    /// Complete games per future iteration; existing cumulative counts are preserved.
+    #[arg(long)]
+    pub games: Option<usize>,
+    /// PPO passes over each future rollout; KL early stopping still applies.
+    #[arg(long)]
+    pub epochs: Option<usize>,
+    #[arg(long)]
+    pub entropy_coef: Option<f64>,
+    #[arg(long)]
+    pub gae_lambda: Option<f32>,
+    #[arg(long)]
+    pub gae_within_turn_lambda: Option<f32>,
+    /// Return to per-decision GAE; otherwise inherit the parent's trace mode.
+    #[arg(long, conflicts_with = "gae_within_turn_lambda")]
+    pub clear_gae_within_turn_lambda: bool,
+    #[arg(long)]
+    pub value_coef: Option<f64>,
+    #[arg(long)]
+    pub terminal_value_coef: Option<f64>,
+    #[arg(long)]
+    pub health_value_coef: Option<f64>,
 }
 
 pub fn fork(args: ForkArgs) -> Result<(), String> {
@@ -169,13 +214,52 @@ pub fn fork(args: ForkArgs) -> Result<(), String> {
         return Err("fork output already exists; choose a new checkpoint path".into());
     }
     let (trainer, mut state) = checkpoint::load(&args.checkpoint)?;
-    let previous = state.options.policy_rules;
-    state.options.policy_rules.block_consecutive_freeze = args.block_consecutive_freeze;
+    let previous = state.options.clone();
+    if let Some(value) = args.block_consecutive_freeze {
+        state.options.policy_rules.block_consecutive_freeze = value;
+    }
+    if let Some(value) = args.freeze_at_end {
+        state.options.policy_rules.freeze_at_end = value;
+    }
+    if let Some(value) = args.lr {
+        state.options.lr = value;
+    }
+    if let Some(value) = args.games {
+        state.options.games = value;
+    }
+    if let Some(value) = args.epochs {
+        state.options.epochs = value;
+    }
+    if let Some(value) = args.entropy_coef {
+        state.options.ppo.entropy_coef = value;
+    }
+    if let Some(value) = args.gae_lambda {
+        state.options.gae_lambda = value;
+    }
+    if args.clear_gae_within_turn_lambda {
+        if args.gae_within_turn_lambda.is_some() {
+            return Err("cannot both set and clear gae-within-turn-lambda".into());
+        }
+        state.options.gae_within_turn_lambda = None;
+    } else if let Some(value) = args.gae_within_turn_lambda {
+        state.options.gae_within_turn_lambda = Some(value);
+    }
+    if let Some(value) = args.value_coef {
+        state.options.ppo.value_coef = value;
+    }
+    if let Some(value) = args.terminal_value_coef {
+        state.options.ppo.terminal_value_coef = value;
+    }
+    if let Some(value) = args.health_value_coef {
+        state.options.ppo.health_value_coef = value;
+    }
+    state.options.validate()?;
     checkpoint::save(&args.out, &trainer, &state)?;
     println!(
         "{}",
         json!({"event":"fork", "parent":args.checkpoint, "out":args.out,
-        "iteration":state.iteration,"previous_policy_rules":previous,"policy_rules":state.options.policy_rules})
+        "iteration":state.iteration,"previous_policy_rules":previous.policy_rules,"policy_rules":state.options.policy_rules,
+        "previous_options":previous,"options":state.options})
     );
     Ok(())
 }
@@ -302,10 +386,19 @@ fn run(
         for game in games {
             actions.add(&game.actions);
             for trajectory in game.trajectories {
-                samples.extend(trajectory.into_samples(opts.gamma, opts.gae_lambda)?);
+                samples.extend(trajectory.into_samples_with_trace(
+                    opts.gamma,
+                    opts.gae_lambda,
+                    opts.gae_within_turn_lambda,
+                )?);
             }
         }
         let samples_count = samples.len();
+        let mut critic = crate::critic::summarize(&samples);
+        // Keep full turn buckets every 50 iterations without bloating every checkpoint.
+        if !iteration.is_multiple_of(50) {
+            critic.as_object_mut().unwrap().remove("by_turn");
+        }
         rollout::normalize_advantages(&mut samples)?;
         let collect_seconds = start.elapsed().as_secs_f64();
         let start = Instant::now();
@@ -350,6 +443,7 @@ fn run(
             "cleanup_seconds": cleanup_seconds,
             "actions": actions,
             "policy_rules": opts.policy_rules,
+            "critic": critic,
             "ppo": metrics});
         state.history.push(entry.clone());
         let start = Instant::now();

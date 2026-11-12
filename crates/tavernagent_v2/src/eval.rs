@@ -119,7 +119,8 @@ pub fn play_detailed(
                     !sample,
                 )?;
                 diagnostics.record(&game, 0, &history, decision.action);
-                crate::actions::apply(&mut game, 0, decision.action).map_err(str::to_string)?;
+                crate::actions::apply_with_rules(&mut game, 0, decision.action, rules)
+                    .map_err(str::to_string)?;
                 history.record(turn, decision.action);
             } else {
                 // Scripted bots use engine coordinates, and their random choices must

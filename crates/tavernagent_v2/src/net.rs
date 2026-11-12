@@ -174,6 +174,10 @@ pub struct NetConfig {
     pub activation: Activation,
     pub residual_scale: f32,
     pub head_norm: bool,
+    #[serde(default)]
+    pub critic_distribution: bool,
+    #[serde(default)]
+    pub critic_health: bool,
 }
 
 impl Default for NetConfig {
@@ -185,11 +189,16 @@ impl Default for NetConfig {
             activation: Activation::Gelu,
             residual_scale: 1.0,
             head_norm: false,
+            critic_distribution: false,
+            critic_health: false,
         }
     }
 }
 
 impl NetConfig {
+    pub fn value_outputs(&self) -> usize {
+        (if self.critic_distribution { 8 } else { 1 }) + usize::from(self.critic_health)
+    }
     /// Fixed 3/2 expansion; rounded up for odd widths used in small tests.
     pub fn ff_hidden(&self) -> usize {
         self.hidden + self.hidden.div_ceil(2)
@@ -416,6 +425,7 @@ pub struct Cache {
     value_hidden: Mat,
     head_ln: Option<LnCache>,
     value: Vec<f32>,
+    pub(crate) value_logits: Mat,
 }
 
 #[derive(Clone, Debug)]
@@ -480,8 +490,12 @@ impl PolicyValueNet {
         tensors.push(Mat::zeros(1, N_ACTIONS));
         tensors.push(randn(h, VALUE_HIDDEN, he(h)));
         tensors.push(Mat::zeros(1, VALUE_HIDDEN));
-        tensors.push(randn(VALUE_HIDDEN, 1, he(VALUE_HIDDEN) * 0.1));
-        tensors.push(Mat::zeros(1, 1));
+        tensors.push(randn(
+            VALUE_HIDDEN,
+            cfg.value_outputs(),
+            he(VALUE_HIDDEN) * 0.1,
+        ));
+        tensors.push(Mat::zeros(1, cfg.value_outputs()));
         Ok(PolicyValueNet {
             p: Params {
                 blocks: cfg.blocks,
@@ -648,7 +662,9 @@ impl PolicyValueNet {
         }
         let mut value_mat = linear(&value_hidden, &p[wv]);
         value_mat.add_row(&p[bv].data);
-        let value: Vec<f32> = value_mat.data.iter().map(|v| v.tanh()).collect();
+        let value: Vec<f32> = (0..value_mat.rows)
+            .map(|r| critic_prediction(value_mat.row(r), &self.cfg))
+            .collect();
         Ok((
             logits,
             value.clone(),
@@ -662,6 +678,7 @@ impl PolicyValueNet {
                 value_hidden,
                 head_ln,
                 value,
+                value_logits: value_mat,
             },
         ))
     }
@@ -708,26 +725,28 @@ impl PolicyValueNet {
         for v in &mut vh {
             *v = gelu(*v);
         }
-        let value = (p[self.p.wv()].vecmat(&vh)[0] + p[self.p.bv()].data[0]).tanh();
+        let mut value_logits = p[self.p.wv()].vecmat(&vh);
+        add_bias(&mut value_logits, &p[self.p.bv()].data);
+        let value = critic_prediction(&value_logits, &self.cfg);
         Ok((logits, value))
     }
 
     // ---- backward ----------------------------------------------------------
 
-    /// Parameter gradients for upstream gradients of the logits (batch x actions) and of
-    /// the pre-tanh value (batch; caller includes the tanh derivative).
+    /// Parameter gradients for policy logits and flattened raw critic outputs.
+    /// The caller includes tanh/softmax and auxiliary-loss derivatives.
     pub fn backward(&self, cache: &Cache, dlogits: &Mat, dvalue: &[f32]) -> Params {
         let p = &self.p.tensors;
         let act = self.cfg.activation;
         let bsz = cache.h_final.rows;
-        let dvalue = Mat::from_vec(bsz, 1, dvalue.to_vec());
+        let dvalue = Mat::from_vec(bsz, self.cfg.value_outputs(), dvalue.to_vec());
         let hidden = self.cfg.hidden;
         let (wp, bp, wv, bv) = (self.p.wp(), self.p.bp(), self.p.wv(), self.p.bv());
         let mut grads = self.p.zeros_like();
         grads.tensors[wp] = cache.h_final.t_matmul(dlogits);
         grads.tensors[bp] = Mat::from_vec(1, N_ACTIONS, dlogits.sum_rows());
         grads.tensors[wv] = cache.value_hidden.t_matmul(&dvalue);
-        grads.tensors[bv] = Mat::from_vec(1, 1, dvalue.sum_rows());
+        grads.tensors[bv] = Mat::from_vec(1, self.cfg.value_outputs(), dvalue.sum_rows());
         let mut dh = dlogits.matmul_t(&p[wp]);
         let mut dvh = dvalue.matmul_t(&p[wv]);
         for (d, v) in dvh.data.iter_mut().zip(&cache.value_pre.data) {
@@ -916,6 +935,39 @@ pub fn masked_softmax_rows(logits: &Mat, masks: &[&[bool]]) -> Mat {
             .copy_from_slice(&masked_softmax(logits.row(r), mask));
     }
     out
+}
+
+/// FP64 softmax over the eight terminal-placement bins, shared by CPU and CUDA hosts.
+pub(crate) fn placement_probabilities(logits: &[f32]) -> [f64; 8] {
+    let top = logits[..8]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max) as f64;
+    let mut result = [0.0; 8];
+    for (i, p) in result.iter_mut().enumerate() {
+        *p = (f64::from(logits[i]) - top).exp();
+    }
+    let sum: f64 = result.iter().sum();
+    for p in &mut result {
+        *p /= sum;
+    }
+    result
+}
+
+pub(crate) fn placement_support(index: usize) -> f64 {
+    1.0 - 2.0 * index as f64 / 7.0
+}
+
+pub(crate) fn critic_prediction(logits: &[f32], cfg: &NetConfig) -> f32 {
+    if cfg.critic_distribution {
+        placement_probabilities(logits)
+            .iter()
+            .enumerate()
+            .map(|(i, p)| p * placement_support(i))
+            .sum::<f64>() as f32
+    } else {
+        logits[0].tanh()
+    }
 }
 
 #[cfg(test)]

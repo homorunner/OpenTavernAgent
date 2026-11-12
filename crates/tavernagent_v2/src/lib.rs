@@ -8,6 +8,7 @@ pub mod batched;
 pub mod batched_arena;
 pub mod batched_eval;
 pub mod checkpoint;
+pub mod critic;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod diagnostics;

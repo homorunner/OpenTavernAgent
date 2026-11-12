@@ -17,6 +17,10 @@ pub struct CheckArgs {
     pub batch: usize,
     #[arg(long)]
     pub head_norm: bool,
+    #[arg(long)]
+    pub critic_distribution: bool,
+    #[arg(long)]
+    pub critic_health: bool,
     #[arg(long,default_value="gelu",value_parser=crate::net::Activation::parse)]
     pub activation: crate::net::Activation,
     #[arg(long, default_value_t = 1.0)]
@@ -47,6 +51,8 @@ pub fn check(args: CheckArgs) -> Result<(), String> {
         hidden: args.hidden,
         blocks: args.blocks,
         head_norm: args.head_norm,
+        critic_distribution: args.critic_distribution,
+        critic_health: args.critic_health,
         activation: args.activation,
         residual_scale: args.residual_scale,
         max_turns: 3,
@@ -167,6 +173,7 @@ pub fn check(args: CheckArgs) -> Result<(), String> {
     println!(
         "{}",
         json!({"passed":passed,"hidden":args.hidden,"blocks":args.blocks,"batch":args.batch,
+        "critic_distribution":args.critic_distribution,"critic_health":args.critic_health,
         "precision":"fp32-pedantic","logits_max_abs":logits.0,"values_max_abs":values.0,"restore_exact":restore_exact,"kl_preserves_state":kl_preserves_state,
         "gradient_max_abs":gradient.0,"gradient_relative_l2":gradient.1,"update_max_abs":update.0,"update_relative_l2":update.1,
         "cpu_gradient_norm":cpu_norm,"gpu_gradient_norm":gpu_norm,"cpu_loss":cpu_loss,"gpu_loss":gpu_loss,"gradients":gradients})

@@ -15,8 +15,23 @@ pub fn estimate(
     gamma: f32,
     lambda: f32,
 ) -> Result<Vec<(f32, f32)>, String> {
+    if !(0.0..=1.0).contains(&lambda) {
+        return Err("invalid GAE lambda".into());
+    }
+    estimate_with_trace(steps, bootstrap, gamma, &vec![lambda; steps.len()])
+}
+
+/// Each trace coefficient links a decision to the next decision of the same seat.
+/// Gamma retains its per-decision meaning; changing the trace does not change rewards.
+pub fn estimate_with_trace(
+    steps: &[ValueStep],
+    bootstrap: f32,
+    gamma: f32,
+    trace: &[f32],
+) -> Result<Vec<(f32, f32)>, String> {
     if !(0.0..=1.0).contains(&gamma)
-        || !(0.0..=1.0).contains(&lambda)
+        || trace.len() != steps.len()
+        || trace.iter().any(|v| !(0.0..=1.0).contains(v))
         || !bootstrap.is_finite()
         || steps
             .iter()
@@ -32,7 +47,7 @@ pub fn estimate(
             advantage = 0.0;
         }
         let delta = step.reward as f64 + gamma as f64 * next_value - step.value as f64;
-        advantage = delta + gamma as f64 * lambda as f64 * advantage;
+        advantage = delta + gamma as f64 * trace[i] as f64 * advantage;
         let target = advantage + step.value as f64;
         if !(advantage as f32).is_finite() || !(target as f32).is_finite() {
             return Err("nonfinite GAE result".into());

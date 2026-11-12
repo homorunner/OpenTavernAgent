@@ -24,6 +24,18 @@ pub struct PpoOptions {
     pub clip_range: f64,
     #[arg(long, default_value_t = 0.5)]
     pub value_coef: f64,
+    /// Additional regression to the observed terminal placement reward (same scalar head).
+    #[serde(default)]
+    #[arg(long, default_value_t = 0.0)]
+    pub terminal_value_coef: f64,
+    /// Clip only the critic target; actor advantages retain the original GAE estimate.
+    #[serde(default)]
+    #[arg(long)]
+    pub clip_value_target: bool,
+    /// Auxiliary future-health loss, active only with --critic-health.
+    #[serde(default = "default_health_coef")]
+    #[arg(long, default_value_t = 0.1)]
+    pub health_value_coef: f64,
     #[arg(long, default_value_t = 0.03)]
     pub entropy_coef: f64,
     #[arg(long, default_value_t = 0.5)]
@@ -40,6 +52,9 @@ impl Default for PpoOptions {
         Self {
             clip_range: 0.2,
             value_coef: 0.5,
+            terminal_value_coef: 0.0,
+            clip_value_target: false,
+            health_value_coef: 0.1,
             entropy_coef: 0.03,
             max_grad_norm: 0.5,
             weight_decay: 0.01,
@@ -55,6 +70,8 @@ impl PpoOptions {
         }
         for (name, value) in [
             ("value-coef", self.value_coef),
+            ("terminal-value-coef", self.terminal_value_coef),
+            ("health-value-coef", self.health_value_coef),
             ("entropy-coef", self.entropy_coef),
             ("weight-decay", self.weight_decay),
             ("target-kl", self.target_kl),
@@ -74,6 +91,8 @@ impl PpoOptions {
 pub struct LossMetrics {
     pub policy_loss: f64,
     pub value_loss: f64,
+    pub terminal_value_loss: f64,
+    pub health_value_loss: f64,
     pub entropy: f64,
     pub approx_kl: f64,
     pub clip_fraction: f64,
@@ -84,6 +103,8 @@ impl LossMetrics {
     pub(crate) fn add_scaled(&mut self, other: &Self, scale: f64) {
         self.policy_loss += other.policy_loss * scale;
         self.value_loss += other.value_loss * scale;
+        self.terminal_value_loss += other.terminal_value_loss * scale;
+        self.health_value_loss += other.health_value_loss * scale;
         self.entropy += other.entropy * scale;
         self.approx_kl += other.approx_kl * scale;
         self.clip_fraction += other.clip_fraction * scale;
@@ -91,7 +112,11 @@ impl LossMetrics {
     }
 
     pub fn total_loss(&self, opts: &PpoOptions) -> f64 {
-        self.policy_loss + opts.value_coef * self.value_loss - opts.entropy_coef * self.entropy
+        self.policy_loss
+            + opts.value_coef * self.value_loss
+            + opts.terminal_value_coef * self.terminal_value_loss
+            + opts.health_value_coef * self.health_value_loss
+            - opts.entropy_coef * self.entropy
     }
 }
 
@@ -164,7 +189,8 @@ fn chunk_gradients(
         .map(|s| s.transition.obs.mask.as_slice())
         .collect();
     let (logits, values, cache) = net.forward(&xs, &cards, &masks)?;
-    let (dlogits, dvalue, metrics) = output_gradients(rows, &logits, &values, opts)?;
+    let (dlogits, dvalue, metrics) =
+        output_gradients(rows, &logits, &values, opts, &net.cfg, &cache.value_logits)?;
     Ok((net.backward(&cache, &dlogits, &dvalue), metrics))
 }
 
@@ -174,9 +200,12 @@ pub(crate) fn output_gradients(
     logits: &Mat,
     values: &[f32],
     opts: &PpoOptions,
+    config: &crate::net::NetConfig,
+    raw_values: &Mat,
 ) -> Result<(Mat, Vec<f32>, LossMetrics), String> {
     let mut dlogits = Mat::zeros(rows.len(), N_ACTIONS);
-    let mut dvalue = vec![0.0; rows.len()];
+    let width = config.value_outputs();
+    let mut dvalue = vec![0.0; rows.len() * width];
     let mut metrics = LossMetrics::default();
     for (r, sample) in rows.iter().enumerate() {
         if !sample.return_.is_finite() || !values[r].is_finite() {
@@ -191,13 +220,64 @@ pub(crate) fn output_gradients(
             opts,
         )?;
         dlogits.row_mut(r).copy_from_slice(&grad);
-        let error = values[r] as f64 - sample.return_ as f64;
-        row_metrics.value_loss = error * error;
-        // backward() consumes the derivative of the pre-tanh value.
-        dvalue[r] = (2.0 * opts.value_coef * error * (1.0 - (values[r] as f64).powi(2))) as f32;
+        let target = if opts.clip_value_target {
+            sample.return_.clamp(-1.0, 1.0)
+        } else {
+            sample.return_
+        };
+        let error = values[r] as f64 - target as f64;
+        if !sample.terminal_reward.is_finite() {
+            return Err("nonfinite terminal reward".into());
+        }
+        let terminal_error = values[r] as f64 - sample.terminal_reward as f64;
+        if config.critic_distribution {
+            let probabilities = crate::net::placement_probabilities(raw_values.row(r));
+            let lambda_target = project_placement(sample.return_);
+            let terminal_target = project_placement(sample.terminal_reward);
+            for k in 0..8 {
+                row_metrics.value_loss -= lambda_target[k] * probabilities[k].max(1e-300).ln();
+                row_metrics.terminal_value_loss -=
+                    terminal_target[k] * probabilities[k].max(1e-300).ln();
+                dvalue[r * width + k] = (opts.value_coef * (probabilities[k] - lambda_target[k])
+                    + opts.terminal_value_coef * (probabilities[k] - terminal_target[k]))
+                    as f32;
+            }
+        } else {
+            row_metrics.value_loss = error * error;
+            row_metrics.terminal_value_loss = terminal_error * terminal_error;
+            // backward() consumes the derivative of the pre-tanh value.
+            dvalue[r * width] = (2.0
+                * (opts.value_coef * error + opts.terminal_value_coef * terminal_error)
+                * (1.0 - (values[r] as f64).powi(2))) as f32;
+        }
+        if config.critic_health
+            && let Some(target) = sample.future_health
+        {
+            let prediction = raw_values.row(r)[width - 1].tanh() as f64;
+            let error = prediction - f64::from(target);
+            row_metrics.health_value_loss = error * error;
+            dvalue[r * width + width - 1] =
+                (2.0 * opts.health_value_coef * error * (1.0 - prediction * prediction)) as f32;
+        }
         metrics.add_scaled(&row_metrics, 1.0);
     }
     Ok((dlogits, dvalue, metrics))
+}
+
+fn default_health_coef() -> f64 {
+    0.1
+}
+
+/// Linear projection preserves the expectation on the eight placement-reward bins.
+fn project_placement(value: f32) -> [f64; 8] {
+    let position = (1.0 - f64::from(value).clamp(-1.0, 1.0)) * 3.5;
+    let low = position.floor() as usize;
+    let high = (low + 1).min(7);
+    let fraction = position - low as f64;
+    let mut result = [0.0; 8];
+    result[low] += 1.0 - fraction;
+    result[high] += fraction;
+    result
 }
 
 /// Mean batch loss and gradients; old probabilities, advantages and targets are constants.

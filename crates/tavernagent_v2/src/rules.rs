@@ -14,6 +14,10 @@ pub struct PolicyRules {
     /// After this seat successfully presses Freeze, mask Freeze until another action or turn.
     #[arg(long)]
     pub block_consecutive_freeze: bool,
+    /// Replace the free Freeze toggle with Freeze-and-End; keep the same output slot.
+    #[serde(default)]
+    #[arg(long)]
+    pub freeze_at_end: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -75,7 +75,8 @@ pub fn play(
             let turn = game.turn;
             let obs = observe_seat_with_rules(&game, seat, model.rules, &histories[seat]);
             let decision = policy::decide(&model.net, &obs, &mut rng, true)?;
-            crate::actions::apply(&mut game, seat, decision.action).map_err(str::to_owned)?;
+            crate::actions::apply_with_rules(&mut game, seat, decision.action, model.rules)
+                .map_err(str::to_owned)?;
             histories[seat].record(turn, decision.action);
             acted = true;
         }

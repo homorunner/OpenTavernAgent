@@ -34,3 +34,26 @@ pub fn apply(game: &mut Game, seat: usize, action: usize) -> Result<(), &'static
     let action = engine_action(game, seat, action)?;
     game.apply(seat, action)
 }
+
+/// Policy semantics belong to the checkpoint; the simulator action space is unchanged.
+pub fn apply_with_rules(
+    game: &mut Game,
+    seat: usize,
+    action: usize,
+    rules: crate::rules::PolicyRules,
+) -> Result<(), &'static str> {
+    if rules.freeze_at_end && action == engine::A_FREEZE {
+        let legal = game.legal_mask(seat);
+        if !legal[engine::A_END] || !legal[engine::A_FREEZE] {
+            return Err("freeze-and-end is not legal");
+        }
+        // An already frozen shop need not be toggled off. Partially frozen shops
+        // become fully frozen, matching the engine Freeze button.
+        if !game.players[seat].shop.iter().all(|slot| slot.frozen) {
+            game.apply(seat, Action::Freeze)?;
+        }
+        game.apply(seat, Action::EndTurn)
+    } else {
+        apply(game, seat, action)
+    }
+}

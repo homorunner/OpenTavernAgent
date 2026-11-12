@@ -93,7 +93,8 @@ pub fn play(
             if is_candidate(seat) {
                 diagnostics[seat].record(&game, seat, &histories[seat], decision.action);
             }
-            crate::actions::apply(&mut game, seat, decision.action).map_err(str::to_string)?;
+            crate::actions::apply_with_rules(&mut game, seat, decision.action, rules)
+                .map_err(str::to_string)?;
             histories[seat].record(turn, decision.action);
             acted = true;
         }

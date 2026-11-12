@@ -37,6 +37,7 @@ pub struct Cache {
     head_norm: Option<Norm>,
     value_pre: Matrix,
     value_hidden: Matrix,
+    value_logits: Mat,
 }
 
 pub struct CudaNet {
@@ -269,13 +270,21 @@ impl CudaNet {
         let value_pre = self.linear(&h, net.p.wv_hidden(), net.p.bv_hidden())?;
         let value_hidden = self.activate(&value_pre, Activation::Gelu)?;
         let values = self.linear(&value_hidden, net.p.wv(), net.p.bv())?;
-        self.gpu.launch(
-            "value_tanh",
-            blocks(values.len()),
-            &mut [Ptr(values.ptr()), shape(&values)],
-        )?;
+        let (values, value_logits) = if net.cfg.value_outputs() == 1 {
+            self.gpu.launch(
+                "value_tanh",
+                blocks(values.len()),
+                &mut [Ptr(values.ptr()), shape(&values)],
+            )?;
+            (values.buffer.read()?, Mat::zeros(0, 0))
+        } else {
+            let raw = Mat::from_vec(values.rows, values.cols, values.buffer.read()?);
+            let predictions = (0..raw.rows)
+                .map(|r| net::critic_prediction(raw.row(r), &net.cfg))
+                .collect();
+            (predictions, raw)
+        };
         let logits = Mat::from_vec(logits.rows, logits.cols, logits.buffer.read()?);
-        let values = values.buffer.read()?;
         Ok((
             logits,
             values,
@@ -289,6 +298,7 @@ impl CudaNet {
                 head_norm,
                 value_pre,
                 value_hidden,
+                value_logits,
             },
         ))
     }
@@ -315,7 +325,9 @@ impl CudaNet {
         let dl = self
             .gpu
             .from_f32(dlogits.rows, dlogits.cols, &dlogits.data)?;
-        let dv = self.gpu.from_f32(dvalue.len(), 1, dvalue)?;
+        let dv = self
+            .gpu
+            .from_f32(dlogits.rows, net.cfg.value_outputs(), dvalue)?;
         grad[net.p.wp()] = self.gpu.gemm(&c.head, true, &dl, false)?;
         grad[net.p.bp()] = self.sum(&dl)?;
         grad[net.p.wv()] = self.gpu.gemm(&c.value_hidden, true, &dv, false)?;
@@ -407,7 +419,8 @@ impl CudaNet {
         opts.validate()?;
         let observations: Vec<_> = rows.iter().map(|s| &s.transition.obs).collect();
         let (logits, values, cache) = self.forward(net, &observations)?;
-        let (dl, dv, metrics) = ppo::output_gradients(rows, &logits, &values, opts)?;
+        let (dl, dv, metrics) =
+            ppo::output_gradients(rows, &logits, &values, opts, &net.cfg, &cache.value_logits)?;
         let grads = self.backward(net, &cache, &dl, &dv)?;
         let norm = 1. / rows.len() as f64;
         for g in &grads {

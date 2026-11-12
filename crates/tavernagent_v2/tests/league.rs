@@ -22,6 +22,7 @@ fn mixed_checkpoint_league_matches_arena_rules_and_is_worker_independent() {
             net: PolicyValueNet::new(if i < 4 { 71 } else { 93 }, opts.net_config()).unwrap(),
             rules: PolicyRules {
                 block_consecutive_freeze: i < 4,
+                ..Default::default()
             },
         })
         .collect();

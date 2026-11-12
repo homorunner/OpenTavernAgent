@@ -14,10 +14,17 @@ fn batching_independent_games_preserves_every_cpu_transition() {
     };
     let net = PolicyValueNet::new(728, options.net_config()).unwrap();
     let cfg = options.game_config().unwrap();
-    for enabled in [false, true] {
-        let rules = PolicyRules {
-            block_consecutive_freeze: enabled,
-        };
+    for rules in [
+        PolicyRules::default(),
+        PolicyRules {
+            block_consecutive_freeze: true,
+            ..Default::default()
+        },
+        PolicyRules {
+            freeze_at_end: true,
+            ..Default::default()
+        },
+    ] {
         let expected = rollout::collect_game_with_rules(&net, 14, &cfg, rules).unwrap();
         for workers in [1, 4] {
             let pool = rayon::ThreadPoolBuilder::new()
@@ -54,7 +61,8 @@ fn batched_bot_evaluation_preserves_placement_rng_and_diagnostics() {
     for opponent in [Opponent::Scripted, Opponent::Teacher] {
         for sample in [false, true] {
             let rules = PolicyRules {
-                block_consecutive_freeze: true,
+                freeze_at_end: true,
+                ..Default::default()
             };
             let actual = batched_eval::evaluate(
                 &net,
@@ -96,7 +104,8 @@ fn batched_arena_preserves_paired_seats_and_each_game_result() {
     let b = PolicyValueNet::new(93, opts.net_config()).unwrap();
     let cfg = opts.game_config().unwrap();
     let rules = PolicyRules {
-        block_consecutive_freeze: true,
+        freeze_at_end: true,
+        ..Default::default()
     };
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(3)

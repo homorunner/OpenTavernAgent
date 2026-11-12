@@ -100,7 +100,12 @@ fn trace(
                 for (i, &p) in dist.probabilities.iter().enumerate() {
                     if p > 0.0 {
                         let a = actions::engine_action(&game, 0, i).map_err(str::to_string)?;
-                        *masses.entry(kind(a)).or_default() += p;
+                        let label = if rules.freeze_at_end && i == taverngym::actions::A_FREEZE {
+                            "FreezeAndEnd"
+                        } else {
+                            kind(a)
+                        };
+                        *masses.entry(label).or_default() += p;
                     }
                 }
                 let item = match engine {
@@ -117,9 +122,9 @@ fn trace(
                 let chosen_card = item.map(|x| card(x.card()));
                 let turn = game.turn;
                 let before = snapshot(&game);
-                game.apply(0, engine).map_err(str::to_string)?;
+                actions::apply_with_rules(&mut game, 0, action, rules).map_err(str::to_string)?;
                 history.record(turn, action);
-                rows.push(json!({"turn":turn,"action":kind(engine),"engine_action":engine,
+                rows.push(json!({"turn":turn,"action":if rules.freeze_at_end && action == taverngym::actions::A_FREEZE { "FreezeAndEnd" } else { kind(engine) },"engine_action":engine,
                     "action_index":action,"probability":dist.probabilities[action],"type_probabilities":masses,
                     "card":chosen_card,"item_type":item_type,"before":before,"after":snapshot(&game),
                     "ended":!game.needs_action(0)||game.turn!=turn}));

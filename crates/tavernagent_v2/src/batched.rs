@@ -37,6 +37,7 @@ impl Running {
                     seed,
                     seat,
                     placement: 0,
+                    terminal_health: 0.0,
                     steps: Vec::new(),
                 })
                 .collect(),
@@ -67,14 +68,19 @@ impl Running {
         obs: Observation,
         logits: &[f32],
         value: f32,
+        rules: PolicyRules,
     ) -> Result<(), String> {
         let decision = policy::from_logits(logits, value, &obs.mask, &mut self.rng, false)?;
         let turn = self.game.turn;
-        crate::actions::apply(&mut self.game, seat, decision.action).map_err(str::to_owned)?;
+        let health = (self.game.players[seat].health + self.game.players[seat].armor).max(0) as f32;
+        crate::actions::apply_with_rules(&mut self.game, seat, decision.action, rules)
+            .map_err(str::to_owned)?;
         self.actions
             .record(&self.histories[seat], turn, decision.action);
         self.histories[seat].record(turn, decision.action);
         self.trajectories[seat].steps.push(Transition {
+            turn,
+            health,
             obs,
             action: decision.action,
             old_log_prob: decision.log_prob,
@@ -87,6 +93,12 @@ impl Running {
     fn finish(mut self) -> Result<GameRollout, String> {
         for t in &mut self.trajectories {
             t.placement = self.game.players[t.seat].placement;
+            let p = &self.game.players[t.seat];
+            t.terminal_health = if p.alive {
+                (p.health + p.armor).max(0) as f32
+            } else {
+                0.0
+            };
             if t.placement == 0 {
                 return Err("batched rollout missing placement".into());
             }
@@ -153,7 +165,7 @@ pub fn collect(
                 .zip(work.into_par_iter())
                 .try_for_each(|(game, work)| {
                     if let Some((seat, obs, logits, value)) = work {
-                        game.apply(seat, obs, &logits, value)
+                        game.apply(seat, obs, &logits, value, rules)
                     } else {
                         Ok(())
                     }

@@ -16,6 +16,7 @@ use taverngym::{
 fn enabled() -> PolicyRules {
     PolicyRules {
         block_consecutive_freeze: true,
+        ..Default::default()
     }
 }
 
@@ -162,11 +163,18 @@ fn fork_preserves_weights_adam_rng_and_counters_and_old_metadata_defaults_off() 
         .as_text()
         .unwrap()
         .replacen(
-            ",\"policy_rules\":{\"block_consecutive_freeze\":false}",
+            &format!(
+                ",\"policy_rules\":{}",
+                serde_json::to_string(&PolicyRules::default()).unwrap()
+            ),
             "",
             1,
         )
         .replacen("\"backend\":\"cpu\",", "", 1);
+    // Check the options object, since historical diagnostic rows also contain rules.
+    let parsed: serde_json::Value = serde_json::from_str(&meta).unwrap();
+    assert!(parsed["state"]["options"].get("policy_rules").is_none());
+    assert!(parsed["state"]["options"].get("backend").is_none());
     npz.insert("trainer_meta", tavernagent_v2::npz::NpyArray::text(&meta));
     npz.save(&parent).unwrap();
     let (before, old) = checkpoint::load(&parent).unwrap();
@@ -175,7 +183,8 @@ fn fork_preserves_weights_adam_rng_and_counters_and_old_metadata_defaults_off() 
     train::fork(train::ForkArgs {
         checkpoint: parent.clone(),
         out: child.clone(),
-        block_consecutive_freeze: true,
+        block_consecutive_freeze: Some(true),
+        ..Default::default()
     })
     .unwrap();
     let (after, new) = checkpoint::load(&child).unwrap();
@@ -196,7 +205,8 @@ fn fork_preserves_weights_adam_rng_and_counters_and_old_metadata_defaults_off() 
         train::fork(train::ForkArgs {
             checkpoint: parent.clone(),
             out: child.clone(),
-            block_consecutive_freeze: false
+            block_consecutive_freeze: Some(false),
+            ..Default::default()
         })
         .is_err()
     );
@@ -216,6 +226,88 @@ fn fork_preserves_weights_adam_rng_and_counters_and_old_metadata_defaults_off() 
         continued.history.last().unwrap()["actions"]["consecutive_freeze_actions"],
         0
     );
+    let tuned = dir.join("tuned.npz");
+    let source_bytes = std::fs::read(&child).unwrap();
+    train::fork(train::ForkArgs {
+        checkpoint: child.clone(),
+        out: tuned.clone(),
+        lr: Some(8e-5),
+        games: Some(2),
+        epochs: Some(2),
+        entropy_coef: Some(0.025),
+        gae_lambda: Some(0.965),
+        gae_within_turn_lambda: Some(0.98),
+        freeze_at_end: Some(true),
+        terminal_value_coef: Some(0.05),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(source_bytes, std::fs::read(&child).unwrap());
+    let source_npz = tavernagent_v2::npz::Npz::load(&child).unwrap();
+    let tuned_npz = tavernagent_v2::npz::Npz::load(&tuned).unwrap();
+    let (source_trainer, source_state) = checkpoint::load(&child).unwrap();
+    let (tuned_trainer, mut tuned_state) = checkpoint::load(&tuned).unwrap();
+    assert_eq!(source_trainer.net.p.tensors, tuned_trainer.net.p.tensors);
+    assert_eq!(source_trainer.m.tensors, tuned_trainer.m.tensors);
+    assert_eq!(source_trainer.v.tensors, tuned_trainer.v.tensors);
+    assert_eq!(source_trainer.optimizer_step, tuned_trainer.optimizer_step);
+    assert_eq!(
+        source_npz.get("meta").unwrap(),
+        tuned_npz.get("meta").unwrap()
+    );
+    assert!(tuned_state.options.policy_rules.block_consecutive_freeze);
+    assert!(tuned_state.options.policy_rules.freeze_at_end);
+    assert_eq!(tuned_state.options.lr, 8e-5);
+    assert_eq!(tuned_state.options.games, 2);
+    assert_eq!(tuned_state.options.epochs, 2);
+    assert_eq!(tuned_state.options.ppo.entropy_coef, 0.025);
+    assert_eq!(tuned_state.options.ppo.terminal_value_coef, 0.05);
+    assert_eq!(tuned_state.options.gae_lambda, 0.965);
+    assert_eq!(tuned_state.options.gae_within_turn_lambda, Some(0.98));
+    tuned_state.options = source_state.options.clone();
+    assert_eq!(
+        serde_json::to_string(&source_state).unwrap(),
+        serde_json::to_string(&tuned_state).unwrap()
+    );
+    let cleared = dir.join("cleared.npz");
+    train::fork(train::ForkArgs {
+        checkpoint: tuned,
+        out: cleared.clone(),
+        clear_gae_within_turn_lambda: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let (_, state) = checkpoint::load(&cleared).unwrap();
+    assert_eq!(state.options.gae_within_turn_lambda, None);
+    assert_eq!(state.options.gae_lambda, 0.965);
+    assert!(state.options.policy_rules.block_consecutive_freeze);
+    assert!(state.options.policy_rules.freeze_at_end);
+    train::resume(train::ResumeArgs {
+        backend: None,
+        device: 0,
+        checkpoint: cleared.clone(),
+        iterations: 3,
+        workers: 2,
+        out: None,
+        save_every: 0,
+    })
+    .unwrap();
+    let (_, resized) = checkpoint::load(&cleared).unwrap();
+    assert_eq!(resized.iteration, source_state.iteration + 1);
+    assert_eq!(resized.games, source_state.games + 2);
+    assert_eq!(resized.history.last().unwrap()["games"], 2);
+    assert_eq!(resized.options.epochs, 2);
+    let invalid = dir.join("invalid.npz");
+    assert!(
+        train::fork(train::ForkArgs {
+            checkpoint: child,
+            out: invalid.clone(),
+            lr: Some(f64::NAN),
+            ..Default::default()
+        })
+        .is_err()
+    );
+    assert!(!invalid.exists());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
