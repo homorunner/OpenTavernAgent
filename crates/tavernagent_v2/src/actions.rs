@@ -42,6 +42,19 @@ pub fn apply_with_rules(
     action: usize,
     rules: crate::rules::PolicyRules,
 ) -> Result<(), &'static str> {
+    apply_with(game, seat, action, rules, |game, seat, action| {
+        game.apply(seat, action)
+    })
+}
+
+/// Shared action expansion for ordinary evaluation and observational replay hooks.
+pub(crate) fn apply_with(
+    game: &mut Game,
+    seat: usize,
+    action: usize,
+    rules: crate::rules::PolicyRules,
+    mut apply: impl FnMut(&mut Game, usize, Action) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
     if rules.freeze_at_end && action == engine::A_FREEZE {
         let legal = game.legal_mask(seat);
         if !legal[engine::A_END] || !legal[engine::A_FREEZE] {
@@ -50,10 +63,11 @@ pub fn apply_with_rules(
         // An already frozen shop need not be toggled off. Partially frozen shops
         // become fully frozen, matching the engine Freeze button.
         if !game.players[seat].shop.iter().all(|slot| slot.frozen) {
-            game.apply(seat, Action::Freeze)?;
+            apply(game, seat, Action::Freeze)?;
         }
-        game.apply(seat, Action::EndTurn)
+        apply(game, seat, Action::EndTurn)
     } else {
-        apply(game, seat, action)
+        let engine = engine_action(game, seat, action)?;
+        apply(game, seat, engine)
     }
 }

@@ -20,20 +20,28 @@ struct Running {
     cursor: usize,
     acted: bool,
     rng: Pcg64Mcg,
-    history: ActionHistory,
+    histories: Vec<ActionHistory>,
+    model_seat: usize,
+    replay: Option<crate::replay::Recorder>,
+    evaluation_end: Option<(bool, u32)>,
     diagnostics: GameDiagnostics,
 }
 impl Running {
-    fn new(seed: u64, cfg: &RulesConfig) -> Result<Self, String> {
+    fn new(seed: u64, cfg: &RulesConfig, record: bool) -> Result<Self, String> {
         let mut game = Game::new(seed, cfg.clone());
         select_heroes(&mut game, seed)?;
+        let replay = record.then(|| crate::replay::Recorder::new(&game));
+        let histories = vec![ActionHistory::default(); game.players.len()];
         Ok(Self {
             game,
             seed,
             cursor: 0,
             acted: true,
             rng: game_rng(seed),
-            history: ActionHistory::default(),
+            histories,
+            model_seat: 0,
+            replay,
+            evaluation_end: None,
             diagnostics: GameDiagnostics::default(),
         })
     }
@@ -44,7 +52,18 @@ impl Running {
     ) -> Result<Option<Observation>, String> {
         loop {
             if self.cursor == 0 {
-                if self.game.is_over() || !self.game.players[0].alive {
+                if opponent != Opponent::SelfPlay
+                    && !self.game.players[0].alive
+                    && self.evaluation_end.is_none()
+                {
+                    self.evaluation_end =
+                        Some((self.game.turn_limit_end, self.game.truncated_combats));
+                }
+                if self.game.is_over()
+                    || (self.replay.is_none()
+                        && opponent != Opponent::SelfPlay
+                        && !self.game.players[0].alive)
+                {
                     return Ok(None);
                 }
                 if self.game.stopped_reason.is_some() || !self.acted {
@@ -58,21 +77,29 @@ impl Running {
                 continue;
             }
             self.acted = true;
-            if seat == 0 {
+            if opponent.is_model(seat) {
+                self.model_seat = seat;
                 return Ok(Some(observe_seat_with_rules(
                     &self.game,
-                    0,
+                    seat,
                     rules,
-                    &self.history,
+                    &self.histories[seat],
                 )));
             }
             let saved = self.game.rng.clone();
             let action = match opponent {
                 Opponent::Scripted => taverngym::bot::choose_action(&mut self.game, seat),
                 Opponent::Teacher => crate::teacher::choose_action(&mut self.game, seat),
+                Opponent::SelfPlay => unreachable!(),
             };
             self.game.rng = saved;
-            self.game.apply(seat, action).map_err(str::to_owned)?;
+            if let Some(replay) = &mut self.replay {
+                replay
+                    .apply_bot(&mut self.game, seat, action, opponent.name())
+                    .map_err(str::to_owned)?;
+            } else {
+                self.game.apply(seat, action).map_err(str::to_owned)?;
+            }
         }
     }
     fn apply(
@@ -85,11 +112,20 @@ impl Running {
     ) -> Result<(), String> {
         let turn = self.game.turn;
         let decision = policy::from_logits(logits, value, &obs.mask, &mut self.rng, !sample)?;
-        self.diagnostics
-            .record(&self.game, 0, &self.history, decision.action);
-        crate::actions::apply_with_rules(&mut self.game, 0, decision.action, rules)
-            .map_err(str::to_owned)?;
-        self.history.record(turn, decision.action);
+        let seat = self.model_seat;
+        if seat == 0 {
+            self.diagnostics
+                .record(&self.game, seat, &self.histories[seat], decision.action);
+        }
+        if let Some(replay) = &mut self.replay {
+            replay
+                .apply_model(&mut self.game, seat, decision, rules)
+                .map_err(str::to_owned)?;
+        } else {
+            crate::actions::apply_with_rules(&mut self.game, seat, decision.action, rules)
+                .map_err(str::to_owned)?;
+        }
+        self.histories[seat].record(turn, decision.action);
         Ok(())
     }
     fn finish(self) -> Result<GameEvaluation, String> {
@@ -97,11 +133,15 @@ impl Running {
         if placement == 0 || self.game.stopped_reason.is_some() {
             return Err("batched evaluation missing placement".into());
         }
+        let (turn_limit_end, truncated_combats) = self
+            .evaluation_end
+            .unwrap_or((self.game.turn_limit_end, self.game.truncated_combats));
         Ok(GameEvaluation {
             placement,
             diagnostics: self.diagnostics,
-            turn_limit_end: self.game.turn_limit_end,
-            truncated_combats: self.game.truncated_combats,
+            turn_limit_end,
+            truncated_combats,
+            replay: self.replay.map(|r| r.finish(&self.game)),
         })
     }
 }
@@ -118,6 +158,24 @@ pub fn evaluate(
     batch: usize,
     pool: &rayon::ThreadPool,
 ) -> Result<Vec<GameEvaluation>, String> {
+    evaluate_recorded(
+        net, execution, seeds, cfg, rules, opponent, sample, batch, pool, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_recorded(
+    net: &PolicyValueNet,
+    execution: &Execution,
+    seeds: &[u64],
+    cfg: &RulesConfig,
+    rules: PolicyRules,
+    opponent: Opponent,
+    sample: bool,
+    batch: usize,
+    pool: &rayon::ThreadPool,
+    record: bool,
+) -> Result<Vec<GameEvaluation>, String> {
     cfg.validate()?;
     if batch == 0 {
         return Err("inference-batch must be positive".into());
@@ -127,7 +185,7 @@ pub fn evaluate(
         let mut games = pool.install(|| {
             chunk
                 .par_iter()
-                .map(|&seed| Running::new(seed, cfg))
+                .map(|&seed| Running::new(seed, cfg, record))
                 .collect::<Result<Vec<_>, _>>()
         })?;
         loop {

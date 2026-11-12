@@ -24,7 +24,7 @@ enum Command {
     Resume(train::ResumeArgs),
     /// Change selected training options in a new checkpoint, preserving optimizer, RNG and counters.
     Fork(train::ForkArgs),
-    /// Evaluate the policy directly against seven scripted or teacher bots.
+    /// Evaluate against bots or the same checkpoint; optionally export full JSONL replays.
     Eval(eval::EvalArgs),
     /// Evaluate four candidate copies against four frozen references with paired seats.
     Arena(arena::ArenaArgs),

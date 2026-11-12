@@ -22,6 +22,7 @@ pub mod npz;
 pub mod observation;
 pub mod policy;
 pub mod ppo;
+pub mod replay;
 pub mod rollout;
 pub mod rules;
 pub mod teacher;

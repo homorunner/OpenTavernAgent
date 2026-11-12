@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>TavernAgent · 对局回放</title>
+        <link rel="stylesheet" href="style.css" />
+        <script src="viewer.js" defer></script>
+    </head>
+    <body>
+        <header>
+            <h1>TavernAgent <span>文字回放</span></h1>
+            <p>查看每一步选择、回合结束阵容与最后一战。</p>
+            <section id="server" class="server" hidden>
+                <h2>服务器文件</h2>
+                <form id="server-form" class="server-path">
+                    <label for="server-path">目录或 JSONL 路径</label>
+                    <input
+                        id="server-path"
+                        type="text"
+                        value="/"
+                        placeholder="/runs/replay/"
+                    />
+                    <button type="submit">打开</button>
+                    <button id="server-up" type="button">上一级</button>
+                    <button id="server-root" type="button">根目录</button>
+                    <button id="server-refresh" type="button">刷新</button>
+                </form>
+                <p id="server-status" class="muted" role="status"></p>
+                <div id="server-entries" class="server-entries"></div>
+            </section>
+            <label class="file"
+                >选择本机文件（不上传）
+                <input
+                    id="file"
+                    type="file"
+                    accept=".jsonl,.json,text/plain,application/json"
+                    multiple
+            /></label>
+            <p id="status" role="status">请选择 eval --replay 导出的 JSONL。</p>
+        </header>
+        <main id="viewer" hidden>
+            <nav class="toolbar" aria-label="回放导航">
+                <label
+                    >对局
+                    <select id="game"></select
+                ></label>
+                <label
+                    >玩家
+                    <select id="seat"></select
+                ></label>
+                <button id="prev" type="button">← 上回合</button>
+                <label
+                    >回合
+                    <select id="turn"></select
+                ></label>
+                <button id="next" type="button">下回合 →</button>
+                <button id="final" type="button">最后一战</button>
+            </nav>
+            <p id="metadata" class="muted"></p>
+            <p id="warning" class="warning" hidden></p>
+            <details>
+                <summary>最终排名与各玩家最后的战前阵容</summary>
+                <div id="results"></div>
+            </details>
+            <section>
+                <h2 id="round-title"></h2>
+                <div id="combats"></div>
+            </section>
+            <div class="columns">
+                <section>
+                    <h2>决策记录</h2>
+                    <p class="muted">
+                        展开一条决策，比较金币、商店、手牌和阵容。位置从 1
+                        开始。
+                    </p>
+                    <div id="actions"></div>
+                </section>
+                <section>
+                    <h2>回合结束阵容</h2>
+                    <p class="muted">结算完回合结束效果、战斗开始前的阵容。</p>
+                    <div id="boards"></div>
+                </section>
+            </div>
+        </main>
+        <footer>
+            只读回放 · 不包含逐次攻击动画 ·
+            自对弈的名次用于观察策略，不是独立强度评分
+        </footer>
+    </body>
+</html>

@@ -282,6 +282,48 @@ target/release/tavernagent_v2 arena \
   --games 1024 --workers 16 --seed 20000000 --out runs/freeze-test/arena.json
 ```
 
+### 完整对局导出与文字回放
+
+`eval --out` 保存汇总 JSON；额外指定 `--replay` 可导出完整对局 JSONL，每行一场，按游戏种子顺序排列。支持 `scripted`、`teacher`，以及 `--opponent selfplay`：八个座位使用同一个 checkpoint，各自维护动作历史和规则。默认 greedy；`--sample` 按策略概率采样，更接近训练时的自博弈行为，但不更新参数。
+
+下面使用快速使用示例训练得到的模型，生成一场自对弈回放：
+
+```bash
+cargo build --release -p tavernagent_v2
+target/release/tavernagent_v2 eval \
+  --model runs/tavernagent_v2/model.npz --opponent selfplay --sample \
+  --games 1 --workers 2 --seed 120000000 \
+  --out runs/replay/selfplay-summary.json --replay runs/replay/selfplay.jsonl
+
+# 固定 bot 的完整对局也可以导出
+target/release/tavernagent_v2 eval \
+  --model runs/tavernagent_v2/model.npz --opponent teacher \
+  --games 2 --workers 2 --seed 120000001 \
+  --replay runs/replay/teacher.jsonl
+```
+
+在仓库根目录执行 `python3 -m http.server` 后，用浏览器访问该服务的 `/tools/ppo_replay/`。页面自动显示“服务器文件”，从服务根目录逐层进入文件夹，点击 JSONL 即可直接读取，无需浏览器文件选择或上传。也可以填写服务器路径（例如 `/runs/replay/selfplay.jsonl`）直接打开；“刷新”用于查看新生成的文件。目录浏览兼容 Python `http.server` 的目录列表，不递归扫描整个仓库。
+
+链接可以附带 `?replay=/runs/replay/selfplay.jsonl` 自动加载指定文件，路径指向使用者按上文命令生成的产物。若目录存在首页而不显示目录列表，仍可直接填写 JSONL 路径。只读取当前 HTTP 服务提供的文件，不访问服务器文件系统的其他位置。
+
+也可以直接用浏览器打开 [文字回放页面](../tools/ppo_replay/index.html)，点击“选择本机文件”读取 JSONL；这种方式不上传内容。两种方式均无需构建或第三方前端依赖。可以切换对局、玩家、回合，展开决策前后的金币、手牌、商店和阵容，查看动作概率与 value、每回合对手和伤害，以及最终名次。点击“最后一战”查看最后一个战斗回合的全部存活玩家；只有该回合恰好两人存活时才标为二人决赛。最终排名表保留每位玩家最后一次战斗前的阵容。
+
+导出覆盖八个座位，固定 bot 对局也会在零号玩家淘汰后继续到整局结束。汇总指标仍针对零号玩家，固定 bot 的诊断和异常计数保留原来的评估截止口径；JSONL 中的名次与异常计数覆盖整局。自对弈汇总同样只统计零号玩家，不能把它作为独立的绝对强度分数。
+
+格式标识为 `schema="tavernagent_v2.replay"`、`version=1`；每行包含模型轮数及训练种子、后端、策略规则、游戏规则、八席 `placements` 和 `events`。64 位游戏种子与模型种子以字符串保存，避免浏览器整数精度丢失。事件如下：
+
+| type | 内容 |
+| --- | --- |
+| `turn_start` | 八个玩家的回合开始状态，包含已选英雄 |
+| `action` | 玩家、控制策略、引擎动作、动作前后状态；模型动作另有紧凑动作索引、选择概率、value 和 Freeze-and-End 标记 |
+| `combat_start` | 全部回合结束效果结算后、战斗随机数消耗前的八席状态；用于回合结束阵容 |
+| `combat_end` | 实际配对、胜负、伤害、截断标记及结算后状态 |
+| `game_end` | 八席最终状态与名次 |
+
+若动作触发整轮战斗，其 `after.turn` 可能已进入下一回合；页面会标注，不将此快照当作上一回合战前阵容。记录通过引擎暂停/恢复接口捕获战斗边界，不增加随机采样，不记录选英雄的独立随机决策或逐次战斗攻击动画。到达回合上限、战斗截断会显式显示。
+
+CPU/CUDA 共用记录路径；CPU 已验证开启记录前后的名次、诊断和 RNG 一致，以及不同 workers / batch 下完整回放一致。导出会增加时间和文件体积，建议先用 1–2 局观察；内存中最多保留四场完整回放。浏览器单文件限制为 256 MiB，较大评估应减少单次导出局数。回放文件存在时拒绝覆盖；成功后发布最终文件，失败时删除本次 `.partial`。没有传入 `--replay` 时不保存完整状态。
+
 ### Checkpoint 联赛与 Elo
 
 打固定 bot 的平均排名接近 1.2 后，继续保留这一指标作行为回归检查，训练阶段的相对强度主要看 **每 500 轮 checkpoint 的共享联赛**。`league` 复用 v1 的评估口径：每桌八个不同 checkpoint，随机分配座位，记录八席完整名次；[league_elo.py](../tools/league_elo.py) 用 Plackett–Luce 拟合强度，按 `400 × log10(strength)` 转成 Elo。它与 `arena` 的两模型 4v4 评估分别使用。
@@ -728,6 +770,7 @@ A 在五个配对种子、两类对手上全部领先，平均排名改善 0.040
 | [batched.rs](../crates/tavernagent_v2/src/batched.rs) / [batched_eval.rs](../crates/tavernagent_v2/src/batched_eval.rs) / [batched_arena.rs](../crates/tavernagent_v2/src/batched_arena.rs) | 保持座位顺序的跨游戏合批 |
 | [ppo_notify.py](../tools/ppo_notify.py) | 读取训练与联赛结果、绘制三张图、定期发送飞书卡片 |
 | [critic.rs](../crates/tavernagent_v2/src/critic.rs) | 冻结 critic 诊断、逐回合 explained variance 和回报预测误差 |
+| [replay.rs](../crates/tavernagent_v2/src/replay.rs) / [文字回放页面](../tools/ppo_replay/index.html) | 完整对局 JSONL、战前阵容快照和离线回放 |
 
 ```bash
 cargo test --release -p tavernagent_v2
@@ -736,6 +779,7 @@ cargo fmt -p tavernagent_v2 -- --check
 cargo clippy -p tavernagent_v2 --all-targets -- -D warnings
 cargo clippy -p tavernagent_v2 --all-targets --features cuda -- -D warnings
 python3 -m unittest discover -s tools -p 'test_ppo_*.py'
+node --test tools/ppo_replay/viewer.test.cjs
 ```
 
 已有检查覆盖动作和磁力映射、mask 逃生规则、饰品来源、v1 观测/FP32 一致性、terminal/bootstrap GAE、有限差分梯度、actor/learner 概率一致性、按座位奖励、跨 workers 采样与更新一致性、KL 停止和恢复。CPU 检查还覆盖跨游戏合批的完整轨迹、固定 bot 评估和混桌结果一致性；GPU 通过 `cuda-check` 单独验收。其余检查包括 teacher 逐动作 v1 一致性、iteration-0 恢复、连续 Freeze 的座位/回合隔离、规则 fork 状态保留和混桌中性分数。开局工具通过 clippy，试跑验证 1/2 workers 轨迹相同，完整统计校验两个回合都有结束记录。
