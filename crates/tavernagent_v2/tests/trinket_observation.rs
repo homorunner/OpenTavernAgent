@@ -3,7 +3,7 @@ use tavernagent_v2::net::{OWNED_TRINKET_SLOTS, TRINKET_SLOT_START, card_slot_ind
 use tavernagent_v2::observation::observe_seat;
 use taverngym::actions::Action;
 use taverngym::cards::{CardId, cid};
-use taverngym::state::{Pending, TrinketSource};
+use taverngym::state::{Item, Pending, QuestState, TrinketSource};
 use taverngym::{Game, RulesConfig, content};
 
 fn game() -> Game {
@@ -101,7 +101,7 @@ fn marin_and_buttons_offers_remember_the_actual_power_slot() {
 }
 
 #[test]
-fn boutique_trinkets_are_observed_only_for_the_first_owned_reward() {
+fn boutique_trinkets_are_observed_only_for_the_last_owned_reward() {
     for reward in ["BG33_Reward_014", "BG33_Reward_015"] {
         let mut g = game();
         let reward = cid(reward);
@@ -119,16 +119,79 @@ fn boutique_trinkets_are_observed_only_for_the_first_owned_reward() {
         *options = vec![target];
         g.apply(0, Action::Choose(0)).unwrap();
         let obs = observe_seat(&g, 0);
+        assert_eq!(obs.cards[7], index(target));
+        assert_eq!(obs.cards[TRINKET_SLOT_START], 0);
+        assert_eq!(g.players[0].rewards[1], reward);
+        // Once another reward is last, the previous reward's trinket stays hidden.
+        let next = cid("BG24_Reward_362");
+        g.players[0].rewards.push(next);
+        let obs = observe_seat(&g, 0);
+        assert_eq!(obs.cards[7], index(next));
         assert!(
             card_slot_indices()
                 .iter()
                 .all(|&i| obs.cards[i] != index(target))
         );
+    }
+}
+
+#[test]
+fn quest_rewards_and_evidence_choices_preserve_the_power_slot() {
+    for power_slot in 0..taverngym::actions::N_POWERS {
+        let mut g = game();
+        let power = cid("BG24_HERO_100p");
+        g.set_hero_power(0, power_slot, power);
+        g.players[0].pending.clear();
+        let quest = cid("BG24_Quest_126");
+        let evidence = cid("BG24_Reward_363");
+        g.players[0].quests.push(QuestState {
+            card: quest,
+            reward: evidence,
+            progress: 0,
+            goal: 1,
+            data: 0,
+            reward_data: 0,
+        });
+        let obs = observe_seat(&g, 0);
+        assert_eq!(obs.cards[1 + power_slot], index(power));
+        assert_eq!(obs.cards[5], index(quest));
+        assert_eq!(obs.cards[6], index(evidence));
+        assert_eq!(obs.cards[7], 0);
+        g.with_recruit(0, |c| c.quest_progress(0, quest, 1));
+        let obs = observe_seat(&g, 0);
+        assert_eq!(obs.cards[1 + power_slot], index(power));
+        assert_eq!(obs.cards[5], 0);
+        assert_eq!(obs.cards[7], index(evidence));
+
+        // Resolve real Discover actions: each new pick replaces the prior extra reward.
+        for reward in [cid("BG24_Reward_362"), cid("BG33_Reward_014")] {
+            g.players[0].pending.push(Pending::Discover {
+                source: evidence,
+                options: vec![Item::Spell {
+                    card: reward,
+                    data: 0,
+                }],
+            });
+            let option_slot = TRINKET_SLOT_START - taverngym::actions::N_CHOICE;
+            assert_eq!(observe_seat(&g, 0).cards[option_slot], index(reward));
+            g.apply(0, Action::Choose(0)).unwrap();
+            assert_eq!(g.players[0].rewards, vec![evidence, reward]);
+            let before = serde_json::to_value(&g).unwrap();
+            let obs = observe_seat(&g, 0);
+            assert_eq!(obs.cards[1 + power_slot], index(power));
+            assert_eq!(obs.cards[7], index(reward));
+            assert_eq!(serde_json::to_value(&g).unwrap(), before);
+        }
+        let reward = cid("BG33_Reward_014");
+        let trinket = cid("BG30_MagicItem_841");
+        buy(&mut g, trinket, Some(TrinketSource::QuestReward(reward)));
+        let obs = observe_seat(&g, 0);
+        assert_eq!(obs.cards[1 + power_slot], index(power));
+        assert_eq!(obs.cards[7], index(trinket));
         assert_eq!(obs.cards[TRINKET_SLOT_START], 0);
-        assert_eq!(g.players[0].rewards[1], reward);
-        // Once this is the first owned reward, its trinket occupies that slot.
-        g.players[0].rewards.remove(0);
-        assert_eq!(observe_seat(&g, 0).cards[7], index(target));
+        assert_eq!(g.players[0].powers[power_slot].card, power);
+        let restored: Game = serde_json::from_value(serde_json::to_value(&g).unwrap()).unwrap();
+        assert_eq!(observe_seat(&restored, 0).cards, obs.cards);
     }
 }
 

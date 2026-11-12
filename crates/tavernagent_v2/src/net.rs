@@ -60,7 +60,7 @@ pub fn input_feature_indices() -> Vec<usize> {
 pub const TRINKET_SLOT_START: usize = N_CARD_SLOTS - N_OPP_BOARD_SLOTS - o::N_OPP - 8;
 pub const OWNED_TRINKET_SLOTS: usize = 2;
 
-/// Keep the first quest, its target reward and the first owned reward (three slots).
+/// Keep the first quest, its target reward and the owned-reward slot (three slots).
 /// Also omit Deity, secrets, surplus trinket slots and historical warbands.
 pub fn card_slot_indices() -> Vec<usize> {
     let quest_start = 1 + a::N_POWERS + 2;

@@ -28,7 +28,7 @@ pub fn observe_seat_with_rules(
     history: &ActionHistory,
 ) -> Observation {
     let mut o = observe(game, seat);
-    map_owned_trinkets(&game.players[seat], &mut o.cards);
+    map_owned_effects(&game.players[seat], &mut o.cards);
     // Combat fixes cap eligibility at recruit start, even if a player dies mid-turn.
     let alive = match game.turn_alive {
         0 => game.alive_count(),
@@ -53,7 +53,7 @@ pub fn observe_seat_with_rules(
 /// Compact acquisition sources without moving the engine's actual effects. Orb shells
 /// have already fired; only their resulting trinkets occupy a slot. Pending choices are
 /// deliberately untouched, including Orb options that have not been bought yet.
-fn map_owned_trinkets(player: &taverngym::state::Player, cards: &mut [i32]) {
+fn map_owned_effects(player: &taverngym::state::Player, cards: &mut [i32]) {
     use crate::net::{OWNED_TRINKET_SLOTS, TRINKET_SLOT_START};
     use taverngym::state::TrinketSource;
 
@@ -61,6 +61,10 @@ fn map_owned_trinkets(player: &taverngym::state::Player, cards: &mut [i32]) {
         card.base() == taverngym::cardid!("BG35_MagicItem_816")
             || card.base() == taverngym::cardid!("BG35_MagicItem_816t")
     };
+    let reward_slot = 1 + taverngym::actions::N_POWERS + 2 + 2;
+    let reward = player.rewards.last().copied();
+    // Ethereal Evidence appends its current pick after the permanent reward shell.
+    cards[reward_slot] = reward.map_or(0, |card| card.idx() as i32 + 1);
     cards[TRINKET_SLOT_START..TRINKET_SLOT_START + 8].fill(0);
     for (slot, power) in player
         .powers
@@ -83,12 +87,12 @@ fn map_owned_trinkets(player: &taverngym::state::Player, cards: &mut [i32]) {
                 (usize::from(slot) < taverngym::actions::N_POWERS).then_some(1 + usize::from(slot))
             }
             Some(TrinketSource::QuestReward(reward)) => {
-                // Only the first owned reward is observed. Hidden rewards must not
+                // Only the last owned reward is observed. Hidden rewards must not
                 // spill their trinkets into the ordinary owned-trinket slots.
-                if player.rewards.first() != Some(&reward) {
+                if player.rewards.last() != Some(&reward) {
                     continue;
                 }
-                Some(1 + taverngym::actions::N_POWERS + 2 + 2)
+                Some(reward_slot)
             }
             None => None,
         };
