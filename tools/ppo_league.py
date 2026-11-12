@@ -73,8 +73,15 @@ class League:
             if not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in self.sources:
                 raise ValueError('run labels must be unique simple names')
             self.sources[name] = Path(path).resolve()
+        self.references = {}
+        for spec in args.reference:
+            name, path = spec.split('=', 1)
+            if not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in self.sources or name in self.references:
+                raise ValueError('reference labels must be unique and distinct from run labels')
+            self.references[name] = Path(path).resolve()
         self.models = json.loads((self.root / 'models.json').read_text()) if (self.root / 'models.json').exists() else {}
         settings = {'runs': {n: str(p) for n, p in self.sources.items()},
+                    'references': {n: str(p) for n, p in self.references.items()},
                     'binary_sha256': digest(args.binary), 'fitter_sha256': digest(Path(__file__).with_name('league_elo.py')),
                     'controller_sha256': digest(Path(__file__)),
                     'interval': args.interval, 'target_iteration': args.target_iteration,
@@ -104,19 +111,21 @@ class League:
             'batch': self.batch, **extra})
 
     def discover(self):
-        for label, directory in self.sources.items():
-            candidates = sorted(directory.glob('model.iter*.npz'))
-            if (directory / 'initial.npz').exists():
+        for label in [*self.sources, *self.references]:
+            fixed = label in self.references
+            directory = self.sources.get(label)
+            candidates = [self.references[label]] if fixed else sorted(directory.glob('model.iter*.npz'))
+            if not fixed and (directory / 'initial.npz').exists():
                 candidates.append(directory / 'initial.npz')
             for path in candidates:
                 if any(m['path'] == str(path) for m in self.models.values()):
                     continue
                 match = re.fullmatch(r'model\.iter(\d+)\.npz', path.name)
-                if match and (int(match[1]) % self.args.interval or int(match[1]) > self.args.target_iteration):
+                if not fixed and match and (int(match[1]) % self.args.interval or int(match[1]) > self.args.target_iteration):
                     continue
                 state = checkpoint_state(path)
                 iteration = state['iteration']
-                if iteration == 0 or iteration % self.args.interval or iteration > self.args.target_iteration:
+                if not fixed and (iteration == 0 or iteration % self.args.interval or iteration > self.args.target_iteration):
                     continue
                 if match and int(match[1]) != iteration:
                     raise ValueError(f'checkpoint name/metadata mismatch: {path}')
@@ -260,6 +269,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--run', action='append', required=True)
+    parser.add_argument('--reference', action='append', default=[], metavar='LABEL=CHECKPOINT',
+                        help='frozen reference, independent of training iteration ceiling')
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--anchor', required=True)
     parser.add_argument('--anchor-rating', type=float, default=1000)

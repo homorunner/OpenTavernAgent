@@ -5,11 +5,34 @@ import tempfile
 from pathlib import Path
 from collections import Counter
 import numpy as np
+from types import SimpleNamespace
+from unittest.mock import patch
 from league_elo import ratings_with_bootstrap, validate_games
 from ppo_league import League, schedule
 
 
 class LeagueTests(unittest.TestCase):
+    def test_frozen_reference_can_exceed_candidate_iteration_ceiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidates = root / 'candidate'
+            candidates.mkdir()
+            (candidates / 'model.iter4000.npz').write_bytes(b'excluded')
+            reference = root / 'model.iter5000.npz'
+            reference.write_bytes(b'frozen reference')
+            league = League.__new__(League)
+            league.root = root
+            league.sources = {'candidate': candidates}
+            league.references = {'baseline': reference}
+            league.models = {}
+            league.args = SimpleNamespace(interval=500, target_iteration=3000)
+            state = {'iteration': 5000, 'options': {'seed': 4, 'hidden': 256,
+                     'blocks': 6, 'max_turns': 40, 'budgets': {}}}
+            with patch('ppo_league.checkpoint_state', return_value=state):
+                league.discover()
+            self.assertEqual(list(league.models), ['baseline_s5000'])
+            self.assertEqual(league.models['baseline_s5000']['iteration'], 5000)
+
     def test_scheduler_connects_new_cohort_and_balances_seats(self):
         names = [f'm{i}' for i in range(24)]
         counts = Counter({name: 256 for name in names[:16]})

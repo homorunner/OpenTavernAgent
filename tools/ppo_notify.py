@@ -133,7 +133,10 @@ def plot_evaluation(snapshot, opponent, path):
         for row in data.get('evaluations', []):
             if row['opponent'] == opponent:
                 groups[row['run']][row['iteration']] = row
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6.5), gridspec_kw={'width_ratios': [1, 1.4]})
+    legend_rows = (len(groups) + 3) // 4
+    legend_height = max(1.0, .22 * legend_rows + .25)
+    height = 5.5 + legend_height
+    fig, axes = plt.subplots(1, 2, figsize=(14, height), gridspec_kw={'width_ratios': [1, 1.4]})
     markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*', '<', '>', 'h']
     zoom_rows = []
     for i, (name, points) in enumerate(sorted(groups.items())):
@@ -167,7 +170,7 @@ def plot_evaluation(snapshot, opponent, path):
     timestamp=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     title='Scripted bot evaluation' if opponent=='scripted' else 'Teacher bot evaluation'
     fig.suptitle(f'{title} — against 7 bots\n{timestamp} | Error bars: 95% game-sampling intervals',fontsize=13)
-    fig.tight_layout(rect=(0,.16,1,1))
+    fig.tight_layout(rect=(0,legend_height/height,1,1))
     fig.savefig(path,dpi=135)
     plt.close(fig)
 
@@ -180,7 +183,9 @@ def plot_ratings(data, path):
     groups = defaultdict(list)
     for name, row in ratings.items():
         groups[row['run']].append(row)
-    fig, ax = plt.subplots(figsize=(12, 7))
+    legend_height = max(1.0, .22 * ((len(groups) + 3) // 4) + .25)
+    height = 6.0 + legend_height
+    fig, ax = plt.subplots(figsize=(14, height))
     markers = ['o', 's', '^', 'D', 'v', 'P', 'X', '*', '<', '>', 'h']
     for i, (name, rows) in enumerate(sorted(groups.items())):
         rows.sort(key=lambda r: r['iteration'])
@@ -196,8 +201,9 @@ def plot_ratings(data, path):
     ax.set_ylabel('Elo (fixed anchor = 1000)')
     ax.grid(alpha=.25)
     if groups:
-        ax.legend(fontsize=7, ncol=2)
-    fig.tight_layout()
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(handles, labels, loc='lower center', fontsize=7, ncol=4)
+    fig.tight_layout(rect=(0,legend_height/height,1,1))
     fig.savefig(path, dpi=135)
     plt.close(fig)
     return True
