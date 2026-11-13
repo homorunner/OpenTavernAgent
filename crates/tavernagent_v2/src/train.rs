@@ -17,6 +17,25 @@ use crate::ppo::{self, PpoOptions, Trainer};
 use crate::rollout;
 use crate::rules::{ActionCounts, Budgets, PolicyRules};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LrSchedule {
+    /// Preserve constant LR when loading checkpoints without schedule metadata.
+    #[default]
+    Constant,
+    Cosine,
+}
+
+fn default_lr_min() -> f64 {
+    2e-5
+}
+fn default_lr_decay_start() -> usize {
+    5000
+}
+fn default_lr_decay_end() -> usize {
+    10000
+}
+
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
 pub struct TrainOptions {
     /// Fixed C architecture; retained in checkpoints for schema validation.
@@ -36,6 +55,19 @@ pub struct TrainOptions {
     pub batch: usize,
     #[arg(long, default_value_t = 1e-4)]
     pub lr: f64,
+    /// New training defaults to cosine decay; legacy checkpoints retain constant LR.
+    #[serde(default)]
+    #[arg(long, value_enum, default_value_t = LrSchedule::Cosine)]
+    pub lr_schedule: LrSchedule,
+    #[serde(default = "default_lr_min")]
+    #[arg(long, default_value_t = default_lr_min())]
+    pub lr_min: f64,
+    #[serde(default = "default_lr_decay_start")]
+    #[arg(long, default_value_t = default_lr_decay_start())]
+    pub lr_decay_start: usize,
+    #[serde(default = "default_lr_decay_end")]
+    #[arg(long, default_value_t = default_lr_decay_end())]
+    pub lr_decay_end: usize,
     /// Discount per decision of the same seat, not per global engine step.
     #[arg(long, default_value_t = 1.0)]
     pub gamma: f32,
@@ -91,6 +123,20 @@ impl Default for TrainOptions {
 }
 
 impl TrainOptions {
+    /// LR for the absolute, one-based training iteration (not Adam minibatch count).
+    pub fn learning_rate(&self, iteration: usize) -> f64 {
+        if self.lr_schedule == LrSchedule::Constant || iteration <= self.lr_decay_start {
+            return self.lr;
+        }
+        if iteration >= self.lr_decay_end {
+            return self.lr_min;
+        }
+        let progress = (iteration - self.lr_decay_start) as f64
+            / (self.lr_decay_end - self.lr_decay_start) as f64;
+        self.lr_min
+            + 0.5 * (self.lr - self.lr_min) * (1.0 + (std::f64::consts::PI * progress).cos())
+    }
+
     pub fn net_config(&self) -> NetConfig {
         NetConfig {
             architecture: self.architecture,
@@ -126,6 +172,16 @@ impl TrainOptions {
             || self.lr <= 0.0
         {
             return Err("games, epochs, batch and lr must be positive".into());
+        }
+        if self.lr_schedule == LrSchedule::Cosine
+            && (!self.lr_min.is_finite()
+                || self.lr_min <= 0.0
+                || self.lr_min > self.lr
+                || self.lr_decay_end <= self.lr_decay_start)
+        {
+            return Err(
+                "cosine LR requires 0 < lr-min <= lr and lr-decay-start < lr-decay-end".into(),
+            );
         }
         if !(0.0..=1.0).contains(&self.gamma) || !(0.0..=1.0).contains(&self.gae_lambda) {
             return Err("gamma and gae-lambda must be in [0, 1]".into());
@@ -194,6 +250,14 @@ pub struct ForkArgs {
     pub freeze_at_end: Option<bool>,
     #[arg(long)]
     pub lr: Option<f64>,
+    #[arg(long, value_enum)]
+    pub lr_schedule: Option<LrSchedule>,
+    #[arg(long)]
+    pub lr_min: Option<f64>,
+    #[arg(long)]
+    pub lr_decay_start: Option<usize>,
+    #[arg(long)]
+    pub lr_decay_end: Option<usize>,
     /// Complete games per future iteration; existing cumulative counts are preserved.
     #[arg(long)]
     pub games: Option<usize>,
@@ -231,6 +295,18 @@ pub fn fork(args: ForkArgs) -> Result<(), String> {
     }
     if let Some(value) = args.lr {
         state.options.lr = value;
+    }
+    if let Some(value) = args.lr_schedule {
+        state.options.lr_schedule = value;
+    }
+    if let Some(value) = args.lr_min {
+        state.options.lr_min = value;
+    }
+    if let Some(value) = args.lr_decay_start {
+        state.options.lr_decay_start = value;
+    }
+    if let Some(value) = args.lr_decay_end {
+        state.options.lr_decay_end = value;
     }
     if let Some(value) = args.games {
         state.options.games = value;
@@ -359,6 +435,7 @@ fn run(
         let iteration_start = Instant::now();
         let start = Instant::now();
         let opts = &state.options;
+        let learning_rate = opts.learning_rate(iteration);
         let seeds = (0..opts.games)
             .map(|i| {
                 opts.seed
@@ -417,7 +494,7 @@ fn run(
                     &samples,
                     opts.epochs,
                     opts.batch,
-                    opts.lr,
+                    learning_rate,
                     &opts.ppo,
                     &mut state.shuffle_rng,
                 )
@@ -428,7 +505,7 @@ fn run(
                 &samples,
                 opts.epochs,
                 opts.batch,
-                opts.lr,
+                learning_rate,
                 &opts.ppo,
                 &mut state.shuffle_rng,
             )?
@@ -442,7 +519,7 @@ fn run(
         state.games += opts.games as u64;
         state.transitions += samples_count as u64;
         let mut entry = json!({"iteration": iteration, "games": opts.games, "transitions": samples_count,
-            "backend":opts.backend,
+            "backend":opts.backend, "learning_rate": learning_rate,
             "total_games": state.games, "total_transitions": state.transitions,
             "mean_turns": mean_turns, "seat0_mean_placement": seat0_mean_placement,
             "turn_limit_games": turn_limit_games, "truncated_combats": truncated_combats,
