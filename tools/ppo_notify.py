@@ -51,6 +51,8 @@ for run in runs:
             match=re.fullmatch(r'eval-(\d+)-(scripted|teacher)\.json',path.name)
             if not match:
                 continue
+            if int(match[1]) in run.get('exclude_iterations', []):
+                continue
             row=json.loads(path.read_text())
             if row['iteration']!=int(match[1]) or row['opponent']!=match[2]:
                 raise ValueError('evaluation filename and metadata differ')
@@ -84,6 +86,8 @@ def collect(config):
         for name, task in tasks.items():
             try:
                 result[name] = task.result()
+                if source_note := config['sources'][name].get('plot_note'):
+                    result[name]['plot_note'] = source_note
             except Exception as error:
                 result[name] = {'error': type(error).__name__}
     return result
@@ -169,10 +173,26 @@ def plot_evaluation(snapshot, opponent, path):
         axes[0].text(.5,.5,'No completed evaluation data',transform=axes[0].transAxes,ha='center')
     timestamp=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     title='Scripted bot evaluation' if opponent=='scripted' else 'Teacher bot evaluation'
-    fig.suptitle(f'{title} — against 7 bots\n{timestamp} | Error bars: 95% game-sampling intervals',fontsize=13)
+    note = snapshot.get('league', {}).get('plot_note', '')
+    suffix = f'\n{note}' if note else ''
+    fig.suptitle(f'{title} — against 7 bots\n{timestamp} | Error bars: 95% game-sampling intervals{suffix}',fontsize=13)
     fig.tight_layout(rect=(0,legend_height/height,1,1))
     fig.savefig(path,dpi=135)
     plt.close(fig)
+
+
+def rating_series(data):
+    """Replace grouped member curves by their available-seed bootstrap means."""
+    averages = data.get('rating_groups') or {}
+    members = {run for group in averages.values() for run in group['members']}
+    groups = defaultdict(list)
+    for row in (data.get('ratings') or {}).values():
+        if row['run'] not in members:
+            groups[row['run']].append(row)
+    for name, group in averages.items():
+        if group['points']:
+            groups[f"{name} (available-seed mean)"] = group['points']
+    return groups
 
 
 def plot_ratings(data, path):
@@ -180,9 +200,7 @@ def plot_ratings(data, path):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    groups = defaultdict(list)
-    for name, row in ratings.items():
-        groups[row['run']].append(row)
+    groups = rating_series(data)
     legend_height = max(1.0, .22 * ((len(groups) + 3) // 4) + .25)
     height = 6.0 + legend_height
     fig, ax = plt.subplots(figsize=(14, height))
@@ -192,13 +210,20 @@ def plot_ratings(data, path):
         ax.errorbar([r['iteration'] for r in rows], [r['elo'] for r in rows],
                     yerr=[1.96*r['se'] for r in rows], marker=markers[i % len(markers)],
                     linestyle=['-', '--', '-.', ':'][i//5 % 4], capsize=2, markersize=4, label=series_label(name))
+        for row in rows:
+            if 'expected_seeds' in row:
+                ax.annotate(f"{row['seeds']}/{row['expected_seeds']} seeds",
+                            (row['iteration'], row['elo']), xytext=(0, 8),
+                            textcoords='offset points', ha='center', fontsize=7)
+
     meta = data.get('ratings_meta') or {}
     counts = [r['games'] for r in ratings.values()]
     timestamp=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     count_label=f'{min(counts)}–{max(counts)} games/model' if counts else 'No completed ratings'
-    ax.set_title(f"Arena Elo: {len(ratings)} checkpoints, {meta.get('games', '?')} games\n{timestamp} | {count_label}; error bars: 95% whole-game bootstrap")
+    suffix = f"\n{data['plot_note']}" if data.get('plot_note') else ''
+    ax.set_title(f"Arena Elo: {len(ratings)} checkpoints, {meta.get('games', '?')} games\n{timestamp} | {count_label}; error bars: 95% whole-game bootstrap{suffix}")
     ax.set_xlabel('Training iteration')
-    ax.set_ylabel('Elo (fixed anchor = 1000)')
+    ax.set_ylabel(f"Elo ({meta.get('anchor', 'fixed anchor')} = {meta.get('anchor_rating', 1000):g})")
     ax.grid(alpha=.25)
     if groups:
         handles, labels = ax.get_legend_handles_labels()

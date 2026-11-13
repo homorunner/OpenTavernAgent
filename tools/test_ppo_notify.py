@@ -5,10 +5,25 @@ import json
 import subprocess
 import sys
 from unittest.mock import Mock
-from ppo_notify import Feishu, events, read_env, image_card, source_script
+from ppo_notify import Feishu, events, read_env, image_card, source_script, rating_series
 
 
 class NotificationTests(unittest.TestCase):
+    def test_rating_plot_replaces_baseline_seeds_with_one_mean_series(self):
+        data = {'ratings': {'a': {'run': 'a', 'iteration': 3000, 'elo': 900},
+                            'b': {'run': 'b', 'iteration': 3000, 'elo': 1100},
+                            'a_next': {'run': 'a', 'iteration': 3500, 'elo': 1200},
+                            'c': {'run': 'candidate', 'iteration': 500, 'elo': 800}},
+                'rating_groups': {'baseline': {'members': ['a', 'b'],
+                    'points': [{'iteration': 3000, 'elo': 1000, 'se': 10, 'seeds': 2, 'expected_seeds': 2},
+                               {'iteration': 3500, 'elo': 1200, 'se': 12, 'seeds': 1, 'expected_seeds': 2}]}}}
+        series = rating_series(data)
+        self.assertEqual(set(series), {'baseline (available-seed mean)', 'candidate'})
+        self.assertEqual(series['baseline (available-seed mean)'], data['rating_groups']['baseline']['points'])
+        # No rated checkpoints means no mean point, rather than individual curves.
+        data['rating_groups']['baseline']['points'] = []
+        self.assertEqual(set(rating_series(data)), {'candidate'})
+
     def test_read_env_does_not_execute_shell(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'env'
@@ -67,6 +82,11 @@ class NotificationTests(unittest.TestCase):
             self.assertEqual(len(rows),1)
             self.assertEqual(rows[0]['games'],2048)
             self.assertEqual(rows[0]['run'],'test')
+            source['eval_runs'][0]['exclude_iterations'] = [500]
+            process=subprocess.run([sys.executable,'-'],input=source_script(source),capture_output=True,text=True,check=True)
+            self.assertEqual(json.loads(process.stdout)['evaluations'], [])
+            self.assertTrue((b/'eval-00500-scripted.json').exists())
+
 
 
 if __name__ == '__main__':

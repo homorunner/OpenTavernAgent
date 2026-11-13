@@ -60,6 +60,40 @@ def stop(signum, frame):
     raise KeyboardInterrupt(f'stopped by signal {signum}')
 
 
+def average_ratings(names, elo, boots, counts, models, groups):
+    """Equal-weight means of available seeds, retaining bootstrap covariance."""
+    import numpy as np
+    result = {}
+    for label, members in groups.items():
+        by_step = {}
+        for i, name in enumerate(names):
+            model = models[name]
+            if model['run'] in members:
+                by_step.setdefault(model['iteration'], {})[model['run']] = i
+        points = []
+        for iteration, indices in sorted(by_step.items()):
+            available = [run for run in members if run in indices]
+            selected = [indices[run] for run in available]
+            mean = float(np.mean(elo[selected]))
+            se = float(np.std(np.mean(boots[:, selected], axis=1), ddof=1))
+            points.append({'iteration': iteration, 'elo': mean, 'se': se,
+                           'ci95_normal': [mean - 1.96 * se, mean + 1.96 * se],
+                           'seeds': len(selected), 'expected_seeds': len(members),
+                           'available_members': available, 'games_min': int(min(counts[selected])),
+                           'games_max': int(max(counts[selected]))})
+        result[label] = {'members': members, 'points': points,
+                         'note': 'Equal-weight Elo mean of available seeds at each iteration. Membership may change as checkpoints arrive. Error bars use joint whole-game bootstrap; conditional on these training seeds.'}
+    return result
+
+
+def game_exclusion_reason(row, excluded_models):
+    if excluded_models.intersection(row['models']):
+        return 'excluded_model'
+    if row['turn_limit_end'] or row['truncated_combats']:
+        return 'truncated_game'
+    return None
+
+
 class League:
     def __init__(self, args):
         self.args = args
@@ -79,7 +113,25 @@ class League:
             if not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in self.sources or name in self.references:
                 raise ValueError('reference labels must be unique and distinct from run labels')
             self.references[name] = Path(path).resolve()
+        self.average_runs = {}
+        assigned = set()
+        for spec in args.average_run:
+            name, members = spec.split('=', 1)
+            members = members.split(',')
+            if (not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in self.average_runs
+                    or name in self.sources or name in self.references or len(members) < 2
+                    or len(set(members)) != len(members) or assigned.intersection(members)
+                    or not set(members) <= self.sources.keys() | self.references.keys()):
+                raise ValueError('average-run requires a distinct label and at least two distinct, ungrouped run labels')
+            self.average_runs[name] = members
+            assigned.update(members)
+        self.excluded_models = set(args.exclude_model)
+        if args.anchor in self.excluded_models:
+            raise ValueError('cannot exclude the Elo anchor')
+        if any(not re.fullmatch(r'[A-Za-z0-9_.-]+_s\d+', name) for name in self.excluded_models):
+            raise ValueError('exclude-model requires exact checkpoint names: RUN_sITERATION')
         self.models = json.loads((self.root / 'models.json').read_text()) if (self.root / 'models.json').exists() else {}
+        self.models = {name: model for name, model in self.models.items() if name not in self.excluded_models}
         settings = {'runs': {n: str(p) for n, p in self.sources.items()},
                     'references': {n: str(p) for n, p in self.references.items()},
                     'binary_sha256': digest(args.binary), 'fitter_sha256': digest(Path(__file__).with_name('league_elo.py')),
@@ -88,6 +140,10 @@ class League:
                     'games_per_model': args.games_per_model, 'batch_games': args.batch_games,
                     'seed': args.seed, 'anchor': args.anchor, 'anchor_rating': args.anchor_rating,
                     'bootstrap': args.bootstrap, 'backend': 'cpu', 'inference': 'fp32', 'sample': False}
+        if self.average_runs:
+            settings['average_runs'] = self.average_runs
+        if self.excluded_models:
+            settings['excluded_models'] = sorted(self.excluded_models)
         manifest = self.root / 'manifest.json'
         if manifest.exists():
             if json.loads(manifest.read_text()) != settings:
@@ -101,12 +157,15 @@ class League:
         self.batch = 0
         self.last_fit_batch = (json.loads((self.root / 'ratings-meta.json').read_text()).get('batches', -1)
                                if (self.root / 'ratings-meta.json').exists() else -1)
+        ratings_path = self.root / 'ratings.json'
+        if ratings_path.exists() and self.excluded_models.intersection(json.loads(ratings_path.read_text())):
+            self.last_fit_batch = -1
         self.recover()
 
     def status(self, phase, **extra):
         save(self.root / 'status.json', {'state': phase, 'updated_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
             'models': len(self.models), 'games': sum(self.counts.values()) // 8,
-            'excluded_games': len(self.excluded),
+            'excluded_games': len(self.excluded), 'excluded_models': sorted(self.excluded_models),
             'appearances': dict(self.counts), 'minimum_games': self.args.games_per_model,
             'batch': self.batch, **extra})
 
@@ -130,6 +189,8 @@ class League:
                 if match and int(match[1]) != iteration:
                     raise ValueError(f'checkpoint name/metadata mismatch: {path}')
                 name = f'{label}_s{iteration}'
+                if name in self.excluded_models:
+                    continue
                 fingerprint = digest(path)
                 if name in self.models:
                     if self.models[name]['sha256'] != fingerprint:
@@ -163,8 +224,9 @@ class League:
                 if sorted(row['placements']) != list(range(1, 9)):
                     raise ValueError(f'invalid league ranking: {directory}')
                 indices.add(i)
-                if row['turn_limit_end'] or row['truncated_combats']:
-                    self.excluded.append({'batch': directory.name, **row})
+                reason = game_exclusion_reason(row, self.excluded_models)
+                if reason:
+                    self.excluded.append({'batch': directory.name, **row, 'reason': reason})
                     continue
                 self.counts.update(row['models'])
             self.completed.append(output)
@@ -214,19 +276,21 @@ class League:
             for path in self.completed:
                 rows = sorted((json.loads(line) for line in path.read_text().splitlines()), key=lambda row: row['game'])
                 for row in rows:
-                    if row['turn_limit_end'] or row['truncated_combats']:
+                    if game_exclusion_reason(row, self.excluded_models):
                         continue
                     output.write((json.dumps(row) + '\n').encode())
         temporary.replace(combined)
         games = load(combined)
         names = sorted({name for models, _ in games for name in models})
-        elo, se, counts = ratings_with_bootstrap(games, names, bootstrap=self.args.bootstrap,
-            workers=min(4, self.args.workers), seed=0, anchor=self.args.anchor, anchor_rating=self.args.anchor_rating)
+        elo, se, counts, boots = ratings_with_bootstrap(games, names, bootstrap=self.args.bootstrap,
+            workers=min(4, self.args.workers), seed=0, anchor=self.args.anchor,
+            anchor_rating=self.args.anchor_rating, return_samples=True)
         ratings = {name: {'elo': float(e), 'se': float(s), 'ci95_normal': [float(e - 1.96*s), float(e + 1.96*s)],
             'games': int(n), 'run': self.models[name]['run'], 'iteration': self.models[name]['iteration']}
             for name, e, s, n in zip(names, elo, se, counts)}
         save(self.root / 'ratings.json', ratings)
-        save(self.root / 'ratings-meta.json', {'games': len(games), 'excluded_games': len(self.excluded), 'models': len(names), 'batches': self.batch, 'anchor': self.args.anchor,
+        save(self.root / 'rating-groups.json', average_ratings(names, elo, boots, counts, self.models, self.average_runs))
+        save(self.root / 'ratings-meta.json', {'games': len(games), 'excluded_games': len(self.excluded), 'excluded_models': sorted(self.excluded_models), 'models': len(names), 'batches': self.batch, 'anchor': self.args.anchor,
             'anchor_rating': self.args.anchor_rating, 'bootstrap': self.args.bootstrap,
             'note': 'Conditional full-game bootstrap, not training-seed uncertainty. Scores are relative within this connected pool and may shift when games/models are added.'})
         self.last_fit_batch = self.batch
@@ -243,7 +307,7 @@ class League:
                         continue
                     if self.completed:
                         self.fit()
-                    finished = all(any(m['run'] == run and m['iteration'] == self.args.target_iteration
+                    finished = all(f'{run}_s{self.args.target_iteration}' in self.excluded_models or any(m['run'] == run and m['iteration'] == self.args.target_iteration
                                        for m in self.models.values()) for run in self.sources)
                     if finished or not self.args.watch:
                         self.status('complete')
@@ -271,6 +335,10 @@ def main():
     parser.add_argument('--run', action='append', required=True)
     parser.add_argument('--reference', action='append', default=[], metavar='LABEL=CHECKPOINT',
                         help='frozen reference, independent of training iteration ceiling')
+    parser.add_argument('--average-run', action='append', default=[], metavar='LABEL=RUN1,RUN2,...',
+                        help='plot equal-weight Elo means of available members; retain separate league entrants')
+    parser.add_argument('--exclude-model', action='append', default=[], metavar='RUN_sITERATION',
+                        help='exclude a checkpoint and whole games containing it; never delete weights')
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--anchor', required=True)
     parser.add_argument('--anchor-rating', type=float, default=1000)

@@ -111,7 +111,7 @@ def plackett_luce(games, names, iters=500, tol=1e-9):
 
 
 def ratings_with_bootstrap(games, names, bootstrap=32, workers=4, seed=0,
-                           anchor=None, anchor_rating=1000.0):
+                           anchor=None, anchor_rating=1000.0, return_samples=False):
     """Full-game bootstrap without rebuilding and sorting Python game lists."""
     validate_games(games, names)
     if bootstrap < 2 or workers < 1:
@@ -135,7 +135,8 @@ def ratings_with_bootstrap(games, names, bootstrap=32, workers=4, seed=0,
         # Anchor each resampled fit too, preserving covariance in relative errors.
         boots = boots - boots[:, index:index+1] + anchor_rating
     counts = sum((np.bincount(r.ravel(), minlength=len(names)) for r, _ in groups), np.zeros(len(names), dtype=int))
-    return elo, np.std(boots, axis=0, ddof=1), counts
+    result = (elo, np.std(boots, axis=0, ddof=1), counts)
+    return (*result, boots) if return_samples else result
 
 
 def main():
