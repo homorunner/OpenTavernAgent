@@ -68,8 +68,6 @@ fn stat_feature(value: i32) -> f32 {
     (value.max(0) as f32).ln_1p() / 10.0_f32.ln_1p()
 }
 
-// TODO(observation): encode visible dynamic card counters, attached card identities,
-// hero progress and persistent effect contents; counts alone do not identify effects.
 fn push_minion(f: &mut Vec<f32>, m: Option<&Minion>) {
     let Some(m) = m else {
         f.extend(std::iter::repeat_n(0.0, MINION_F));

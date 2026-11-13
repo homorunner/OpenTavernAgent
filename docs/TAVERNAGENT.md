@@ -641,9 +641,6 @@ the experiments do not isolate the value head as the sole cause.
   controlled comparisons. Tree splits also change sample counts, weights and data reuse.
 - **TODO: value auxiliary targets.** Test short-term combat/damage targets alongside the
   nonlinear value head. Keep final expected placement as search utility.
-- **TODO: input representation.** Test a shared per-card/entity encoder that retains
-  zone and position information. Current input projection remains per slot; simply
-  pooling away warband order would discard strategically relevant information.
 
 Model/input experiment TODOs (discussion item numbers; initial priority: 1 → 3 → 2 → 5):
 
