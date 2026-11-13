@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Mat {
     pub rows: usize,
     pub cols: usize,
@@ -36,6 +36,22 @@ impl Mat {
             "matrix data does not match its shape"
         );
         Mat { rows, cols, data }
+    }
+
+    /// Reuse storage; callers must overwrite existing entries before reading them.
+    pub(crate) fn resize(&mut self, rows: usize, cols: usize) {
+        self.data.resize(rows * cols, 0.0);
+        self.rows = rows;
+        self.cols = cols;
+    }
+
+    pub(crate) fn matmul_into(&self, other: &Mat, out: &mut Mat) {
+        assert_eq!(self.cols, other.rows, "matmul shape mismatch");
+        out.resize(self.rows, other.cols);
+        if self.cols == 0 {
+            out.data.fill(0.0);
+        }
+        gemm(false, self, false, other, out);
     }
 
     pub fn zeros_like(&self) -> Mat {
@@ -82,11 +98,75 @@ impl Mat {
         out
     }
 
+    /// Multiply by a contiguous range of weight rows, optionally transposed.
+    /// Borrows the weights directly instead of allocating a partition copy.
+    pub(crate) fn matmul_weight_rows(
+        &self,
+        weights: &Mat,
+        start: usize,
+        rows: usize,
+        transpose: bool,
+    ) -> Mat {
+        let mut out = Mat::default();
+        self.matmul_weight_rows_into(weights, start, rows, transpose, &mut out);
+        out
+    }
+
+    pub(crate) fn matmul_weight_rows_into(
+        &self,
+        weights: &Mat,
+        start: usize,
+        rows: usize,
+        transpose: bool,
+        out: &mut Mat,
+    ) {
+        assert!(start <= weights.rows && rows <= weights.rows - start);
+        let (k, n, rs, cs) = if transpose {
+            (weights.cols, rows, 1, weights.cols as isize)
+        } else {
+            (rows, weights.cols, weights.cols as isize, 1)
+        };
+        assert_eq!(self.cols, k);
+        out.resize(self.rows, n);
+        if k == 0 {
+            out.data.fill(0.0);
+        }
+        if self.rows != 0 && k != 0 && n != 0 {
+            // SAFETY: checked shapes and row bounds cover both contiguous inputs
+            // and the output; transposition only exchanges the weight strides.
+            unsafe {
+                matrixmultiply::sgemm(
+                    self.rows,
+                    k,
+                    n,
+                    1.0,
+                    self.data.as_ptr(),
+                    self.cols as isize,
+                    1,
+                    weights.data[start * weights.cols..].as_ptr(),
+                    rs,
+                    cs,
+                    0.0,
+                    out.data.as_mut_ptr(),
+                    n as isize,
+                    1,
+                );
+            }
+        }
+    }
+
     /// `x (1 x k) * self (k x n)` for a single row, skipping zero inputs: the observation
     /// is sparse and this path serves every rollout decision.
     pub fn vecmat(&self, x: &[f32]) -> Vec<f32> {
+        let mut out = Vec::new();
+        self.vecmat_into(x, &mut out);
+        out
+    }
+
+    pub(crate) fn vecmat_into(&self, x: &[f32], out: &mut Vec<f32>) {
         assert_eq!(x.len(), self.rows, "vecmat shape mismatch");
-        let mut out = vec![0.0f32; self.cols];
+        out.resize(self.cols, 0.0);
+        out.fill(0.0);
         for (i, &xi) in x.iter().enumerate() {
             if xi == 0.0 {
                 continue;
@@ -96,7 +176,6 @@ impl Mat {
                 *o += xi * w;
             }
         }
-        out
     }
 
     /// Add a row vector to every row.

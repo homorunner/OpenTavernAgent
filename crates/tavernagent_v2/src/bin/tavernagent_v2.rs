@@ -32,7 +32,7 @@ enum Command {
     League(league::LeagueArgs),
     /// Measure frozen critic predictions against lambda returns and terminal rewards.
     Diagnose(tavernagent_v2::critic::DiagnoseArgs),
-    /// Validate CUDA forward, backward and AdamW against the CPU reference.
+    /// Reserved CUDA check entry point; C is currently CPU-only.
     #[cfg(feature = "cuda")]
     CudaCheck(tavernagent_v2::cuda::CheckArgs),
 }

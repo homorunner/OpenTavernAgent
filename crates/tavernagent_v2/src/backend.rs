@@ -20,25 +20,14 @@ pub enum Backend {
 
 pub enum Execution {
     Cpu,
-    #[cfg(feature = "cuda")]
-    Cuda(Box<crate::cuda::CudaNet>),
 }
 impl Execution {
     pub fn new(backend: Backend, trainer: &Trainer, device: usize) -> Result<Self, String> {
         match backend {
             Backend::Cpu => Ok(Self::Cpu),
             Backend::Cuda => {
-                #[cfg(feature = "cuda")]
-                {
-                    Ok(Self::Cuda(Box::new(crate::cuda::CudaNet::new(
-                        trainer, device,
-                    )?)))
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    let _ = (trainer, device);
-                    Err("CUDA backend requires a binary built with --features cuda".into())
-                }
+                let _ = (trainer, device);
+                Err("CUDA is not implemented for the C architecture; use --backend cpu".into())
             }
         }
     }
@@ -58,8 +47,6 @@ impl Execution {
                 }
                 Ok((logits, values))
             }
-            #[cfg(feature = "cuda")]
-            Self::Cuda(gpu) => gpu.infer(net, obs),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -75,12 +62,6 @@ impl Execution {
     ) -> Result<UpdateMetrics, String> {
         match self {
             Self::Cpu => ppo::update(trainer, samples, epochs, batch, lr, options, rng),
-            #[cfg(feature = "cuda")]
-            Self::Cuda(gpu) => {
-                let result = gpu.update(&trainer.net, samples, epochs, batch, lr, options, rng)?;
-                gpu.download(trainer)?;
-                Ok(result)
-            }
         }
     }
 }

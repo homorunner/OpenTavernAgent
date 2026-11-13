@@ -12,14 +12,18 @@ use taverngym::RulesConfig;
 
 use crate::backend::{Backend, Execution};
 use crate::checkpoint::{self, RunState};
-use crate::net::{Activation, NetConfig, PolicyValueNet};
+use crate::net::{Activation, Architecture, NetConfig, PolicyValueNet};
 use crate::ppo::{self, PpoOptions, Trainer};
 use crate::rollout;
 use crate::rules::{ActionCounts, Budgets, PolicyRules};
 
 #[derive(Clone, Debug, Args, Serialize, Deserialize)]
 pub struct TrainOptions {
-    /// CPU reference or FP32 CUDA network/optimizer; stored for consistent resume.
+    /// Fixed C architecture; retained in checkpoints for schema validation.
+    #[serde(default)]
+    #[arg(skip = Architecture::EntityActions)]
+    pub architecture: Architecture,
+    /// Execution backend, stored for resume. C currently supports CPU only.
     #[serde(default)]
     #[arg(long,value_enum,default_value_t=Backend::Cpu)]
     pub backend: Backend,
@@ -89,6 +93,7 @@ impl Default for TrainOptions {
 impl TrainOptions {
     pub fn net_config(&self) -> NetConfig {
         NetConfig {
+            architecture: self.architecture,
             hidden: self.hidden,
             blocks: self.blocks,
             embedding_dim: self.embedding_dim,
@@ -111,6 +116,9 @@ impl TrainOptions {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.backend == Backend::Cuda {
+            return Err("CUDA is not implemented for the C architecture; use --backend cpu".into());
+        }
         if self.games == 0
             || self.epochs == 0
             || self.batch == 0

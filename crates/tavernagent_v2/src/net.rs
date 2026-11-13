@@ -1,15 +1,8 @@
-//! A small pre-norm residual policy/value network with a shared card embedding.
-//!
-//! ```text
-//! numeric features + turn/tier one-hots + card embeddings + legal mask
-//!     -> 256 -> pre-norm FFN residual blocks
-//!     -> policy: Linear(256, 116)
-//!     -> value: Linear(256, 128) -> GELU -> Linear(128, 1) -> tanh
-//! ```
-//!
-//! Forward passes return their cache instead of storing it, so one network can serve
-//! many rollout threads at once. Backward is written by hand and checked numerically
-//! in the crate tests.
+//! Entity encoders and object-conditioned action heads (the C architecture).
+//! A 320-wide, six-block pre-norm residual trunk shares a card embedding and
+//! feeds global actions, per-object action scorers, and a GELU value head.
+//! CPU FP32 inference reuses scratch buffers without backward caches; training
+//! retains per-call caches and uses a numerically checked handwritten backward.
 
 use std::path::Path;
 
@@ -24,13 +17,22 @@ use taverngym::obs as o;
 use crate::linalg::Mat;
 use crate::npz::{NpyArray, Npz};
 
+mod entity;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Architecture {
+    #[default]
+    EntityActions,
+}
+
 /// Compact policy layout; resolved to engine actions using the current state.
 pub const N_ACTIONS: usize = crate::actions::N_ACTIONS;
 /// Agent-only flag appended to the unchanged engine observation.
 pub const COMBAT_PROTECTED_FEATURE: usize = o::OBS_FLOATS;
 pub const N_FEATURES: usize = o::OBS_FLOATS + 1;
 pub const N_CARD_SLOTS: usize = o::OBS_CARDS;
-pub const DEFAULT_HIDDEN: usize = 256;
+pub const DEFAULT_HIDDEN: usize = 320;
 pub const DEFAULT_EMBEDDING_DIM: usize = 32;
 pub const DEFAULT_BLOCKS: usize = 6;
 pub const MODEL_VERSION: i64 = 1;
@@ -130,6 +132,27 @@ impl Activation {
         }
     }
     #[inline]
+    fn apply_and_grad(self, x: f32) -> (f32, f32) {
+        match self {
+            Activation::Gelu => {
+                let inner = GELU_C * (x + GELU_K * x * x * x);
+                let t = inner.tanh();
+                let d_inner = GELU_C * (1.0 + 3.0 * GELU_K * x * x);
+                (
+                    0.5 * x * (1.0 + t),
+                    0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * d_inner,
+                )
+            }
+            Activation::Silu => {
+                let s = sigmoid(x);
+                (x * s, s + x * s * (1.0 - s))
+            }
+            Activation::Relu => (x.max(0.0), (x > 0.0) as u8 as f32),
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
     fn grad(self, x: f32) -> f32 {
         match self {
             Activation::Gelu => gelu_grad(x),
@@ -151,6 +174,7 @@ fn gelu(x: f32) -> f32 {
     0.5 * x * (1.0 + inner.tanh())
 }
 
+#[cfg(test)]
 #[inline]
 fn gelu_grad(x: f32) -> f32 {
     let inner = GELU_C * (x + GELU_K * x * x * x);
@@ -166,6 +190,7 @@ fn sigmoid(x: f32) -> f32 {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NetConfig {
+    pub architecture: Architecture,
     /// Width of the trunk.
     pub hidden: usize,
     /// Number of residual blocks.
@@ -183,6 +208,7 @@ pub struct NetConfig {
 impl Default for NetConfig {
     fn default() -> Self {
         NetConfig {
+            architecture: Architecture::EntityActions,
             hidden: DEFAULT_HIDDEN,
             blocks: DEFAULT_BLOCKS,
             embedding_dim: DEFAULT_EMBEDDING_DIM,
@@ -206,7 +232,7 @@ impl NetConfig {
 }
 
 /// Named tensors in a fixed order: E, W0, b0, g0, k0, (W_up, b_up, W_down, b_down, g, k) per block, Wp, bp,
-/// Wv, bv.
+/// Wv, bv, then the shared entity encoders and object action heads.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Params {
     pub blocks: usize,
@@ -290,7 +316,9 @@ impl Params {
         block(self.blocks) + 5
     }
     pub fn names(&self) -> Vec<String> {
-        tensor_names(self.blocks)
+        let mut names = tensor_names(self.blocks);
+        names.extend(entity::tensor_names());
+        names
     }
     pub fn zeros_like(&self) -> Params {
         Params {
@@ -314,6 +342,11 @@ impl Params {
             || index == self.wv_hidden()
             || index == self.wv()
             || (0..self.blocks).any(|i| index == w_up(i) || index == w_down(i))
+            || (index >= self.extra() && (index - self.extra()).is_multiple_of(2))
+    }
+
+    fn extra(&self) -> usize {
+        block(self.blocks) + 6
     }
 }
 
@@ -324,6 +357,49 @@ fn linear(x: &Mat, w: &Mat) -> Mat {
     } else {
         x.matmul(w)
     }
+}
+
+/// Consume preactivations, retaining derivatives in the same allocation.
+fn activate_with_derivative(mut pre: Mat, act: Activation) -> (Mat, Mat) {
+    let mut hidden = pre.zeros_like();
+    for (x, out) in pre.data.iter_mut().zip(&mut hidden.data) {
+        let (value, derivative) = act.apply_and_grad(*x);
+        *out = value;
+        *x = derivative;
+    }
+    (hidden, pre)
+}
+
+fn linear_into(x: &Mat, w: &Mat, out: &mut Mat) {
+    if x.rows == 1 {
+        out.resize(1, w.cols);
+        w.vecmat_into(x.row(0), &mut out.data);
+    } else {
+        x.matmul_into(w, out);
+    }
+}
+
+#[derive(Default)]
+struct InferenceWorkspace {
+    raw: Mat,
+    used: Vec<i32>,
+    encoded: Mat,
+    head: Mat,
+    h: Vec<f32>,
+    n: Vec<f32>,
+    up: Vec<f32>,
+    down: Vec<f32>,
+    logits: Vec<f32>,
+    vh: Vec<f32>,
+    value_logits: Vec<f32>,
+    ones: Vec<f32>,
+    zeros: Vec<f32>,
+    entity: entity::InferenceWorkspace,
+}
+
+thread_local! {
+    static INFERENCE_WORKSPACE: std::cell::RefCell<InferenceWorkspace> =
+        std::cell::RefCell::new(InferenceWorkspace::default());
 }
 
 struct LnCache {
@@ -379,10 +455,10 @@ fn layer_norm_backward(grad: &Mat, cache: &LnCache, gamma: &[f32]) -> (Mat, Vec<
     let mut dbeta = vec![0.0f32; cols];
     let mut dx = grad.zeros_like();
     let n = cols as f32;
+    let mut dxhat = vec![0.0f32; cols];
     for r in 0..grad.rows {
         let gr = grad.row(r);
         let xh = cache.xhat.row(r);
-        let mut dxhat = vec![0.0f32; cols];
         let mut mean_dxhat = 0.0f32;
         let mut mean_dxhat_xhat = 0.0f32;
         for j in 0..cols {
@@ -403,25 +479,27 @@ fn layer_norm_backward(grad: &Mat, cache: &LnCache, gamma: &[f32]) -> (Mat, Vec<
 }
 
 struct StemCache {
-    n: Mat,
+    derivative: Mat,
     ln: LnCache,
 }
 
 struct BlockCache {
     normed: Mat,
-    pre_activation: Mat,
+    derivative: Mat,
     activated: Mat,
     ln: LnCache,
 }
 
 /// Everything backward needs from a forward pass.
 pub struct Cache {
+    entity: entity::Cache,
+    actions: entity::ActionCache,
     x_in: Mat,
     cards: Vec<i32>, // batch x used slots, after the allowed-kind filter
     stem: StemCache,
     blocks: Vec<BlockCache>,
     h_final: Mat,
-    value_pre: Mat,
+    value_derivative: Mat,
     value_hidden: Mat,
     head_ln: Option<LnCache>,
     value: Vec<f32>,
@@ -435,6 +513,7 @@ pub struct PolicyValueNet {
     input_features: Vec<usize>,
     card_slots: Vec<usize>,
     allowed: Vec<bool>,
+    entity: entity::Layout,
     pub card_fingerprint: u64,
 }
 
@@ -466,7 +545,8 @@ impl PolicyValueNet {
             Mat::from_vec(rows, cols, data)
         };
         let he = |fan_in: usize| (2.0 / fan_in as f32).sqrt();
-        let in_dim = ONE_HOT_FEATURES + input_features.len() + card_slots.len() * d + N_ACTIONS;
+        let entity = entity::Layout::new(&input_features, &card_slots, d);
+        let in_dim = entity.output_dim();
         let mut tensors = Vec::with_capacity(11 + 6 * cfg.blocks);
         let mut e = randn(n_cards, d, 0.1);
         for v in e.row_mut(0) {
@@ -486,8 +566,9 @@ impl PolicyValueNet {
             tensors.push(Mat::filled(1, h, 1.0));
             tensors.push(Mat::zeros(1, h));
         }
-        tensors.push(randn(h, N_ACTIONS, he(h) * 0.1));
-        tensors.push(Mat::zeros(1, N_ACTIONS));
+        let policy_outputs = a::A_BUY;
+        tensors.push(randn(h, policy_outputs, he(h) * 0.1));
+        tensors.push(Mat::zeros(1, policy_outputs));
         tensors.push(randn(h, VALUE_HIDDEN, he(h)));
         tensors.push(Mat::zeros(1, VALUE_HIDDEN));
         tensors.push(randn(
@@ -496,6 +577,7 @@ impl PolicyValueNet {
             he(VALUE_HIDDEN) * 0.1,
         ));
         tensors.push(Mat::zeros(1, cfg.value_outputs()));
+        entity.initialize(&mut tensors, &cfg, &mut randn);
         Ok(PolicyValueNet {
             p: Params {
                 blocks: cfg.blocks,
@@ -505,6 +587,7 @@ impl PolicyValueNet {
             input_features,
             card_slots,
             allowed: allowed_cards(),
+            entity,
             card_fingerprint: db().fingerprint,
         })
     }
@@ -529,6 +612,7 @@ impl PolicyValueNet {
             input_features: self.input_features.clone(),
             card_slots: self.card_slots.clone(),
             allowed: self.allowed.clone(),
+            entity: self.entity.clone(),
             card_fingerprint: self.card_fingerprint,
         }
     }
@@ -596,7 +680,10 @@ impl PolicyValueNet {
         if cards.len() != bsz || masks.len() != bsz {
             return Err("feature, card and mask batches differ in length".into());
         }
-        let mut x_in = Mat::zeros(bsz, self.p.tensors[W0].rows);
+        let mut x_in = Mat::zeros(
+            bsz,
+            self.n_input_features() + self.card_slots.len() * self.cfg.embedding_dim + N_ACTIONS,
+        );
         let mut used = Vec::with_capacity(bsz * self.card_slots.len());
         for r in 0..bsz {
             self.write_input(xs[r], cards[r], masks[r], x_in.row_mut(r), Some(&mut used))?;
@@ -612,25 +699,23 @@ impl PolicyValueNet {
         masks: &[&[bool]],
     ) -> Result<(Mat, Vec<f32>, Cache), String> {
         let (x_in, used) = self.assemble(xs, cards, masks)?;
+        let (x_in, entity) = self.entity.forward(self, &x_in, &used);
         let p = &self.p.tensors;
         let act = self.cfg.activation;
         let mut z0 = linear(&x_in, &p[W0]);
         z0.add_row(&p[B0].data);
         let (n0, ln0) = layer_norm(&z0, &p[G0].data, &p[K0].data);
-        let mut h = n0.clone();
-        for v in &mut h.data {
-            *v = act.apply(*v);
-        }
-        let stem = StemCache { n: n0, ln: ln0 };
+        let (mut h, derivative) = activate_with_derivative(n0, act);
+        let stem = StemCache {
+            derivative,
+            ln: ln0,
+        };
         let mut blocks = Vec::with_capacity(self.cfg.blocks);
         for i in 0..self.cfg.blocks {
             let (normed, ln) = layer_norm(&h, &p[g(i)].data, &p[k(i)].data);
             let mut pre_activation = linear(&normed, &p[w_up(i)]);
             pre_activation.add_row(&p[b_up(i)].data);
-            let mut activated = pre_activation.clone();
-            for v in &mut activated.data {
-                *v = act.apply(*v);
-            }
+            let (activated, derivative) = activate_with_derivative(pre_activation, act);
             let mut residual = linear(&activated, &p[w_down(i)]);
             residual.add_row(&p[b_down(i)].data);
             for (hv, rv) in h.data.iter_mut().zip(&residual.data) {
@@ -638,7 +723,7 @@ impl PolicyValueNet {
             }
             blocks.push(BlockCache {
                 normed,
-                pre_activation,
+                derivative,
                 activated,
                 ln,
             });
@@ -654,12 +739,11 @@ impl PolicyValueNet {
         let (wp, bp, wv, bv) = (self.p.wp(), self.p.bp(), self.p.wv(), self.p.bv());
         let mut logits = linear(&h, &p[wp]);
         logits.add_row(&p[bp].data);
+        let (logits, actions) = self.entity.policy(self, &h, &x_in, &logits);
         let mut value_pre = linear(&h, &p[self.p.wv_hidden()]);
         value_pre.add_row(&p[self.p.bv_hidden()].data);
-        let mut value_hidden = value_pre.clone();
-        for v in &mut value_hidden.data {
-            *v = gelu(*v);
-        }
+        let (value_hidden, value_derivative) =
+            activate_with_derivative(value_pre, Activation::Gelu);
         let mut value_mat = linear(&value_hidden, &p[wv]);
         value_mat.add_row(&p[bv].data);
         let value: Vec<f32> = (0..value_mat.rows)
@@ -669,12 +753,14 @@ impl PolicyValueNet {
             logits,
             value.clone(),
             Cache {
+                entity,
+                actions,
                 x_in,
                 cards: used,
                 stem,
                 blocks,
                 h_final: h,
-                value_pre,
+                value_derivative,
                 value_hidden,
                 head_ln,
                 value,
@@ -683,52 +769,82 @@ impl PolicyValueNet {
         ))
     }
 
-    /// FP32 logits and value, using the same operations as the training forward pass.
+    /// FP32 inference with thread-local scratch storage and no backward cache.
+    /// Scratch contains no weights or persistent model state and is safe to reuse
+    /// across different networks/checkpoints on the same worker thread.
     pub fn infer_f32(
         &self,
         x: &[f32],
         cards: &[i32],
         mask: &[bool],
     ) -> Result<(Vec<f32>, f32), String> {
-        let (x_in, _) = self.assemble(&[x], &[cards], &[mask])?;
+        INFERENCE_WORKSPACE.with(|workspace| {
+            self.infer_with_workspace(x, cards, mask, &mut workspace.borrow_mut())
+        })
+    }
+
+    fn infer_with_workspace(
+        &self,
+        x: &[f32],
+        cards: &[i32],
+        mask: &[bool],
+        ws: &mut InferenceWorkspace,
+    ) -> Result<(Vec<f32>, f32), String> {
+        ws.raw.resize(
+            1,
+            self.n_input_features() + self.card_slots.len() * self.cfg.embedding_dim + N_ACTIONS,
+        );
+        ws.used.clear();
+        self.write_input(x, cards, mask, ws.raw.row_mut(0), Some(&mut ws.used))?;
+        self.entity
+            .infer(self, &ws.raw, &ws.used, &mut ws.encoded, &mut ws.entity);
+        let input = &ws.encoded;
         let p = &self.p.tensors;
         let act = self.cfg.activation;
-        let mut h = p[W0].vecmat(x_in.row(0));
-        add_bias(&mut h, &p[B0].data);
-        layer_norm_row(&mut h, &p[G0].data, &p[K0].data);
-        for v in &mut h {
+        p[W0].vecmat_into(input.row(0), &mut ws.h);
+        add_bias(&mut ws.h, &p[B0].data);
+        layer_norm_row(&mut ws.h, &p[G0].data, &p[K0].data);
+        for v in &mut ws.h {
             *v = act.apply(*v);
         }
         for i in 0..self.cfg.blocks {
-            let mut n = h.clone();
-            layer_norm_row(&mut n, &p[g(i)].data, &p[k(i)].data);
-            let mut up = p[w_up(i)].vecmat(&n);
-            add_bias(&mut up, &p[b_up(i)].data);
-            for v in &mut up {
+            ws.n.clone_from(&ws.h);
+            layer_norm_row(&mut ws.n, &p[g(i)].data, &p[k(i)].data);
+            p[w_up(i)].vecmat_into(&ws.n, &mut ws.up);
+            add_bias(&mut ws.up, &p[b_up(i)].data);
+            for v in &mut ws.up {
                 *v = act.apply(*v);
             }
-            let mut down = p[w_down(i)].vecmat(&up);
-            add_bias(&mut down, &p[b_down(i)].data);
-            for (hv, rv) in h.iter_mut().zip(&down) {
+            p[w_down(i)].vecmat_into(&ws.up, &mut ws.down);
+            add_bias(&mut ws.down, &p[b_down(i)].data);
+            for (hv, rv) in ws.h.iter_mut().zip(&ws.down) {
                 *hv += self.cfg.residual_scale * rv;
             }
         }
         if self.cfg.head_norm {
-            let ones = vec![1.0f32; self.cfg.hidden];
-            let zeros = vec![0.0f32; self.cfg.hidden];
-            layer_norm_row(&mut h, &ones, &zeros);
+            ws.ones.resize(self.cfg.hidden, 1.0);
+            ws.zeros.resize(self.cfg.hidden, 0.0);
+            layer_norm_row(&mut ws.h, &ws.ones, &ws.zeros);
         }
-        let mut logits = p[self.p.wp()].vecmat(&h);
-        add_bias(&mut logits, &p[self.p.bp()].data);
-        let mut vh = p[self.p.wv_hidden()].vecmat(&h);
-        add_bias(&mut vh, &p[self.p.bv_hidden()].data);
-        for v in &mut vh {
+        p[self.p.wp()].vecmat_into(&ws.h, &mut ws.logits);
+        add_bias(&mut ws.logits, &p[self.p.bp()].data);
+        {
+            ws.head.resize(1, ws.h.len());
+            ws.head.data.copy_from_slice(&ws.h);
+            self.entity
+                .infer_policy(self, &ws.head, &ws.encoded, &mut ws.logits, &mut ws.entity);
+        }
+        p[self.p.wv_hidden()].vecmat_into(&ws.h, &mut ws.vh);
+        add_bias(&mut ws.vh, &p[self.p.bv_hidden()].data);
+        for v in &mut ws.vh {
             *v = gelu(*v);
         }
-        let mut value_logits = p[self.p.wv()].vecmat(&vh);
-        add_bias(&mut value_logits, &p[self.p.bv()].data);
-        let value = critic_prediction(&value_logits, &self.cfg);
-        Ok((logits, value))
+        p[self.p.wv()].vecmat_into(&ws.vh, &mut ws.value_logits);
+        add_bias(&mut ws.value_logits, &p[self.p.bv()].data);
+        Ok((
+            ws.logits.clone(),
+            critic_prediction(&ws.value_logits, &self.cfg),
+        ))
     }
 
     // ---- backward ----------------------------------------------------------
@@ -737,20 +853,30 @@ impl PolicyValueNet {
     /// The caller includes tanh/softmax and auxiliary-loss derivatives.
     pub fn backward(&self, cache: &Cache, dlogits: &Mat, dvalue: &[f32]) -> Params {
         let p = &self.p.tensors;
-        let act = self.cfg.activation;
         let bsz = cache.h_final.rows;
         let dvalue = Mat::from_vec(bsz, self.cfg.value_outputs(), dvalue.to_vec());
         let hidden = self.cfg.hidden;
         let (wp, bp, wv, bv) = (self.p.wp(), self.p.bp(), self.p.wv(), self.p.bv());
         let mut grads = self.p.zeros_like();
-        grads.tensors[wp] = cache.h_final.t_matmul(dlogits);
-        grads.tensors[bp] = Mat::from_vec(1, N_ACTIONS, dlogits.sum_rows());
+        let mut extra_dh = Mat::zeros(bsz, hidden);
+        let mut extra_dx = cache.x_in.zeros_like();
+        let policy_grad = self.entity.policy_backward(
+            self,
+            &cache.actions,
+            dlogits,
+            &mut grads,
+            &mut extra_dh,
+            &mut extra_dx,
+        );
+        grads.tensors[wp] = cache.h_final.t_matmul(&policy_grad);
+        grads.tensors[bp] = Mat::from_vec(1, policy_grad.cols, policy_grad.sum_rows());
         grads.tensors[wv] = cache.value_hidden.t_matmul(&dvalue);
         grads.tensors[bv] = Mat::from_vec(1, self.cfg.value_outputs(), dvalue.sum_rows());
-        let mut dh = dlogits.matmul_t(&p[wp]);
+        let mut dh = policy_grad.matmul_t(&p[wp]);
+        dh.add_assign(&extra_dh);
         let mut dvh = dvalue.matmul_t(&p[wv]);
-        for (d, v) in dvh.data.iter_mut().zip(&cache.value_pre.data) {
-            *d *= gelu_grad(*v);
+        for (d, v) in dvh.data.iter_mut().zip(&cache.value_derivative.data) {
+            *d *= v;
         }
         grads.tensors[self.p.wv_hidden()] = cache.h_final.t_matmul(&dvh);
         grads.tensors[self.p.bv_hidden()] = Mat::from_vec(1, VALUE_HIDDEN, dvh.sum_rows());
@@ -766,8 +892,8 @@ impl PolicyValueNet {
             grads.tensors[w_down(i)] = layer.activated.t_matmul(&dr);
             grads.tensors[b_down(i)] = Mat::from_vec(1, hidden, dr.sum_rows());
             let mut du = dr.matmul_t(&p[w_down(i)]);
-            for (d, v) in du.data.iter_mut().zip(&layer.pre_activation.data) {
-                *d *= act.grad(*v);
+            for (d, v) in du.data.iter_mut().zip(&layer.derivative.data) {
+                *d *= v;
             }
             grads.tensors[w_up(i)] = layer.normed.t_matmul(&du);
             grads.tensors[b_up(i)] = Mat::from_vec(1, self.cfg.ff_hidden(), du.sum_rows());
@@ -779,8 +905,8 @@ impl PolicyValueNet {
         }
         let first = &cache.stem;
         let mut dn0 = dh;
-        for (d, nv) in dn0.data.iter_mut().zip(&first.n.data) {
-            *d *= act.grad(*nv);
+        for (d, nv) in dn0.data.iter_mut().zip(&first.derivative.data) {
+            *d *= nv;
         }
         let (dz0, dg0, dk0) = layer_norm_backward(&dn0, &first.ln, &p[G0].data);
         grads.tensors[G0] = Mat::from_vec(1, hidden, dg0);
@@ -788,7 +914,11 @@ impl PolicyValueNet {
         grads.tensors[W0] = cache.x_in.t_matmul(&dz0);
         grads.tensors[B0] = Mat::from_vec(1, hidden, dz0.sum_rows());
         // Embedding gradient: the input gradient's embedding columns, scatter-added per card.
-        let dx_in = dz0.matmul_t(&p[W0]);
+        let mut dx_in = dz0.matmul_t(&p[W0]);
+        dx_in.add_assign(&extra_dx);
+        dx_in = self
+            .entity
+            .backward(self, &cache.entity, &dx_in, &mut grads);
         let n_in = self.n_input_features();
         let d = self.cfg.embedding_dim;
         let n_slots = self.card_slots.len();
@@ -980,7 +1110,11 @@ mod input_tests {
         let mut x = vec![0.0; N_FEATURES];
         let cards = vec![0; N_CARD_SLOTS];
         let mask = vec![false; N_ACTIONS];
-        let mut row = vec![99.0; net.p.tensors[W0].rows];
+        let mut row =
+            vec![
+                99.0;
+                net.n_input_features() + net.n_card_slots() * net.cfg.embedding_dim + N_ACTIONS
+            ];
         for tier in 1..=7 {
             x[10] = tier as f32 / 7.0;
             for protected in [0.0, 1.0] {
@@ -1008,7 +1142,11 @@ mod input_tests {
         x[7] = 0.8; // Other numeric features must keep their value and offset.
         let cards = vec![0; N_CARD_SLOTS];
         let mask = vec![false; N_ACTIONS];
-        let mut row = vec![99.0; net.p.tensors[W0].rows];
+        let mut row =
+            vec![
+                99.0;
+                net.n_input_features() + net.n_card_slots() * net.cfg.embedding_dim + N_ACTIONS
+            ];
         for turn in (0..=32).chain([100, 1000]) {
             x[0] = turn as f32 / 20.0;
             net.write_input(&x, &cards, &mask, &mut row, None).unwrap();
@@ -1035,3 +1173,7 @@ mod input_tests {
         assert_ne!(infer(16), infer(100));
     }
 }
+
+#[cfg(test)]
+#[path = "net/inference_reference.rs"]
+mod inference_reference;
