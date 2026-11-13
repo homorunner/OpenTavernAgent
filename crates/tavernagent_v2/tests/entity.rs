@@ -53,11 +53,24 @@ fn entity_parameter_budgets_and_checkpoint_roundtrip() {
         )
         .unwrap();
         println!("{architecture:?}: {} parameters", net.n_params());
-        assert_eq!(net.n_params(), 3_473_102);
+        assert_eq!(net.n_params(), 3_452_302);
         assert_eq!(net.p.names().len(), net.p.tensors.len());
         let restored = PolicyValueNet::from_npz(&net.to_npz()).unwrap();
         assert_eq!(restored.cfg, net.cfg);
         assert_eq!(restored.p, net.p);
+        let mut legacy = net.to_npz();
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&legacy.get("meta").unwrap().as_text().unwrap()).unwrap();
+        meta["version"] = 1.into();
+        legacy.insert(
+            "meta",
+            tavernagent_v2::npz::NpyArray::text(&meta.to_string()),
+        );
+        assert!(
+            PolicyValueNet::from_npz(&legacy)
+                .unwrap_err()
+                .contains("model format v2")
+        );
     }
     // Unsupported historical layouts must fail explicitly, including missing metadata.
     for architecture in [Some("flat"), Some("entity"), None] {

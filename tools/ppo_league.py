@@ -144,6 +144,8 @@ class League:
             settings['average_runs'] = self.average_runs
         if self.excluded_models:
             settings['excluded_models'] = sorted(self.excluded_models)
+        if getattr(args, 'final_games_per_model', 0):
+            settings['final_games_per_model'] = args.final_games_per_model
         manifest = self.root / 'manifest.json'
         if manifest.exists():
             if json.loads(manifest.read_text()) != settings:
@@ -242,7 +244,8 @@ class League:
             plan = json.loads(plan_path.read_text())
         else:
             seed = args.seed + self.batch * args.batch_games
-            tables = schedule(sorted(self.models), self.counts, args.batch_games, seed, args.anchor)
+            deficits = {name: self.counts[name] - self.required_games(name) for name in self.models}
+            tables = schedule(sorted(self.models), deficits, args.batch_games, seed, args.anchor)
             plan = {'seed': seed, 'tables': tables}
             save(plan_path, plan)
         save(directory / 'tables.json', plan['tables'])
@@ -295,12 +298,18 @@ class League:
             'note': 'Conditional full-game bootstrap, not training-seed uncertainty. Scores are relative within this connected pool and may shift when games/models are added.'})
         self.last_fit_batch = self.batch
 
+    def required_games(self, name):
+        model = self.models[name]
+        if model['run'] in self.sources and model['iteration'] == self.args.target_iteration:
+            return max(self.args.games_per_model, getattr(self.args, 'final_games_per_model', 0))
+        return self.args.games_per_model
+
     def run(self):
         try:
             while True:
                 self.discover()
                 if len(self.models) >= 8 and self.args.anchor in self.models:
-                    if min(self.counts[name] for name in self.models) < self.args.games_per_model:
+                    if any(self.counts[name] < self.required_games(name) for name in self.models):
                         self.play_batch()
                         if self.batch % 4 == 0:
                             self.fit()
@@ -345,6 +354,8 @@ def main():
     parser.add_argument('--interval', type=int, default=500)
     parser.add_argument('--target-iteration', type=int, default=10000)
     parser.add_argument('--games-per-model', type=int, default=256)
+    parser.add_argument('--final-games-per-model', type=int, default=0,
+                        help='minimum appearances for target-iteration training checkpoints (0 inherits regular budget)')
     parser.add_argument('--batch-games', type=int, default=64)
     parser.add_argument('--seed', type=int, default=60_000_000)
     parser.add_argument('--workers', type=int, default=16)
@@ -354,7 +365,7 @@ def main():
     parser.add_argument('--cpu-list', help='optional comma-separated CPU IDs or ranges for this evaluator')
     parser.add_argument('--numa-node', type=int)
     args = parser.parse_args()
-    if min(args.interval, args.target_iteration, args.games_per_model, args.batch_games, args.workers, args.poll_seconds) <= 0 or args.bootstrap < 2 or args.seed < 0:
+    if min(args.interval, args.target_iteration, args.games_per_model, args.batch_games, args.workers, args.poll_seconds) <= 0 or args.bootstrap < 2 or args.seed < 0 or args.final_games_per_model < 0:
         parser.error('counts must be positive, seed nonnegative, bootstrap >= 2')
     if args.cpu_list:
         cpus = set()

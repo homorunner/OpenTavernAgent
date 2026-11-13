@@ -6,11 +6,12 @@
 
 use std::path::Path;
 
+use crate::actions as a;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use taverngym::actions as a;
 use taverngym::cards::{CardKind, db};
 use taverngym::obs as o;
 
@@ -28,21 +29,30 @@ pub enum Architecture {
 
 /// Compact policy layout; resolved to engine actions using the current state.
 pub const N_ACTIONS: usize = crate::actions::N_ACTIONS;
-/// Agent-only flag appended to the unchanged engine observation.
-pub const COMBAT_PROTECTED_FEATURE: usize = o::OBS_FLOATS;
-pub const SHOP_HEALTH_COST_FEATURE_START: usize = o::OBS_FLOATS + 1;
+/// Offsets in the v2 observation, compacted from the engine schema.
+pub const SHOP_FLOAT_START: usize = o::GLOBAL_F
+    + o::N_QUESTS * o::QUEST_F
+    + o::PENDING_KINDS
+    + a::N_BOARD * o::MINION_F
+    + a::N_HAND * o::ITEM_F;
+pub const SHOP_CARD_START: usize =
+    1 + a::N_POWERS + 2 + 3 * o::N_QUESTS + o::N_SECRETS + a::N_BOARD + a::N_HAND;
+/// Engine observation with its unused eighth shop entity removed.
+pub const COMPACT_OBS_FLOATS: usize = o::OBS_FLOATS - o::ITEM_F;
+pub const COMBAT_PROTECTED_FEATURE: usize = COMPACT_OBS_FLOATS;
+pub const SHOP_HEALTH_COST_FEATURE_START: usize = COMPACT_OBS_FLOATS + 1;
 pub const N_FEATURES: usize = SHOP_HEALTH_COST_FEATURE_START + a::N_SHOP;
-pub const N_CARD_SLOTS: usize = o::OBS_CARDS;
+pub const N_CARD_SLOTS: usize = o::OBS_CARDS - 1;
 pub const DEFAULT_HIDDEN: usize = 320;
 pub const DEFAULT_EMBEDDING_DIM: usize = 32;
 pub const DEFAULT_BLOCKS: usize = 6;
-pub const MODEL_VERSION: i64 = 1;
+pub const MODEL_VERSION: i64 = 2;
 pub const TURN_BINS: usize = 16;
 pub const TIER_BINS: usize = 6;
 pub const ONE_HOT_FEATURES: usize = TURN_BINS + TIER_BINS;
 pub const VALUE_HIDDEN: usize = 128;
 pub const N_OPP_BOARD_SLOTS: usize = o::N_OPP * a::N_BOARD;
-pub const OPP_BOARD_FEATURE_START: usize = o::OBS_FLOATS - N_OPP_BOARD_SLOTS * o::MINION_F;
+pub const OPP_BOARD_FEATURE_START: usize = COMPACT_OBS_FLOATS - N_OPP_BOARD_SLOTS * o::MINION_F;
 /// The ended-turn flag: the seat has finished recruiting and has no legal action.
 pub const ENDED_TURN_FEATURE: usize = o::ENDED_TURN_F;
 /// Global flags the network never needs: hero selection (1), game over (2) and the
@@ -331,10 +341,21 @@ impl Params {
         self.tensors.iter().map(Mat::len).sum()
     }
     pub fn sum_squares(&self) -> f64 {
-        self.tensors.iter().map(Mat::sum_squares).sum()
+        // Keep each tensor's reduction and the final tensor order unchanged.
+        // Parallel summation of arbitrary chunks would change clipping numerics.
+        self.tensors
+            .par_iter()
+            .map(Mat::sum_squares)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .sum()
     }
     pub fn all_finite(&self) -> bool {
-        self.tensors.iter().all(Mat::all_finite)
+        self.tensors.par_iter().all(|t| {
+            t.data
+                .par_chunks(4096)
+                .all(|chunk| chunk.iter().all(|x| x.is_finite()))
+        })
     }
     /// Weight matrices (names starting with W) receive weight decay; vectors and E do not.
     pub fn is_weight(&self, index: usize) -> bool {
@@ -526,7 +547,10 @@ impl PolicyValueNet {
         if !(cfg.residual_scale > 0.0 && cfg.residual_scale <= 1.0) {
             return Err("residual_scale must be in (0, 1]".into());
         }
-        if o::OBS_FLOATS != 3235 || N_CARD_SLOTS != 124 {
+        if o::OBS_FLOATS != 3235
+            || o::OBS_CARDS != 124
+            || taverngym::actions::N_SHOP != a::N_SHOP + 1
+        {
             return Err("observation schema changed; update the network".into());
         }
         let input_features = input_feature_indices();
@@ -1018,6 +1042,73 @@ impl PolicyValueNet {
 
     pub fn load(path: &Path) -> Result<PolicyValueNet, String> {
         PolicyValueNet::from_npz(&Npz::load(path)?)
+    }
+
+    /// Evaluation-only adapter for the frozen C baseline before health-cost flags.
+    /// Omitted shop/mask inputs were always zero; new health-cost weights are zero.
+    /// No checkpoint is rewritten, and the training loader remains strict.
+    pub fn from_npz_for_evaluation(npz: &Npz) -> Result<PolicyValueNet, String> {
+        let mut meta: CheckpointMeta = serde_json::from_str(&npz.get("meta")?.as_text()?)
+            .map_err(|e| format!("invalid evaluation model metadata: {e}"))?;
+        if meta.version == MODEL_VERSION {
+            return Self::from_npz(npz);
+        }
+        if meta.version != 1
+            || meta.features != 3236
+            || meta.input_features != 1732
+            || meta.kind != "tavernagent_v2"
+        {
+            return Err("unsupported legacy evaluation schema".into());
+        }
+        let net = Self::new(0, meta.cfg.clone())?;
+        if meta.card_fingerprint != net.card_fingerprint.to_string() {
+            return Err("legacy evaluation card database differs".into());
+        }
+        let removed_slot = net
+            .card_slots
+            .partition_point(|&i| i < SHOP_CARD_START + a::N_SHOP);
+        let entity_rows = removed_slot * 64..(removed_slot + 1) * 64;
+        let removed_mask = (net.n_card_slots() + 1) * 64 + 128 + a::A_BUY + a::N_SHOP;
+        let mut adapted = Npz::new();
+        for (name, tensor) in net.p.names().iter().zip(&net.p.tensors) {
+            let old = npz.get(name)?;
+            let values = old.as_f32()?;
+            let data = if name == "W0" {
+                if old.shape != [tensor.rows + 65, tensor.cols] {
+                    return Err("legacy evaluation W0 shape differs".into());
+                }
+                values
+                    .chunks_exact(tensor.cols)
+                    .enumerate()
+                    .filter(|(i, _)| !entity_rows.contains(i) && *i != removed_mask)
+                    .flat_map(|(_, row)| row.iter().copied())
+                    .collect()
+            } else if name == "W_shop_in" {
+                if old.shape != [tensor.rows - 1, tensor.cols] {
+                    return Err("legacy evaluation shop encoder shape differs".into());
+                }
+                let mut data = values.to_vec();
+                data.resize(tensor.len(), 0.0);
+                data
+            } else {
+                if values.len() != tensor.len() {
+                    return Err(format!("legacy evaluation tensor differs: {name}"));
+                }
+                values.to_vec()
+            };
+            adapted.insert(
+                name.clone(),
+                NpyArray::f32(vec![tensor.rows, tensor.cols], data),
+            );
+        }
+        meta.version = MODEL_VERSION;
+        meta.features = N_FEATURES;
+        meta.input_features = net.n_input_features();
+        adapted.insert(
+            "meta",
+            NpyArray::text(&serde_json::to_string(&meta).map_err(|e| e.to_string())?),
+        );
+        Self::from_npz(&adapted)
     }
 }
 

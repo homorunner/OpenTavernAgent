@@ -50,7 +50,10 @@ fn two_ordinary_slots_with_power_and_reward_sources_are_observation_only() {
     buy(&mut g, special, Some(TrinketSource::QuestReward(reward)));
     buy(&mut g, ordinary, None);
     let before = serde_json::to_value(&g).unwrap();
-    let raw = taverngym::obs::observe(&g, 0);
+    let mut raw = taverngym::obs::observe(&g, 0);
+    let unused = tavernagent_v2::net::SHOP_FLOAT_START + 7 * taverngym::obs::ITEM_F;
+    raw.floats.drain(unused..unused + taverngym::obs::ITEM_F);
+    raw.cards.remove(tavernagent_v2::net::SHOP_CARD_START + 7);
     let obs = observe_seat(&g, 0);
     let mut expected = raw.cards;
     expected[1] = index(special);
@@ -62,7 +65,7 @@ fn two_ordinary_slots_with_power_and_reward_sources_are_observation_only() {
     assert_eq!(serde_json::to_value(&g).unwrap(), before);
     assert_eq!(g.players[0].trinkets.len(), 4);
     assert_eq!(OWNED_TRINKET_SLOTS, 2);
-    assert_eq!(card_slot_indices().len(), 57);
+    assert_eq!(card_slot_indices().len(), 56);
     assert!(
         card_slot_indices()
             .iter()

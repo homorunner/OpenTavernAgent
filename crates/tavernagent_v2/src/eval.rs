@@ -176,7 +176,7 @@ pub fn run(args: EvalArgs) -> Result<(), String> {
     if let Some(path) = &args.replay {
         crate::replay::validate_paths(&args.model, args.out.as_deref(), path)?;
     }
-    let (trainer, state) = checkpoint::load(&args.model)?;
+    let (net, state) = checkpoint::load_for_evaluation(&args.model)?;
     let mut replay_writer = args
         .replay
         .as_deref()
@@ -191,7 +191,12 @@ pub fn run(args: EvalArgs) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     let games = if args.backend == crate::backend::Backend::Cuda || replay_writer.is_some() {
-        let execution = crate::backend::Execution::new(args.backend, &trainer, args.device)?;
+        let execution = match args.backend {
+            crate::backend::Backend::Cpu => crate::backend::Execution::Cpu,
+            crate::backend::Backend::Cuda => {
+                return Err("CUDA evaluation is not implemented for C".into());
+            }
+        };
         let mut results = Vec::with_capacity(seeds.len());
         // Bound replay memory to at most four complete games, regardless of --games.
         let chunk_size = if replay_writer.is_some() {
@@ -201,7 +206,7 @@ pub fn run(args: EvalArgs) -> Result<(), String> {
         };
         for chunk in seeds.chunks(chunk_size) {
             let mut chunk_results = crate::batched_eval::evaluate_recorded(
-                &trainer.net,
+                &net,
                 &execution,
                 chunk,
                 &cfg,
@@ -235,7 +240,7 @@ pub fn run(args: EvalArgs) -> Result<(), String> {
                 .par_iter()
                 .map(|&seed| {
                     play_detailed(
-                        &trainer.net,
+                        &net,
                         seed,
                         &cfg,
                         args.sample,

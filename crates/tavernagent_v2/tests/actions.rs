@@ -1,4 +1,5 @@
 //! Compact policy actions must agree with engine legality and execution.
+use tavernagent_v2::actions as a;
 use tavernagent_v2::actions::{N_ACTIONS, N_POS, apply, engine_action, legal_mask};
 use taverngym::actions as e;
 use taverngym::cards::cid;
@@ -28,7 +29,7 @@ fn position(board: usize, card: &str) -> Game {
 
 #[test]
 fn compact_mapping_covers_all_hand_slots_and_full_board_hosts() {
-    assert_eq!((N_ACTIONS, N_POS), (116, 7));
+    assert_eq!((N_ACTIONS, N_POS), (115, 7));
     assert_eq!((e::N_ACTIONS, e::N_POS), (245, 8));
     let mut g = position(7, "BG_BOT_911");
     for _ in 1..10 {
@@ -36,7 +37,7 @@ fn compact_mapping_covers_all_hand_slots_and_full_board_hosts() {
     }
     for h in 0..10 {
         for pos in 0..7 {
-            let a = e::A_PLAY + h * N_POS + pos;
+            let a = a::A_PLAY + h * N_POS + pos;
             assert!(legal_mask(&g, 0)[a]);
             assert_eq!(
                 engine_action(&g, 0, a).unwrap(),
@@ -57,7 +58,7 @@ fn compact_mapping_covers_all_hand_slots_and_full_board_hosts() {
     assert!(engine_action(&g, 0, N_ACTIONS).is_err());
     g.players[0].hand[9].locked = 1;
     assert!(
-        legal_mask(&g, 0)[e::A_PLAY + 9 * N_POS..]
+        legal_mask(&g, 0)[a::A_PLAY + 9 * N_POS..]
             .iter()
             .all(|b| !b)
     );
@@ -66,11 +67,35 @@ fn compact_mapping_covers_all_hand_slots_and_full_board_hosts() {
 }
 
 #[test]
+fn seven_shop_slots_shift_later_actions_without_changing_engine_semantics() {
+    let g = position(1, "BG36_345");
+    let engine_mask = g.legal_mask(0);
+    let agent_mask = legal_mask(&g, 0);
+    for (action, &legal) in agent_mask.iter().enumerate().take(a::A_PLAY) {
+        let expected = if action < a::A_SELL {
+            action
+        } else {
+            action + 1
+        };
+        let resolved = engine_action(&g, 0, action).unwrap();
+        assert_eq!(resolved.encode(), expected);
+        assert_eq!(legal, engine_mask[expected]);
+        assert_ne!(resolved, Action::Buy(7));
+    }
+    assert_eq!(engine_action(&g, 0, a::A_BUY + 6).unwrap(), Action::Buy(6));
+    assert_eq!(engine_action(&g, 0, a::A_SELL).unwrap(), Action::Sell(0));
+    assert_eq!(
+        engine_action(&g, 0, a::A_CHOOSE + 15).unwrap(),
+        Action::Choose(15)
+    );
+}
+
+#[test]
 fn magnetic_minion_can_append_or_play_before_an_incompatible_host() {
     for (races, pos) in [(Races::MECH, 1), (Races::BEAST, 0)] {
         let mut g = position(1, "BG_BOT_911");
         g.players[0].board[0].races = races;
-        let a = e::A_PLAY + pos;
+        let a = a::A_PLAY + pos;
         assert_eq!(
             engine_action(&g, 0, a).unwrap(),
             Action::Play { hand: 0, pos }
@@ -82,8 +107,8 @@ fn magnetic_minion_can_append_or_play_before_an_incompatible_host() {
     }
     let mut g = position(7, "BG_BOT_911");
     g.players[0].board[6].races = Races::BEAST;
-    assert!(!legal_mask(&g, 0)[e::A_PLAY + 6]);
-    assert!(apply(&mut g, 0, e::A_PLAY + 6).is_err());
+    assert!(!legal_mask(&g, 0)[a::A_PLAY + 6]);
+    assert!(apply(&mut g, 0, a::A_PLAY + 6).is_err());
 }
 
 #[test]
@@ -95,7 +120,7 @@ fn special_magnetic_hosts_reuse_engine_rules() {
     ] {
         let mut g = position(7, card);
         g.players[0].board[6].races = race;
-        let a = e::A_PLAY + 6;
+        let a = a::A_PLAY + 6;
         assert!(legal_mask(&g, 0)[a]);
         assert_eq!(
             engine_action(&g, 0, a).unwrap(),
@@ -113,7 +138,7 @@ fn ordinary_minions_and_spells_keep_engine_legality() {
             let g = position(n, card);
             let mask = legal_mask(&g, 0);
             for pos in 0..7 {
-                assert_eq!(mask[e::A_PLAY + pos], g.legal_mask(0)[e::A_PLAY + pos]);
+                assert_eq!(mask[a::A_PLAY + pos], g.legal_mask(0)[e::A_PLAY + pos]);
             }
         }
     }

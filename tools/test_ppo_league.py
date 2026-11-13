@@ -12,6 +12,19 @@ from ppo_league import League, schedule, average_ratings, game_exclusion_reason
 
 
 class LeagueTests(unittest.TestCase):
+    def test_final_budget_only_applies_to_training_endpoints(self):
+        league = object.__new__(League)
+        league.args = SimpleNamespace(games_per_model=512, final_games_per_model=2048, target_iteration=12000)
+        league.sources = {'candidate': Path('unused')}
+        league.models = {'early': {'run': 'candidate', 'iteration': 500},
+                         'final': {'run': 'candidate', 'iteration': 12000},
+                         'reference': {'run': 'frozen', 'iteration': 12000}}
+        self.assertEqual([league.required_games(n) for n in league.models], [512, 2048, 512])
+        names = list('abcdefgh')
+        counts = {name: 512 for name in names}
+        deficits = {name: counts[name] - (2048 if name == 'a' else 512) for name in names}
+        self.assertTrue(all('a' in t for t in schedule(names, deficits, 128, 1, 'b')))
+
     def test_seed_means_include_partial_steps_and_preserve_bootstrap_covariance(self):
         names = ['a0', 'b0', 'c0', 'd0', 'e0', 'a1', 'candidate']
         models = {name: {'run': run, 'iteration': step} for name, run, step in

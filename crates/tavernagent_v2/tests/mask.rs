@@ -1,5 +1,6 @@
 //! Training-mask rules, including sole-action escape hatches.
 use serde_json::Value;
+use tavernagent_v2::actions::A_CHOOSE;
 use tavernagent_v2::{
     heroes::select_heroes,
     net::N_ACTIONS,
@@ -8,7 +9,7 @@ use tavernagent_v2::{
 };
 use taverngym::{
     Game,
-    actions::{A_CANCEL, A_CHOOSE, A_END as A_END_TURN, A_HERO_POWER, A_PLAY, A_REFRESH, N_CHOICE},
+    actions::{A_CANCEL, A_END as A_END_TURN, A_HERO_POWER, A_PLAY, A_REFRESH, N_CHOICE},
     cards::{CardId, CardKind, cid, db},
     state::{Item, Pending},
 };
@@ -73,7 +74,7 @@ fn the_agent_cannot_cancel_a_menu_it_opened() {
         "only the menu's options are open"
     );
     let atk = game.players[0].board[0].atk;
-    game.apply_index(0, choices[0]).unwrap();
+    tavernagent_v2::actions::apply(&mut game, 0, choices[0]).unwrap();
     assert!(game.players[0].pending.is_empty());
     assert_eq!(game.players[0].board[0].atk, atk + 2);
 

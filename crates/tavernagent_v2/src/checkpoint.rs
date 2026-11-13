@@ -92,3 +92,19 @@ pub fn load(path: &Path) -> Result<(Trainer, RunState), String> {
     trainer.optimizer_step = meta.optimizer_step;
     Ok((trainer, meta.state))
 }
+
+/// Read policy and evaluation settings without restoring an optimizer for training.
+pub fn load_for_evaluation(path: &Path) -> Result<(PolicyValueNet, RunState), String> {
+    let npz = Npz::load(path)?;
+    let meta: Metadata = serde_json::from_str(&npz.get("trainer_meta")?.as_text()?)
+        .map_err(|e| format!("invalid evaluation checkpoint: {e}"))?;
+    if meta.state.format != FORMAT || meta.state.algorithm != ALGORITHM {
+        return Err("unsupported evaluation trainer format".into());
+    }
+    meta.state.options.validate()?;
+    let net = PolicyValueNet::from_npz_for_evaluation(&npz)?;
+    if net.cfg != meta.state.options.net_config() || !net.p.all_finite() {
+        return Err("invalid evaluation network/options".into());
+    }
+    Ok((net, meta.state))
+}

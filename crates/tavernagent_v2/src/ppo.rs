@@ -38,6 +38,10 @@ pub struct PpoOptions {
     pub health_value_coef: f64,
     #[arg(long, default_value_t = 0.03)]
     pub entropy_coef: f64,
+    /// Replace entropy bonus with -KL(policy || uniform legal categories then actions).
+    #[serde(default)]
+    #[arg(long)]
+    pub category_balanced_entropy: bool,
     #[arg(long, default_value_t = 0.5)]
     pub max_grad_norm: f64,
     #[arg(long, default_value_t = 0.01)]
@@ -56,6 +60,7 @@ impl Default for PpoOptions {
             clip_value_target: false,
             health_value_coef: 0.1,
             entropy_coef: 0.03,
+            category_balanced_entropy: false,
             max_grad_norm: 0.5,
             weight_decay: 0.01,
             target_kl: 0.02,
@@ -94,6 +99,9 @@ pub struct LossMetrics {
     pub terminal_value_loss: f64,
     pub health_value_loss: f64,
     pub entropy: f64,
+    /// Actual exploration bonus: entropy, or negative category-reference KL.
+    #[serde(default)]
+    pub exploration_bonus: f64,
     pub approx_kl: f64,
     pub clip_fraction: f64,
     pub ratio_mean: f64,
@@ -106,6 +114,7 @@ impl LossMetrics {
         self.terminal_value_loss += other.terminal_value_loss * scale;
         self.health_value_loss += other.health_value_loss * scale;
         self.entropy += other.entropy * scale;
+        self.exploration_bonus += other.exploration_bonus * scale;
         self.approx_kl += other.approx_kl * scale;
         self.clip_fraction += other.clip_fraction * scale;
         self.ratio_mean += other.ratio_mean * scale;
@@ -116,7 +125,12 @@ impl LossMetrics {
             + opts.value_coef * self.value_loss
             + opts.terminal_value_coef * self.terminal_value_loss
             + opts.health_value_coef * self.health_value_loss
-            - opts.entropy_coef * self.entropy
+            - opts.entropy_coef
+                * if opts.category_balanced_entropy {
+                    self.exploration_bonus
+                } else {
+                    self.entropy
+                }
     }
 }
 
@@ -140,6 +154,38 @@ pub fn policy_loss_gradient(
         return Err("invalid PPO action, behavior log probability or advantage".into());
     }
     let dist = Categorical::new(logits, mask)?;
+    let mut log_reference = vec![0.0; logits.len()];
+    if opts.category_balanced_entropy {
+        use crate::actions::{N_CATEGORIES, category};
+        if mask.len() != N_ACTIONS {
+            return Err(
+                "category-balanced entropy requires the complete agent action space".into(),
+            );
+        }
+        let mut counts = [0usize; N_CATEGORIES];
+        for (a, &legal) in mask.iter().enumerate() {
+            if legal {
+                counts[category(a)] += 1;
+            }
+        }
+        let groups = counts.iter().filter(|&&n| n > 0).count();
+        for (a, &legal) in mask.iter().enumerate() {
+            if legal {
+                log_reference[a] = -((groups * counts[category(a)]) as f64).ln();
+            }
+        }
+    }
+    let exploration_bonus = if opts.category_balanced_entropy {
+        -dist
+            .probabilities
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| **p > 0.0)
+            .map(|(a, p)| p * (dist.log_probabilities[a] - log_reference[a]))
+            .sum::<f64>()
+    } else {
+        dist.entropy
+    };
     let log_ratio = dist.log_probabilities[action] - old_log_prob;
     let ratio = log_ratio.exp();
     if !ratio.is_finite() {
@@ -159,13 +205,16 @@ pub fn policy_loss_gradient(
         if legal {
             let p = dist.probabilities[a];
             grad[a] = (coeff * (p - f64::from(a == action))
-                + opts.entropy_coef * p * (dist.log_probabilities[a] + dist.entropy))
+                + opts.entropy_coef
+                    * p
+                    * (dist.log_probabilities[a] - log_reference[a] + exploration_bonus))
                 as f32;
         }
     }
     let metrics = LossMetrics {
         policy_loss: -(ratio * advantage).min(clipped_ratio * advantage),
         entropy: dist.entropy,
+        exploration_bonus,
         approx_kl: (log_ratio.exp_m1() - log_ratio).max(0.0),
         clip_fraction: f64::from((ratio - 1.0).abs() > opts.clip_range),
         ratio_mean: ratio,

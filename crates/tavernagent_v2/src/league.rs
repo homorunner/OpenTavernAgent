@@ -180,7 +180,7 @@ pub fn run(args: LeagueArgs) -> Result<(), String> {
     let mut cfg = None;
     let mut identities = Vec::new();
     for (name, path) in &specs {
-        let (trainer, state) = checkpoint::load(path)?;
+        let (net, state) = checkpoint::load_for_evaluation(path)?;
         let model_cfg = state.options.game_config()?;
         if let Some(expected) = &cfg {
             if serde_json::to_value(expected).map_err(|e| e.to_string())?
@@ -194,7 +194,7 @@ pub fn run(args: LeagueArgs) -> Result<(), String> {
         identities.push(serde_json::json!({"name":name,"iteration":state.iteration,
             "training_seed":state.options.seed,"policy_rules":state.options.policy_rules}));
         models.push(LeagueModel {
-            net: trainer.net,
+            net,
             rules: state.options.policy_rules,
         });
     }

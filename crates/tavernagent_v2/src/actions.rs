@@ -2,8 +2,40 @@
 use taverngym::actions as engine;
 use taverngym::{Action, Game};
 
+pub use engine::{
+    A_BUY, A_CANCEL, A_DARK_GIFT, A_END, A_FREEZE, A_HERO_POWER, A_REFRESH, A_UPGRADE, N_BOARD,
+    N_CHOICE, N_HAND, N_POWERS,
+};
+pub const N_SHOP: usize = 7;
+pub const A_SELL: usize = A_BUY + N_SHOP;
+pub const A_ACTIVATE: usize = A_SELL + N_BOARD;
+pub const A_CHOOSE: usize = A_ACTIVATE + N_BOARD;
+pub const A_PLAY: usize = A_CHOOSE + N_CHOICE;
+
 pub const N_POS: usize = engine::N_BOARD;
-pub const N_ACTIONS: usize = engine::A_PLAY + engine::N_HAND * N_POS;
+pub const N_ACTIONS: usize = A_PLAY + N_HAND * N_POS;
+
+pub const N_CATEGORIES: usize = 12;
+
+/// Semantic groups for exploration; HeroPower slots share a group, as do Play/Magnetize.
+pub fn category(action: usize) -> usize {
+    assert!(action < N_ACTIONS);
+    const STARTS: [usize; N_CATEGORIES] = [
+        engine::A_END,
+        engine::A_REFRESH,
+        engine::A_FREEZE,
+        engine::A_UPGRADE,
+        engine::A_HERO_POWER,
+        engine::A_DARK_GIFT,
+        engine::A_CANCEL,
+        engine::A_BUY,
+        A_SELL,
+        A_ACTIVATE,
+        A_CHOOSE,
+        A_PLAY,
+    ];
+    STARTS.partition_point(|&start| start <= action) - 1
+}
 
 /// Resolve against the state *before* applying the action. A compatible occupied
 /// position means Magnetize; an empty or incompatible position means normal Play.
@@ -11,10 +43,11 @@ pub fn engine_action(game: &Game, seat: usize, action: usize) -> Result<Action, 
     if action >= N_ACTIONS {
         return Err("bad agent action index");
     }
-    if action < engine::A_PLAY {
-        return Action::decode(action).ok_or("bad agent action index");
+    if action < A_PLAY {
+        let engine_index = if action < A_SELL { action } else { action + 1 };
+        return Action::decode(engine_index).ok_or("bad agent action index");
     }
-    let k = action - engine::A_PLAY;
+    let k = action - A_PLAY;
     let (hand, pos) = (k / N_POS, k % N_POS);
     Ok(if game.can_magnetize(seat, hand, pos) {
         Action::Magnetize { hand, board: pos }

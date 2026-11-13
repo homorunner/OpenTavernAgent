@@ -1,4 +1,4 @@
-//! Agent observations and action constraints, matching tavernagent.
+//! Compact v2 observations and action constraints; engine/v1 schemas are unchanged.
 use crate::rules::{ActionHistory, PolicyRules};
 use taverngym::actions::{A_CANCEL, A_END as A_END_TURN};
 use taverngym::{Game, obs::observe};
@@ -28,6 +28,11 @@ pub fn observe_seat_with_rules(
     history: &ActionHistory,
 ) -> Observation {
     let mut o = observe(game, seat);
+    // Remove the engine's eighth shop slot before remapping the compact card offsets.
+    let unused = crate::net::SHOP_FLOAT_START + crate::actions::N_SHOP * taverngym::obs::ITEM_F;
+    o.floats.drain(unused..unused + taverngym::obs::ITEM_F);
+    o.cards
+        .remove(crate::net::SHOP_CARD_START + crate::actions::N_SHOP);
     map_owned_effects(&game.players[seat], &mut o.cards);
     // Combat fixes cap eligibility at recruit start, even if a player dies mid-turn.
     let alive = match game.turn_alive {
@@ -41,9 +46,9 @@ pub fn observe_seat_with_rules(
             .damage_cap(game.turn, alive)
             .is_some_and(|cap| player.health.saturating_add(player.armor) > cap);
     // Agent-only extensions leave the engine and v1 observation layout unchanged.
-    o.floats.reserve_exact(1 + taverngym::actions::N_SHOP);
+    o.floats.reserve_exact(1 + crate::actions::N_SHOP);
     o.floats.push(protected as u8 as f32);
-    for slot in 0..taverngym::actions::N_SHOP {
+    for slot in 0..crate::actions::N_SHOP {
         o.floats.push(
             game.slot_price(seat, slot)
                 .is_some_and(|(_, health, _)| health) as u8 as f32,
