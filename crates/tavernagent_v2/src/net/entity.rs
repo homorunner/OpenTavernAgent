@@ -164,6 +164,18 @@ impl Layout {
                         .collect(),
                 );
             }
+            if kind == 3 {
+                for slot in 0..count {
+                    let raw = super::SHOP_HEALTH_COST_FEATURE_START + slot;
+                    groups[kind].features[slot].push(
+                        ONE_HOT_FEATURES
+                            + features
+                                .iter()
+                                .position(|&f| f == raw)
+                                .expect("shop payment feature omitted"),
+                    );
+                }
+            }
             card_start += count;
             float_start += count * width;
         }

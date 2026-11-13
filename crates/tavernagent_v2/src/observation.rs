@@ -40,9 +40,15 @@ pub fn observe_seat_with_rules(
             .cfg
             .damage_cap(game.turn, alive)
             .is_some_and(|cap| player.health.saturating_add(player.armor) > cap);
-    // Avoid doubling every observation's capacity for this one extra feature.
-    o.floats.reserve_exact(1);
+    // Agent-only extensions leave the engine and v1 observation layout unchanged.
+    o.floats.reserve_exact(1 + taverngym::actions::N_SHOP);
     o.floats.push(protected as u8 as f32);
+    for slot in 0..taverngym::actions::N_SHOP {
+        o.floats.push(
+            game.slot_price(seat, slot)
+                .is_some_and(|(_, health, _)| health) as u8 as f32,
+        );
+    }
     Observation {
         x: o.floats,
         cards: o.cards,

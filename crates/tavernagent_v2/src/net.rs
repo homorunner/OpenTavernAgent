@@ -30,7 +30,8 @@ pub enum Architecture {
 pub const N_ACTIONS: usize = crate::actions::N_ACTIONS;
 /// Agent-only flag appended to the unchanged engine observation.
 pub const COMBAT_PROTECTED_FEATURE: usize = o::OBS_FLOATS;
-pub const N_FEATURES: usize = o::OBS_FLOATS + 1;
+pub const SHOP_HEALTH_COST_FEATURE_START: usize = o::OBS_FLOATS + 1;
+pub const N_FEATURES: usize = SHOP_HEALTH_COST_FEATURE_START + a::N_SHOP;
 pub const N_CARD_SLOTS: usize = o::OBS_CARDS;
 pub const DEFAULT_HIDDEN: usize = 320;
 pub const DEFAULT_EMBEDDING_DIM: usize = 32;
@@ -54,7 +55,7 @@ pub fn input_feature_indices() -> Vec<usize> {
     (0..OPP_BOARD_FEATURE_START)
         .filter(|i| !EXCLUDED_GLOBALS.contains(i))
         .filter(|i| !(o::GLOBAL_F + o::QUEST_F..o::GLOBAL_F + o::N_QUESTS * o::QUEST_F).contains(i))
-        .chain(std::iter::once(COMBAT_PROTECTED_FEATURE))
+        .chain(COMBAT_PROTECTED_FEATURE..N_FEATURES)
         .collect()
 }
 

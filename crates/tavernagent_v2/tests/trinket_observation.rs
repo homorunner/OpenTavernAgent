@@ -300,3 +300,42 @@ fn ordinary_slots_are_capped_even_for_debug_states_with_extra_trinkets() {
     );
     assert_eq!(g.players[0].trinkets.len(), 3);
 }
+
+#[test]
+fn shop_health_payment_tracks_trinket_usage_and_free_price() {
+    use tavernagent_v2::net::{N_FEATURES, SHOP_HEALTH_COST_FEATURE_START};
+    use taverngym::{actions as a, obs as o, state::ShopSlot, types::Races};
+    let mut g = game();
+    let mut m = g.with_recruit(0, |c| c.new_minion(0, cid("BGS_029")));
+    m.races = Races(Races::DEMON.0 | Races::PIRATE.0);
+    g.players[0].shop = vec![ShopSlot::new(m.eid, Item::Minion(m))];
+    let shop_start = o::GLOBAL_F
+        + o::N_QUESTS * o::QUEST_F
+        + o::PENDING_KINDS
+        + a::N_BOARD * o::MINION_F
+        + a::N_HAND * o::ITEM_F;
+    let normal = observe_seat(&g, 0);
+    assert_eq!(normal.x.len(), N_FEATURES);
+    assert_eq!(normal.x[SHOP_HEALTH_COST_FEATURE_START], 0.0);
+    let sticker = cid("BG32_MagicItem_821");
+    buy(&mut g, sticker, None);
+    let health = observe_seat(&g, 0);
+    assert_eq!(health.x[SHOP_HEALTH_COST_FEATURE_START], 1.0);
+    assert_eq!(health.x[shop_start + 2], normal.x[shop_start + 2]);
+    assert!(
+        health.x[SHOP_HEALTH_COST_FEATURE_START + 1..]
+            .iter()
+            .all(|&x| x == 0.0)
+    );
+    let owned = g.players[0]
+        .trinket_effects()
+        .find(|c| c.base() == sticker)
+        .unwrap();
+    g.players[0].turn_data.push((owned, 1));
+    assert_eq!(observe_seat(&g, 0).x[SHOP_HEALTH_COST_FEATURE_START], 0.0);
+    g.players[0].turn_data.clear();
+    buy(&mut g, cid("BG32_MagicItem_957"), None);
+    let free = observe_seat(&g, 0);
+    assert_eq!(free.x[shop_start + 2], 0.0);
+    assert_eq!(free.x[SHOP_HEALTH_COST_FEATURE_START], 0.0);
+}

@@ -53,7 +53,7 @@ fn entity_parameter_budgets_and_checkpoint_roundtrip() {
         )
         .unwrap();
         println!("{architecture:?}: {} parameters", net.n_params());
-        assert_eq!(net.n_params(), 3_473_038);
+        assert_eq!(net.n_params(), 3_473_102);
         assert_eq!(net.p.names().len(), net.p.tensors.len());
         let restored = PolicyValueNet::from_npz(&net.to_npz()).unwrap();
         assert_eq!(restored.cfg, net.cfg);
@@ -155,6 +155,10 @@ fn object_heads_share_shop_scoring_and_ignore_absent_entity_contents() {
     for i in 0..o::ITEM_F {
         obs.x.swap(shop_float + i, shop_float + o::ITEM_F + i);
     }
+    obs.x.swap(
+        net::SHOP_HEALTH_COST_FEATURE_START,
+        net::SHOP_HEALTH_COST_FEATURE_START + 1,
+    );
     let swapped = net.infer_f32(&obs.x, &obs.cards, &obs.mask).unwrap().0;
     assert_eq!(before[a::A_BUY], swapped[a::A_BUY + 1]);
     assert_eq!(before[a::A_BUY + 1], swapped[a::A_BUY]);

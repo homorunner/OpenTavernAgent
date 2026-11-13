@@ -521,11 +521,11 @@ fn observation_and_output_shapes_preserve_the_original_contract() {
         ..Default::default()
     };
     let net = PolicyValueNet::new(7, cfg).unwrap();
-    assert_eq!(net.n_input_features(), 1732);
+    assert_eq!(net.n_input_features(), 1740);
     assert_eq!(net.n_card_slots(), 57);
     assert_eq!(
         (net::N_FEATURES, net::N_CARD_SLOTS, net::N_ACTIONS),
-        (3236, 124, 116)
+        (3244, 124, 116)
     );
     for seed in [0, 17, 95] {
         let mut game = Game::new(seed, Default::default());
@@ -533,7 +533,7 @@ fn observation_and_output_shapes_preserve_the_original_contract() {
         for seat in 0..8 {
             let obs = observe_seat(&game, seat);
             let old_obs = tavernagent::mcts::observe_seat(&game, seat);
-            assert_eq!(obs.x, old_obs.x);
+            assert_eq!(&obs.x[..old_obs.x.len()], &old_obs.x);
             assert_eq!(obs.cards, old_obs.cards);
             assert_eq!(obs.mask, old_obs.mask);
             let (logits, value) = net.infer_f32(&obs.x, &obs.cards, &obs.mask).unwrap();
