@@ -51,5 +51,6 @@ guard-*.json
 *.npy
 *.pkl
 
-# local external checkout (not part of this repository)
+# local external checkouts (not part of this repository)
 /hearthstone-bg-ppo/
+/hearthstone-bg-ppo-code/
