@@ -50,3 +50,6 @@ guard-*.json
 *.npz
 *.npy
 *.pkl
+
+# local external checkout (not part of this repository)
+/hearthstone-bg-ppo/

@@ -266,8 +266,6 @@ pub struct ForkArgs {
     pub epochs: Option<usize>,
     #[arg(long)]
     pub entropy_coef: Option<f64>,
-    #[arg(long, action = clap::ArgAction::Set)]
-    pub category_balanced_entropy: Option<bool>,
     #[arg(long)]
     pub gae_lambda: Option<f32>,
     #[arg(long)]
@@ -318,9 +316,6 @@ pub fn fork(args: ForkArgs) -> Result<(), String> {
     }
     if let Some(value) = args.entropy_coef {
         state.options.ppo.entropy_coef = value;
-    }
-    if let Some(value) = args.category_balanced_entropy {
-        state.options.ppo.category_balanced_entropy = value;
     }
     if let Some(value) = args.gae_lambda {
         state.options.gae_lambda = value;

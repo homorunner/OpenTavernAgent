@@ -128,7 +128,7 @@ fn clipping_and_entropy_gradients_match_finite_differences_for_both_advantage_si
     };
     let lp = Categorical::new(&logits, &mask).unwrap().log_probabilities[0];
     for ratio in [0.7f64, 1.0, 1.4] {
-        for advantage in [-0.7, 0.7] {
+        for advantage in [-0.7, 0.0, 0.7] {
             let old_lp = lp - ratio.ln();
             let (_, grads) =
                 ppo::policy_loss_gradient(&logits, &mask, 0, old_lp, advantage, &opts).unwrap();
@@ -473,6 +473,34 @@ fn checkpoint_restores_adam_rng_and_exact_next_update() {
     let path =
         std::env::temp_dir().join(format!("tavernagent-v2-{}-resume.npz", std::process::id()));
     checkpoint::save(&path, &trainer, &state).unwrap();
+    // Retired experiment settings must not prevent loading historical checkpoints.
+    // Preserve the raw RNG integer rather than round-tripping it through JSON Value.
+    let mut archive = tavernagent_v2::npz::Npz::load(&path).unwrap();
+    let metadata = archive.get("trainer_meta").unwrap().as_text().unwrap();
+    assert_eq!(metadata.matches("\"ppo\":{").count(), 1);
+    for enabled in [false, true] {
+        let historical = metadata.replacen(
+            "\"ppo\":{",
+            &format!("\"ppo\":{{\"category_balanced_entropy\":{enabled},"),
+            1,
+        );
+        archive.insert(
+            "trainer_meta",
+            tavernagent_v2::npz::NpyArray::text(&historical),
+        );
+        archive.save(&path).unwrap();
+        let (loaded, loaded_state) = checkpoint::load(&path).unwrap();
+        assert_eq!(loaded.net.p.tensors, trainer.net.p.tensors);
+        assert_eq!(loaded_state.options.ppo, state.options.ppo);
+        let saved_options = serde_json::to_value(&loaded_state.options).unwrap();
+        assert!(
+            saved_options["ppo"]
+                .get("category_balanced_entropy")
+                .is_none()
+        );
+        let (policy, _) = checkpoint::load_for_evaluation(&path).unwrap();
+        assert_eq!(policy.p.tensors, trainer.net.p.tensors);
+    }
     let (mut restored, mut restored_state) = checkpoint::load(&path).unwrap();
     assert_eq!(restored.net.p.tensors, trainer.net.p.tensors);
     assert_eq!(restored.m.tensors, trainer.m.tensors);
